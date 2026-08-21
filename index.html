@@ -364,6 +364,16 @@
                         <input type="text" id="server-chat-template-file" placeholder="/path/to/template.jinja" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-[11px] font-mono">
                     </div>
                 </div>
+                <div class="pt-2 border-t border-gray-700/40 space-y-2">
+                    <label class="flex items-center gap-2 text-xs font-semibold text-gray-200">
+                        <input type="checkbox" id="mmproj-toggle" class="accent-indigo-500 rounded">
+                        Multimodal (mmproj) <span class="text-indigo-400 cursor-help" title="--mmproj PATH -- enable vision/multimodal input by loading a CLIP projector alongside the model. The projector must match the model's vision architecture -- HF snapshot caching often puts it in a DIFFERENT snapshot folder than the model weights, since each revision only downloads the files it references. Path is saved per-profile.">?</span>
+                    </label>
+                    <div>
+                        <label class="block text-[10px] text-gray-400 mb-1">mmproj File Path</label>
+                        <input type="text" id="server-mmproj-path" placeholder="/path/to/mmproj-F16.gguf" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-[11px] font-mono">
+                    </div>
+                </div>
                 <div class="pt-2 border-t border-gray-700/40">
                     <label class="block text-[10px] text-gray-400 mb-1">Load Mode <span class="text-indigo-400 cursor-help" title="-lm/--load-mode MODE (default: mmap). none: no special loading mode. mmap: memory-map the model file. mlock: force the model to stay resident in RAM, never swapped/compressed. mmap+mlock: both. dio: use DirectIO if available.">?</span></label>
                     <select id="server-load-mode" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
@@ -500,7 +510,7 @@
              updating omni graph (GPU + prefill/gen tps), independent of any
              single request, fed every telemetry poll tick regardless of which
              tab is active. -->
-        <div id="monitor-view" class="hidden flex-1 flex-col overflow-y-auto p-6 space-y-4">
+         <div id="monitor-view" class="hidden flex-1 flex-col min-h-0 p-6 space-y-4 overflow-hidden">
             <!-- Live in-flight request status: fed by the same PREFILL_PROGRESS /
                  GEN_PROGRESS broadcasts that drive the sidebar, so it works for
                  requests from ANY client (opencode, curl, ...), not just this
@@ -538,26 +548,24 @@
             <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
                 <div class="flex justify-between items-center mb-2">
                     <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">Tokens/sec — this session</h3>
+                    <button id="monitor-tps-xaxis-toggle" type="button" class="text-[10px] text-gray-500 hover:text-gray-300 transition-colors px-1.5 py-0.5 rounded border border-gray-700 hover:border-gray-500" title="Switch between time-spaced (linear) and evenly-spaced (categorical) x-axis">time</button>
                 </div>
                 <div class="h-64"><canvas id="monitorTpsChart"></canvas></div>
             </div>
-            <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
-                <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider p-4 pb-2">Requests This Session</h3>
-                <!-- max-height + vertical scroll: without it, once a session
-                     logged more rows than fit on screen the table grew past
-                     the card and the bottom rows were unreachable. -->
-                <div class="overflow-x-auto overflow-y-auto max-h-80">
+            <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden flex-1 min-h-0 flex flex-col">
+                <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider p-4 pb-2 shrink-0">Requests This Session</h3>
+                <div class="overflow-x-auto overflow-y-auto flex-1 min-h-0">
                     <table class="w-full text-xs">
                         <thead>
                             <tr class="text-gray-500 border-b border-gray-800">
-                                <th class="text-left font-medium px-4 py-2">Time</th>
-                                <th class="text-left font-medium px-4 py-2">Model</th>
-                                <th class="text-right font-medium px-4 py-2">Prompt tok</th>
-                                <th class="text-right font-medium px-4 py-2">Prompt t/s</th>
-                                <th class="text-right font-medium px-4 py-2">Gen tok</th>
-                                <th class="text-right font-medium px-4 py-2">Gen t/s</th>
-                                <th class="text-right font-medium px-4 py-2" title="Speculative draft acceptance: accepted / generated draft tokens for this request. Blank when speculative decoding was off or nothing was drafted.">Draft acc</th>
-                                <th class="text-right font-medium px-4 py-2">Wall (s)</th>
+                                <th class="text-left font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Time</th>
+                                <th class="text-left font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Model</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Prompt tok</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Prompt t/s</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Gen tok</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Gen t/s</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900" title="Speculative draft acceptance: accepted / generated draft tokens for this request. Blank when speculative decoding was off or nothing was drafted.">Draft acc</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Wall (s)</th>
                             </tr>
                         </thead>
                         <tbody id="monitor-requests-body" class="text-gray-300"></tbody>
@@ -570,29 +578,29 @@
         <!-- History: every request ever logged, backfilled from the CSV --
              what "Monitor" used to be before it split into session-only +
              all-time. -->
-        <div id="history-view" class="hidden flex-1 flex-col overflow-y-auto p-6 space-y-4">
+        <div id="history-view" class="hidden flex-1 flex-col min-h-0 p-6 space-y-4 overflow-hidden">
             <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
                 <div class="flex justify-between items-center mb-2">
                     <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">Tokens/sec — every completed request</h3>
+                    <button id="history-tps-xaxis-toggle" type="button" class="text-[10px] text-gray-500 hover:text-gray-300 transition-colors px-1.5 py-0.5 rounded border border-gray-700 hover:border-gray-500" title="Switch between time-spaced (linear) and evenly-spaced (categorical) x-axis">time</button>
                     <span id="history-chart-status" class="text-[10px] text-gray-600"></span>
                 </div>
                 <div class="h-64"><canvas id="historyTpsChart"></canvas></div>
             </div>
-            <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
-                <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider p-4 pb-2">Recent Requests</h3>
-                <!-- max-height + vertical scroll (see Monitor tab's table). -->
-                <div class="overflow-x-auto overflow-y-auto max-h-80">
+            <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden flex-1 min-h-0 flex flex-col">
+                <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider p-4 pb-2 shrink-0">Recent Requests</h3>
+                <div class="overflow-x-auto overflow-y-auto flex-1 min-h-0">
                     <table class="w-full text-xs">
                         <thead>
                             <tr class="text-gray-500 border-b border-gray-800">
-                                <th class="text-left font-medium px-4 py-2">Time</th>
-                                <th class="text-left font-medium px-4 py-2">Model</th>
-                                <th class="text-right font-medium px-4 py-2">Prompt tok</th>
-                                <th class="text-right font-medium px-4 py-2">Prompt t/s</th>
-                                <th class="text-right font-medium px-4 py-2">Gen tok</th>
-                                <th class="text-right font-medium px-4 py-2">Gen t/s</th>
-                                <th class="text-right font-medium px-4 py-2" title="Speculative draft acceptance: accepted / generated draft tokens for this request. Blank when speculative decoding was off or nothing was drafted.">Draft acc</th>
-                                <th class="text-right font-medium px-4 py-2">Wall (s)</th>
+                                <th class="text-left font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Time</th>
+                                <th class="text-left font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Model</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Prompt tok</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Prompt t/s</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Gen tok</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Gen t/s</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900" title="Speculative draft acceptance: accepted / generated draft tokens for this request. Blank when speculative decoding was off or nothing was drafted.">Draft acc</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Wall (s)</th>
                             </tr>
                         </thead>
                         <tbody id="history-requests-body" class="text-gray-300"></tbody>
@@ -840,7 +848,13 @@
                 </div>
                 <textarea id="user-prompt" rows="3" disabled class="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-gray-100 disabled:opacity-50 resize-none shadow-sm placeholder-gray-500" placeholder="Waiting for server..."></textarea>
                 <div class="flex justify-between items-center">
-                    <span id="input-token-count" class="text-xs text-gray-500">~0 tokens</span>
+                    <div class="flex items-center gap-2">
+                        <span id="input-token-count" class="text-xs text-gray-500">~0 tokens</span>
+                        <button type="button" id="attach-image-btn" class="text-gray-500 hover:text-gray-300 transition-colors p-1 rounded hover:bg-gray-800" title="Attach image(s) for multimodal models" disabled>
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+                        </button>
+                        <input type="file" id="image-file-input" accept="image/*" multiple class="hidden">
+                    </div>
                     <div class="flex-1 flex justify-center">
                         <span id="status-indicator" class="text-xs text-indigo-400 hidden animate-pulse">Generating...</span>
                     </div>
@@ -1069,10 +1083,13 @@
         <!-- Height capped at a third of width (aspect-ratio 3/1) -- wide and
              shallow reads better for time series. max-height keeps it from
              overflowing on a narrow/tall window. -->
-        <div class="flex-1 flex items-start justify-center overflow-auto">
-        <div class="bg-gray-900 border border-gray-700 rounded-xl relative w-full p-4" style="aspect-ratio: 3 / 1; max-height: 100%;">
+        <div class="flex-1 flex flex-col items-center overflow-y-auto">
+        <div class="bg-gray-900 border border-gray-700 rounded-xl relative w-full p-4" style="aspect-ratio: 3 / 1; max-height: 60vh;">
             <canvas id="expandedChartCanvas"></canvas>
         </div>
+        <!-- Details panel: populated when a Monitor/History row is clicked,
+             showing the full launch config + all row data for that request. -->
+        <div id="expand-details" class="hidden w-full max-w-6xl mt-3 mb-2"></div>
         </div>
         <!-- Time window controls: only shown for the classic single/dual-line
              sidebar charts (temp/power/CPU/GPU util/CPU temp/net/tokens-per-sec),
