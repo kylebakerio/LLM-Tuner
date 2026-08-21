@@ -55,12 +55,29 @@ expensive part only shows up when the layers are split across devices.
 
 ## Why I think this happens
 
-In common/speculative.cpp the MTP process() hook runs a synchronous catch-up decode in
-the draft context for every prefill ubatch (unless the model is mem-shared — the
-"e.g Gemma4" comment). On a layer split that means every ubatch the pipeline between
-the two GPUs gets broken by a decode on another context, so the ubatch overlap
-(GGML_SCHED_MAX_COPIES) never gets going. That would explain why single GPU is nearly
-free but any split pays ~2x regardless of backend.
+UPDATE (2026-08-20): I tried to fix this locally and it made me less sure of the
+mechanism -- see below. Leaving my original theory here since it's still plausible
+context, but I no longer think it's the whole story.
+
+Original theory: in common/speculative.cpp the MTP process() hook runs a synchronous
+catch-up decode in the draft context for every prefill ubatch (unless the model is
+mem-shared -- the "e.g Gemma4" comment). On a layer split that means every ubatch the
+pipeline between the two GPUs gets broken by a decode on another context, so the
+ubatch overlap (GGML_SCHED_MAX_COPIES) never gets going.
+
+I patched process() to accumulate the catch-up tokens and flush them in n_batch-sized
+chunks instead of decoding every single ubatch -- draft acceptance/mean-len stayed
+healthy, so the patch itself worked, but prefill didn't recover at all (554.5 t/s,
+same as unpatched). So I went further and just skipped the catch-up decode
+completely (env-gated, diagnostic only -- draft quality goes to ~0%, not something to
+actually ship): that recovered only ~9% of the gap (557.7 -> 606.1 t/s on a fresh
+same-session control, vs a 988.7 t/s no-MTP ceiling on the same harness). So the
+catch-up decode itself is NOT the dominant cost -- something about having
+--spec-type draft-mtp active at all costs the other ~90% of the gap, independent of
+that decode. `graphs reused` recovers almost fully when the decode is skipped (246,
+vs 254 no-MTP) even though prefill throughput doesn't follow, so I'd now discount
+graphs-reused as supporting evidence for whatever the real mechanism is. I don't have
+a profile-level answer for what that remaining cost actually is.
 
 ## Environment
 

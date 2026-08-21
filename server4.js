@@ -481,6 +481,8 @@ function buildLlamaArgs(config, { mapModelPath, deviceArgs }) {
     const chatTemplateFile = toNonEmptyString(config.chatTemplateFile);
     if (config.jinja || chatTemplateFile) args.push('--jinja');
     if (chatTemplateFile) args.push('--chat-template-file', chatTemplateFile);
+    const mmprojPath = toNonEmptyString(config.mmprojPath);
+    if (config.mmprojEnabled && mmprojPath) args.push('--mmproj', mmprojPath);
     const loadMode = toNonEmptyString(config.loadMode);
     if (loadMode) args.push('-lm', loadMode);
     const verbosity = toFiniteNumber(config.verbosity);
@@ -722,14 +724,17 @@ function spawnLlamaProcess(command, args, { cwd, onErrorCleanup } = {}) {
                 const tgMatch = line.match(/tg\s*=\s*(\d+\.?\d*)\s*t\/s/);
                 if (nGenMatch && (tg3sMatch || tgMatch)) {
                     // tg_3s is the last-3-second window -- the actual current
-                    // speed. tg is the average since generation started, which
-                    // barely moves and reads as "pegged" on a live graph.
-                    const liveTpsMatch = tg3sMatch || tgMatch;
+                    // speed. tg is the average since generation started.
+                    // Broadcast BOTH: the live Monitor row wants the average
+                    // (tg), the sidebar card wants the instantaneous (tg_3s).
+                    const avgTps = tgMatch ? tgMatch[1] : (tg3sMatch ? tg3sMatch[1] : '0');
+                    const instTps = tg3sMatch ? tg3sMatch[1] : (tgMatch ? tgMatch[1] : '0');
                     // Generation phase -- clear any prefill-phase state so
                     // telemetry samples taken from here on carry the gen rate,
-                    // not a stale prefill stamp.
-                    liveProgress = { genTps: parseFloat(liveTpsMatch[1]) || null, genTokens: parseInt(nGenMatch[1], 10) || null };
-                    broadcastState(`GEN_PROGRESS:${liveTpsMatch[1]}:${nGenMatch[1]}:${nGenMatch[1]}`);
+                    // not a stale prefill stamp. Use tg_3s for the server-side
+                    // sample (instantaneous = better for a live chart line).
+                    liveProgress = { genTps: parseFloat(instTps) || null, genTokens: parseInt(nGenMatch[1], 10) || null };
+                    broadcastState(`GEN_PROGRESS:${avgTps}:${instTps}:${nGenMatch[1]}`);
                     markRequestActivity();
                 }
 
@@ -875,11 +880,18 @@ function spawnLlamaProcess(command, args, { cwd, onErrorCleanup } = {}) {
         // FATAL_LINE_RE (correctly) no longer matches every 'error:' line, so
         // failures where llama-server exits ON ITS OWN before becoming ready
         // (failed to load model/draft, context creation, Vulkan OOM) would
-        // otherwise die silently -- surface their last error lines.
+        // otherwise die silently -- surface their last error lines. Must be
+        // computed BEFORE the state reset below and sent in the SAME
+        // broadcastState call as the 'stopped' transition -- the client only
+        // renders a visible error bubble when state and error co-arrive in one
+        // SSE message (see handleSseMessage's 'stopped' branch); splitting
+        // them into two broadcasts (error-while-'starting', then
+        // stopped-with-no-error) makes the failure die silently in the UI.
+        let launchFailureMsg = '';
         if (llamaProcess === proc && serverState !== 'ready' && serverState !== 'stopped') {
             const errLines = masterLogBuffer.filter(l => /\sE\s|error|failed/i.test(l)).slice(-2);
             if (errLines.length > 0) {
-                broadcastState('', 'Launch failed: ' + errLines.join(' | ').slice(0, 300));
+                launchFailureMsg = 'Launch failed: ' + errLines.join(' | ').slice(0, 300);
             }
         }
         proc.stdout.removeAllListeners('data');
@@ -890,7 +902,7 @@ function spawnLlamaProcess(command, args, { cwd, onErrorCleanup } = {}) {
             currentModel = '';
             isRpc = false;
             currentLaunchConfig = null;
-            broadcastState();
+            broadcastState('', launchFailureMsg);
         }
     });
 
@@ -1347,7 +1359,23 @@ async function logCompletedRequest(timing, samples, completedAt, { config: cfgPa
             draftGenerated: timing.draftGenerated ?? null,
             draftMeanLen: timing.draftMeanLen ?? null,
             aborted: !!timing.aborted,
-            metrics: samples
+            metrics: samples,
+            detail: {
+                modelPath: cfg.modelPath,
+                ctx: cfg.ctx,
+                ngl: cfg.ngl,
+                rpc: cfg.rpcTarget ?? 'no',
+                transport: cfg.rpcTarget ? (cfg.transport || '') : 'Local',
+                devices: cfg.devices ?? null,
+                launchCommand: launchCmd,
+                promptLatency: timing.promptLatency || null,
+                gpuUtil: master.gpu_util ?? null,
+                gpuMemory: master.gpu_mem_used ?? null,
+                gpuPower: master.gpu_power ?? null,
+                gpuTemp: master.gpu_temp ?? null,
+                cpuMemUsed: master.mem_used ?? null,
+                cpuMemAvail: master.mem_avail ?? null,
+            }
         })}`);
     } catch (err) {
         console.error('Failed to log completed request:', err);
@@ -1567,6 +1595,37 @@ const server = http.createServer(async (req, res) => {
                         draftGenerated: cols.length > 35 ? parseNumOrNull(cols[35]) : null,
                         draftMeanLen: cols.length > 36 ? parseNumOrNull(cols[36]) : null,
                         aborted: cols.length > 37 ? cols[37] === '1' : false,
+                        // Full row detail for the expanded row view
+                        detail: {
+                            modelPath: cols[3] || null,
+                            ctx: parseNumOrNull(cols[4]),
+                            ngl: parseNumOrNull(cols[5]),
+                            rpc: cols[6] || null,
+                            argString: cols[8] || null,
+                            launchCommand: cols[9] || null,
+                            promptLatency: parseNumOrNull(cols[15]),
+                            reasonTokens: parseNumOrNull(cols[16]),
+                            loadTime: parseNumOrNull(cols[31]),
+                            // Hardware stats at completion (master)
+                            gpuUtil: parseNumOrNull(cols[17]),
+                            gpuPwr: parseNumOrNull(cols[18]),
+                            gpuTemp: parseNumOrNull(cols[19]),
+                            cpuUtil: parseNumOrNull(cols[20]),
+                            cpuTemp: parseNumOrNull(cols[21]),
+                            vram: parseNumOrNull(cols[22]),
+                            ram: parseNumOrNull(cols[23]),
+                            // Hardware stats at completion (worker)
+                            wGpuUtil: cols.length > 24 ? parseNumOrNull(cols[24]) : null,
+                            wGpuPwr: cols.length > 25 ? parseNumOrNull(cols[25]) : null,
+                            wGpuTemp: cols.length > 26 ? parseNumOrNull(cols[26]) : null,
+                            wCpuUtil: cols.length > 27 ? parseNumOrNull(cols[27]) : null,
+                            wCpuTemp: cols.length > 28 ? parseNumOrNull(cols[28]) : null,
+                            wVram: cols.length > 29 ? parseNumOrNull(cols[29]) : null,
+                            wRam: cols.length > 30 ? parseNumOrNull(cols[30]) : null,
+                            netThroughput: cols.length > 31 ? parseNumOrNull(cols[31]) : null,
+                            // Parsed launch config (structured JSON, if available)
+                            config: cols.length > 32 && cols[32] ? (() => { try { return JSON.parse(cols[32]); } catch (e) { return null; } })() : null,
+                        }
                     });
                 }
                 res.writeHead(200, { 'Content-Type': 'application/json' });

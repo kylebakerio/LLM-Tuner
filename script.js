@@ -16,6 +16,33 @@ function numFieldOrNull(id, parser) {
 }
 function fmtPct(value, decimals = 1) { return isNum(value) ? `${value.toFixed(decimals)}%` : '--%'; }
 function fmtUnit(value, unit, decimals = 0) { return isNum(value) ? `${value.toFixed(decimals)}${unit}` : `--${unit}`; }
+// Compute "avg (min–max)" from an array of {tps} samples. Returns just the
+// average if there's only one sample (no meaningful range). Used for both
+// prefill and gen t/s display on completed Monitor/History rows.
+function fmtTpsWithRange(samples, avgTps) {
+    if (!samples || samples.length === 0) return avgTps != null ? `${Number(avgTps).toFixed(1)}` : '--';
+    const vals = samples.map(s => s.tps).filter(v => isNum(v) && v > 0);
+    if (vals.length === 0) return avgTps != null ? `${Number(avgTps).toFixed(1)}` : '--';
+    const avg = avgTps != null ? Number(avgTps).toFixed(1) : (vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(1);
+    if (vals.length === 1) return avg;
+    const lo = Math.min(...vals).toFixed(1);
+    const hi = Math.max(...vals).toFixed(1);
+    return `${avg} (${lo}–${hi})`;
+}
+// Build a red kwargs annotation for restored messages — used both in the
+// reasoning area (in place of the trace when thinking is off) and in the
+// raw view. Returns '' when there are no kwargs.
+function buildKwargsAnnotation(kw) {
+    if (!kw || Object.keys(kw).length === 0) return '';
+    const parts = [];
+    if (kw.enable_thinking === false) parts.push('<span style="color:#f87171;font-weight:bold">THINKING OFF</span>');
+    else if (kw.enable_thinking === true) parts.push('<span style="color:#4ade80">thinking enabled</span>');
+    for (const [k, v] of Object.entries(kw)) {
+        if (k === 'enable_thinking') continue;
+        parts.push(`<span style="color:#f87171">${escapeHtml(k)}: ${escapeHtml(JSON.stringify(v))}</span>`);
+    }
+    return parts.length ? `<div class="text-xs font-mono text-gray-400">${parts.join(' · ')}</div>` : '';
+}
 function safeRatioPct(numerator, denominator) {
     if (!isNum(numerator) || !isNum(denominator) || denominator <= 0) return 0;
     const pct = (numerator / denominator) * 100;
@@ -25,6 +52,11 @@ function safeRatioPct(numerator, denominator) {
 // --- SSE log/error hooks (kept intentionally lightweight; the real
 // user-facing error surface is the chat-box error bubble in the
 // 'stopped' state handler below) ---
+// Despite the name, this is console-only -- the actual visible error bubble
+// renders in handleSseMessage's `state === 'stopped'` branch (chat-container
+// red box), which requires the SSE message carrying the error to also carry
+// state:'stopped'. If a server-side error path broadcasts them separately,
+// the error is logged here but never shown on screen.
 function displayErrorInUI(err) { console.error('[llama-server error]', err); }
 function appendLogToUI(log) { console.debug('[llama-server log]', log); }
 
@@ -68,6 +100,13 @@ let runningAverages = {
     genTokens: 0,
     genSeconds: 0
 };
+// Delta-tracking for live running average updates during prefill.
+// Each PREFILL_PROGRESS broadcast gives cumulative (nTokens so far,
+// runningAvgTps since prefill start). The elapsed seconds for this
+// batch of tokens = nTokens / runningAvgTps. To avoid double-counting,
+// track the delta from the previous broadcast and only add that.
+let lastPrefillBatchTokens = 0;
+let lastGenBatchTokens = 0;
 
 function updateAverageUI() {
     if (runningAverages.prefillSeconds > 0) {
@@ -497,12 +536,14 @@ function handleSseMessage(e) {
             handlePrefillProgress(progress, tps, nTokens);
         }
         else if (data.log.startsWith('GEN_PROGRESS:')) {
-            // Format from server: GEN_PROGRESS:<tps>:<nDecoded>:<nTokens>
-            // (item 7 Step 2: display live generation speed from print_timing logs)
+            // Format from server: GEN_PROGRESS:<avgTps>:<instTps>:<nDecoded>
+            // avgTps = overall average since gen started (for live Monitor row)
+            // instTps = last-3s window, i.e. current speed (for sidebar card)
             const parts = data.log.split(':');
-            const tps = parseFloat(parts[1]);
-            const nDecoded = parseInt(parts[2]);
-            handleGenProgress(tps, nDecoded);
+            const avgTps = parseFloat(parts[1]);
+            const instTps = parseFloat(parts[2]);
+            const nDecoded = parseInt(parts[3]);
+            handleGenProgress(avgTps, instTps, nDecoded);
         }
         else if (data.log.startsWith('COMPLETION:')) {
             // Server-side, client-agnostic completion capture (Monitor Mode) --
@@ -572,10 +613,21 @@ function handleSseMessage(e) {
             const elapsed = ((Date.now() - data.loadStartTime) / 1000).toFixed(1);
             timerDiv.innerText = `Booting: ${elapsed}s...`;
             bootTimerDisplay.innerText = `${elapsed}s`;
-            // Update progress bar with a pseudo-progress based on elapsed time
-            // Models typically take 5-60s to load, animate the bar slowly
-            const pseudoPct = Math.min((parseFloat(elapsed) / 60) * 100, 95);
-            bootProgressFill.style.width = `${pseudoPct}%`;
+            // Estimate progress from historical load times for this model.
+            // Falls back to a slow time-based animation if no history exists.
+            const modelKey = (data.model || 'unknown').split('/').pop();
+            const hist = JSON.parse(localStorage.getItem('loadTimes') || '{}');
+            const times = hist[modelKey] || [];
+            const avg = times.length > 0 ? times.reduce((a, b) => a + b, 0) / times.length : null;
+            let pct;
+            if (avg) {
+                // Historical estimate: elapsed / average, with a 95% cap
+                pct = Math.min((parseFloat(elapsed) / avg) * 100, 95);
+            } else {
+                // No history: slow time-based animation (60s to 95%)
+                pct = Math.min((parseFloat(elapsed) / 60) * 100, 95);
+            }
+            bootProgressFill.style.width = `${pct}%`;
         }, 100);
     }
 
@@ -596,7 +648,7 @@ function handleSseMessage(e) {
         badge.innerHTML = '<span class="h-2 w-2 rounded-full bg-red-500"></span> ENGINE STOPPED';
         document.getElementById('btn-start-server').classList.remove('hidden'); 
         document.getElementById('btn-stop-server').classList.add('hidden');
-        input.disabled = true; btn.disabled = true; isModelLoaded = false;
+        input.disabled = true; btn.disabled = true; attachBtn.disabled = true; isModelLoaded = false;
 
         // Restore hardware config controls (previously these could get stuck
         // disabled forever because this reset lived in an unreachable
@@ -668,6 +720,18 @@ function handleSseMessage(e) {
         isModelLoaded = true;
         // Capture real load time from server (fixes Item 15a: was always "N/A")
         if (data.finalLoadTime) currentLoadTime = data.finalLoadTime;
+        // Record load time per model for future progress bar estimation
+        if (data.finalLoadTime && data.model) {
+            const modelKey = data.model.split('/').pop();
+            try {
+                const hist = JSON.parse(localStorage.getItem('loadTimes') || '{}');
+                if (!hist[modelKey]) hist[modelKey] = [];
+                hist[modelKey].push(parseFloat(data.finalLoadTime));
+                // Keep last 10 loads per model
+                if (hist[modelKey].length > 10) hist[modelKey] = hist[modelKey].slice(-10);
+                localStorage.setItem('loadTimes', JSON.stringify(hist));
+            } catch (e) {}
+        }
         setTimeout(() => { masterBaseVram = currentVramSnapshot; }, 2000);
 
         // Bug: a client that connects (or refreshes) while the server is
@@ -685,6 +749,7 @@ function handleSseMessage(e) {
         // remove 'disabled' from the #user-prompt and the #submit-btn
         document.querySelector('#user-prompt').disabled = false;
         document.querySelector('#submit-btn').disabled = false;
+        attachBtn.disabled = false;
 
 
         // Identify and remove existing Tailwind classes that might clash
@@ -733,6 +798,11 @@ connectSSE();
 
 // --- Item #22: Persist last launch config to localStorage ---
 const LAST_LAUNCH_CONFIG_KEY = 'last_launch_config';
+// Prefill for the mmproj path field on a config that's never set one --
+// this rig's known-working multimodal projector (found the hard way: HF
+// snapshot caching put it in a different snapshot dir than the model
+// weights it's paired with by default).
+const DEFAULT_MMPROJ_PATH = '/home/kyle/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/27af057ecb382ddfea5d12837360a8980560e3ed/mmproj-F16.gguf';
 
 function saveLastLaunchConfig(config) {
     try { localStorage.setItem(LAST_LAUNCH_CONFIG_KEY, JSON.stringify(config)); } catch(e) {}
@@ -852,6 +922,13 @@ async function applyConfigToUI(config) {
     document.getElementById('jinja-toggle').checked = !!config.jinja;
     document.getElementById('server-chat-template-file').value = config.chatTemplateFile || '';
 
+    // Restore multimodal (mmproj). `?? DEFAULT_MMPROJ_PATH` (not `||`) so a
+    // config that never had this field (older saved profile) prefills the
+    // known-good path, but a field the user explicitly cleared to '' stays
+    // cleared.
+    document.getElementById('mmproj-toggle').checked = !!config.mmprojEnabled;
+    document.getElementById('server-mmproj-path').value = config.mmprojPath ?? DEFAULT_MMPROJ_PATH;
+
     // Restore load mode
     document.getElementById('server-load-mode').value = config.loadMode || '';
 
@@ -957,6 +1034,8 @@ function buildConfigFromUI() {
         nCpuMoe: numFieldOrNull('server-n-cpu-moe', parseInt),
         jinja: document.getElementById('jinja-toggle').checked,
         chatTemplateFile: document.getElementById('server-chat-template-file').value.trim() || null,
+        mmprojEnabled: document.getElementById('mmproj-toggle').checked,
+        mmprojPath: document.getElementById('server-mmproj-path').value.trim() || null,
         loadMode: document.getElementById('server-load-mode').value || null,
         verbosity: numFieldOrNull('server-verbosity', parseInt),
         argString: document.getElementById('extra-args').value.trim() || null
@@ -1118,7 +1197,7 @@ document.getElementById('btn-start-server').addEventListener('click', () => {
  'device-manual-a', 'device-manual-b',
  'server-temp', 'server-top-k', 'server-top-p', 'server-min-p',
  'server-presence-penalty', 'server-repeat-penalty', 'server-n-cpu-moe',
- 'jinja-toggle', 'server-chat-template-file', 'server-load-mode'
+ 'jinja-toggle', 'server-chat-template-file', 'mmproj-toggle', 'server-mmproj-path', 'server-load-mode'
 ].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.addEventListener(el.tagName === 'SELECT' || el.type === 'checkbox' ? 'change' : 'input', refreshCommandPreview);
@@ -1378,7 +1457,25 @@ function toggleRaw(btnEl, isMarkdown) {
         btnEl.dataset.mode = 'rendered';
         btnEl.innerText = 'View Raw';
     } else {
-        contentDiv.innerHTML = `<pre class="text-xs text-gray-300 overflow-x-auto p-3 bg-gray-950 rounded border border-gray-800">${escapeHtml(rawText)}</pre>`;
+        // Kwargs annotation: THINKING OFF / custom template kwargs, shown in
+        // red above the raw content so the user knows what template options
+        // were applied to this request.
+        let kwHtml = '';
+        const kwRaw = btnEl.dataset.kwargs;
+        if (kwRaw) {
+            try {
+                const kw = JSON.parse(kwRaw);
+                const parts = [];
+                if (kw.enable_thinking === false) parts.push('<span style="color:#f87171;font-weight:bold">THINKING OFF</span>');
+                else if (kw.enable_thinking === true) parts.push('<span style="color:#4ade80">thinking enabled</span>');
+                for (const [k, v] of Object.entries(kw)) {
+                    if (k === 'enable_thinking') continue;
+                    parts.push(`<span style="color:#f87171">${escapeHtml(k)}: ${escapeHtml(JSON.stringify(v))}</span>`);
+                }
+                if (parts.length) kwHtml = `<div class="text-xs font-mono mb-2 px-3 pt-2">${parts.join(' · ')}</div>`;
+            } catch (e) {}
+        }
+        contentDiv.innerHTML = kwHtml + `<pre class="text-xs text-gray-300 overflow-x-auto p-3 bg-gray-950 rounded border border-gray-800">${escapeHtml(rawText)}</pre>`;
         contentDiv.className = 'msg-content mt-2 overflow-x-auto break-words';
         btnEl.dataset.mode = 'raw';
         btnEl.innerText = 'View Rendered';
@@ -1450,6 +1547,9 @@ let activeTimelineEls = null; // { svg, prefillLine, thinkLine, answerLine } for
 // chart (the loop used to null out the whole Prefill dataset every tick).
 let livePrefillTps = null;
 let livePrefillProgress = null;
+// Live gen t/s samples (instantaneous) -- used to compute the min-max range
+// displayed on the completed Monitor/History row alongside the average.
+let activeGenSamples = [];
 
 // Monitor tab's Live Request card -- driven by the same broadcasts as the
 // sidebar so it reflects requests from any client, not just this chat.
@@ -1504,6 +1604,18 @@ function handlePrefillProgress(progress, tps, nTokens) {
         activePrefillSamples.push({ progress, tps });
         livePrefillTps = tps;
         livePrefillProgress = progress;
+        // Update session-wide weighted average in real time using deltas.
+        // nTokens/tokensPerSec = accumulated seconds since prefill start.
+        // Delta tokens = nTokens - lastPrefillBatchTokens; delta seconds = deltaTokens / tps.
+        if (!isNaN(nTokens) && nTokens > 0 && tps > 0) {
+            const deltaTokens = nTokens - lastPrefillBatchTokens;
+            if (deltaTokens > 0) {
+                runningAverages.prefillTokens += deltaTokens;
+                runningAverages.prefillSeconds += deltaTokens / tps;
+                lastPrefillBatchTokens = nTokens;
+                updateAverageUI();
+            }
+        }
     }
     updateLiveRequestCard('prefill', { progress, tps, nTokens });
     liveMonitorRow = { ...(liveMonitorRow || { startedAt: Date.now() }), live: true, model: lastKnownModelName, promptTokens: isNaN(nTokens) ? null : nTokens, promptTps: isNaN(tps) ? null : tps };
@@ -1556,26 +1668,41 @@ function hidePrefillLoadingBar() {
     }
 }
 
-// Handle live generation progress from server's print_timing SSE events (item 7 Step 2)
-// Format: GEN_PROGRESS:<tps>:<nDecoded>:<nTokens>
-function handleGenProgress(tps, nDecoded) {
+// Handle live generation progress from server's print_timing SSE events
+// Format: GEN_PROGRESS:<avgTps>:<instTps>:<nDecoded>
+function handleGenProgress(avgTps, instTps, nDecoded) {
     // status-indicator is owned by submitPrompt's tpsLoop -- see the matching
     // note in handlePrefillProgress above.
-    updateLiveRequestCard('gen', { tps, nDecoded });
-    liveMonitorRow = { ...(liveMonitorRow || { startedAt: Date.now() }), live: true, model: lastKnownModelName, genTokens: isNaN(nDecoded) ? null : nDecoded, genTps: isNaN(tps) ? null : tps };
+    updateLiveRequestCard('gen', { tps: instTps, nDecoded });
+    // Update session-wide weighted average in real time.
+    if (!isNaN(nDecoded) && nDecoded > 0 && !isNaN(avgTps) && avgTps > 0) {
+        const deltaTokens = nDecoded - lastGenBatchTokens;
+        if (deltaTokens > 0) {
+            runningAverages.genTokens += deltaTokens;
+            runningAverages.genSeconds += deltaTokens / avgTps;
+            lastGenBatchTokens = nDecoded;
+            updateAverageUI();
+        }
+    }
+    // Live Monitor row gets the AVERAGE (not the instantaneous window)
+    liveMonitorRow = { ...(liveMonitorRow || { startedAt: Date.now() }), live: true, model: lastKnownModelName, genTokens: isNaN(nDecoded) ? null : nDecoded, genTps: isNaN(avgTps) ? null : avgTps };
     if (isMonitorModeActive) renderMonitorTable();
     const abLiveG = document.getElementById('ab-live');
-    const abLiveGText = `generating ${isNaN(nDecoded) ? '?' : nDecoded.toLocaleString()} tok @ ${isNaN(tps) ? '?' : tps.toFixed(1)} t/s`;
+    // instTps (master) is the instantaneous rate; the live sweep block shows
+    // the same text as the top strip so the two can't drift.
+    const abLiveGText = `generating ${isNaN(nDecoded) ? '?' : nDecoded.toLocaleString()} tok @ ${isNaN(instTps) ? '?' : instTps.toFixed(1)} t/s`;
     if (abLiveG) abLiveG.textContent = abLiveGText;
     updateLiveSweepBlock(abLiveGText);
 
-    // Live gen speed in the sidebar card
-    if (!isNaN(tps)) {
-        document.getElementById('metric-gen').innerText = `${tps.toFixed(1)} t/s`;
+    // Sidebar card gets the instantaneous speed (current, not average)
+    if (!isNaN(instTps)) {
+        document.getElementById('metric-gen').innerText = `${instTps.toFixed(1)} t/s`;
     }
     if (!isNaN(nDecoded)) {
         document.getElementById('metric-gen-tokens').innerText = `${nDecoded} tokens`;
     }
+    // Track instantaneous gen samples for min-max range at completion
+    if (!isNaN(instTps)) activeGenSamples.push({ tps: instTps, nDecoded });
 }
 
 // Builds/updates the SVG timeline. widthPct* are 0-100 proportions of the
@@ -1643,11 +1770,32 @@ async function submitPrompt() {
     inputEl.value = '';
 
     const timestamp = new Date().toLocaleTimeString();
-    chatContext.push({ role: 'user', content: text, timestamp });
+    chatContext.push({ role: 'user', content: text, timestamp, images: attachedImages.length > 0 ? attachedImages.map(img => img.dataUrl) : null });
 
     // Always pass full chat context so the server can reuse KV-cache
-    const apiMessages = chatContext.map(m => ({role: m.role, content: m.content}));
+    // Build API messages: when a user message has attached images, format as
+    // OpenAI multimodal content array ([{type:"text",...}, {type:"image_url",...}])
+    // so llama.cpp's mtmd multimodal backend can process them.
+    const apiMessages = chatContext.map(m => {
+        if (m.images && m.images.length > 0) {
+            return {
+                role: m.role,
+                content: [
+                    { type: 'text', text: m.content },
+                    ...m.images.map(url => ({ type: 'image_url', image_url: { url } }))
+                ]
+            };
+        }
+        return { role: m.role, content: m.content };
+    });
+    // Consume the attached images so they don't persist into the next prompt
+    attachedImages = [];
+    const attachedImageContainer = document.getElementById('attached-images');
+    if (attachedImageContainer) attachedImageContainer.remove();
 
+    // Reset live batch trackers for running average delta computation
+    lastPrefillBatchTokens = 0;
+    lastGenBatchTokens = 0;
     // Prepare UI & Reset session data
     inputEl.disabled = true; document.getElementById('submit-btn').disabled = true; document.getElementById('status-indicator').classList.remove('hidden'); document.getElementById('abort-btn').classList.remove('hidden');
     document.getElementById('status-indicator').innerText = 'Loading context...';
@@ -1661,6 +1809,8 @@ async function submitPrompt() {
     // sent. Appending parsed fragments leaves existing nodes -- and their
     // chart instances -- untouched.
     const chatBox = document.getElementById('chat-container');
+    const latestUserMsg = [...chatContext].reverse().find(m => m.role === 'user');
+    const imgThumbs = (latestUserMsg && latestUserMsg.images) ? `<div class="flex flex-wrap gap-2 mb-2">${latestUserMsg.images.map(u => `<img src="${u}" class="h-16 w-16 object-cover rounded-lg border border-gray-600">`).join('')}</div>` : '';
     chatBox.insertAdjacentHTML('beforeend', `
         <div class="msg-wrapper p-4 rounded-xl border border-gray-700 bg-gray-800 max-w-4xl mx-auto shadow-sm w-full mb-4">
             <div class="flex justify-between items-center mb-2">
@@ -1670,6 +1820,7 @@ async function submitPrompt() {
                     <button class="text-[10px] text-gray-500 hover:text-gray-300 transition-colors" data-mode="rendered" data-raw="${escapeHtml(text)}" onclick="toggleRaw(this, false)">View Raw</button>
                 </div>
             </div>
+            ${imgThumbs}
             <div class="msg-content text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto break-words">${escapeHtml(text)}</div>
         </div>
         <div id="active-ast" class="msg-wrapper p-5 rounded-xl border border-indigo-900/30 bg-gray-900 max-w-4xl mx-auto shadow-sm w-full mb-4">
@@ -1815,8 +1966,12 @@ async function submitPrompt() {
                     const pct = Math.min((nDecoded / slot.n_prompt_tokens) * 100, 100).toFixed(1);
                     window.lastSlotProgress = `${nDecoded} / ${slot.n_prompt_tokens} (${pct}%)`;
                 }
-            }
-        } catch (e) {}
+                         }
+                    } catch (e) {
+                        // Re-throw server errors so the outer handler displays them.
+                        // Swallow benign parse failures (partial lines, empty chunks).
+                        if (e.message && !e.message.includes('JSON') && !e.message.includes('Unexpected') && !e.message.startsWith('data:')) throw e;
+                    }
     }, 250);
 
     let lastTpsTickAt = Date.now();
@@ -1894,6 +2049,15 @@ async function submitPrompt() {
             signal: abortController.signal
         });
 
+        // Handle HTTP error responses (e.g. model doesn't support images).
+        // fetch doesn't throw on 4xx/5xx — only on network failures.
+        if (!response.ok) {
+            const errBody = await response.text();
+            let msg;
+            try { const j = JSON.parse(errBody); msg = j.error?.message || j.error || errBody; } catch { msg = errBody; }
+            throw new Error(msg);
+        }
+
         const reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
         let fullContent = ""; let fullReasoning = "";
@@ -1934,6 +2098,11 @@ async function submitPrompt() {
                 if (line.startsWith('data: ') && line !== 'data: [DONE]') {
                     try {
                         const data = JSON.parse(line.slice(6));
+
+                        // Server returned an error mid-stream
+                        if (data.error) {
+                            throw new Error(data.error.message || data.error);
+                        }
                         
                         // End of stream Usage metrics
                         if (data.usage) {
@@ -2062,7 +2231,12 @@ async function submitPrompt() {
                 }
             }
         }
-        chatContext.push({ role: 'assistant', content: fullContent, reasoning: fullReasoning, timestamp: new Date().toLocaleTimeString(), prefillMetrics, thinkMetrics, answerMetrics, responseMetrics, prefillSamples: activePrefillSamples });
+        chatContext.push({ role: 'assistant', content: fullContent, reasoning: fullReasoning, timestamp: new Date().toLocaleTimeString(), prefillMetrics, thinkMetrics, answerMetrics, responseMetrics, prefillSamples: activePrefillSamples, templateKwargs: Object.keys(templateKwargs).length > 0 ? templateKwargs : null });
+        // Store kwargs on the raw button so the "View Raw" toggle can display
+        // them as a red annotation (THINKING OFF, custom kwargs, etc.)
+        if (rawBtn && Object.keys(templateKwargs).length > 0) {
+            rawBtn.dataset.kwargs = JSON.stringify(templateKwargs);
+        }
         // Now that streaming is done and fullContent is final, check whether
         // this response is long enough to collapse -- checking mid-stream
         // would mean the collapse boundary jumping around under the user's
@@ -2104,13 +2278,91 @@ async function submitPrompt() {
         document.getElementById('active-ast').removeAttribute('id');
         // Stop pollTelemetry from feeding the completed bubble's chart
         hwChartContainer = null; hwChartCanvas = null; hwChartInst = null;
-        activeTimelineEls = null; activePrefillSamples = [];
+        activeTimelineEls = null; activePrefillSamples = []; activeGenSamples = [];
         // Reset prompt token counter
         document.getElementById('input-token-count').innerText = '~0 tokens';
     }
 }
 
 document.getElementById('submit-btn').addEventListener('click', submitPrompt);
+// The Stop button fires abortController.abort(), which rejects the in-flight
+// fetch with an AbortError — caught by the try/catch above (err.name==='AbortError'
+// is silently swallowed) and the finally block restores the UI.
+document.getElementById('abort-btn').addEventListener('click', () => {
+    if (abortController) abortController.abort();
+});
+
+// --- Multimodal image attachment ---
+// Stores base64 data URLs of attached images. Cleared after submission.
+let attachedImages = []; // [{ dataUrl, name }]
+const attachBtn = document.getElementById('attach-image-btn');
+const imageInput = document.getElementById('image-file-input');
+if (attachBtn && imageInput) {
+    attachBtn.addEventListener('click', () => imageInput.click());
+    imageInput.addEventListener('change', () => {
+        Array.from(imageInput.files).forEach(file => {
+            const reader = new FileReader();
+            reader.onload = () => {
+                attachedImages.push({ dataUrl: reader.result, name: file.name });
+                renderAttachedImageThumbnails();
+            };
+            reader.readAsDataURL(file);
+        });
+        imageInput.value = ''; // reset so re-selecting the same file works
+    });
+}
+// Render/remove thumbnails above the textarea
+function renderAttachedImageThumbnails() {
+    let container = document.getElementById('attached-images');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'attached-images';
+        container.className = 'flex flex-wrap gap-2 mb-2';
+        const ta = document.getElementById('user-prompt');
+        ta.parentElement.insertBefore(container, ta);
+    }
+    container.innerHTML = '';
+    attachedImages.forEach((img, i) => {
+        const wrap = document.createElement('div');
+        wrap.className = 'relative group';
+        wrap.innerHTML = `<img src="${img.dataUrl}" class="h-16 w-16 object-cover rounded-lg border border-gray-700" title="${escapeHtml(img.name)}">
+            <button type="button" class="absolute -top-1 -right-1 h-4 w-4 rounded-full bg-red-600 text-white text-[10px] leading-4 hover:bg-red-500 opacity-0 group-hover:opacity-100 transition-opacity" title="Remove">✕</button>`;
+        wrap.querySelector('button').addEventListener('click', () => {
+            attachedImages.splice(i, 1);
+            renderAttachedImageThumbnails();
+        });
+        container.appendChild(wrap);
+    });
+    if (attachedImages.length === 0) container.remove();
+}
+
+// --- Tokens/sec chart x-axis toggle (time-spaced vs evenly-spaced) ---
+// `flag` is an object { value: boolean } so the closure reads/writes it directly.
+function initTpsChartToggle(btnId, chartGetter, flag, storageKey, isMonitor) {
+    const btn = document.getElementById(btnId);
+    if (!btn) return;
+    const chart = chartGetter();
+    if (!chart) return;
+    btn.textContent = flag.value ? 'time' : 'cat';
+    btn.addEventListener('click', () => {
+        const c = chartGetter();
+        if (!c) return;
+        flag.value = !flag.value;
+        localStorage.setItem(storageKey, flag.value);
+        c.destroy();
+        const canvas = document.getElementById(isMonitor ? 'monitorTpsChart' : 'historyTpsChart');
+        if (canvas) {
+            if (isMonitor) {
+                window.monitorTpsChart = createTpsChart(canvas, flag.value);
+                renderMonitorChart();
+            } else {
+                window.historyTpsChart = createTpsChart(canvas, flag.value);
+                renderHistoryChart();
+            }
+        }
+        btn.textContent = flag.value ? 'time' : 'cat';
+    });
+}
 
 // --- Live token counter on prompt textarea ---
 document.getElementById('user-prompt').addEventListener('input', (e) => {
@@ -3023,6 +3275,7 @@ function renderChatSession(messages, scrollToIndex = -1) {
     messages.forEach((msg, idx) => {
         const ts = msg.timestamp || '';
         if (msg.role === 'user') {
+            const imgThumbs = msg.images ? `<div class="flex flex-wrap gap-2 mb-2">${msg.images.map(u => `<img src="${u}" class="h-16 w-16 object-cover rounded-lg border border-gray-600" loading="lazy">`).join('')}</div>` : '';
             chatBox.insertAdjacentHTML('beforeend', `
                 <div id="msg-${idx}" class="msg-wrapper p-4 rounded-xl border border-gray-700 bg-gray-800 max-w-4xl mx-auto shadow-sm w-full mb-4">
                     <div class="flex justify-between items-center mb-2">
@@ -3032,6 +3285,7 @@ function renderChatSession(messages, scrollToIndex = -1) {
                             <button class="text-[10px] text-gray-500 hover:text-gray-300 transition-colors" data-mode="rendered" data-raw="${escapeHtml(msg.content)}" onclick="toggleRaw(this, false)">View Raw</button>
                         </div>
                     </div>
+                    ${imgThumbs}
                     <div class="msg-content text-sm text-gray-100 whitespace-pre-wrap overflow-x-auto break-words">${escapeHtml(msg.content)}</div>
                 </div>
             `);
@@ -3042,7 +3296,7 @@ function renderChatSession(messages, scrollToIndex = -1) {
                         <div class="text-xs text-indigo-400 uppercase tracking-wider">Assistant</div>
                         <div class="flex items-center gap-3">
                             <div class="text-[10px] text-gray-500">${ts}</div>
-                            <button class="raw-btn text-[10px] text-gray-500 hover:text-gray-300 transition-colors" data-mode="rendered" data-raw="${escapeHtml(msg.content)}" onclick="toggleRaw(this, true)">View Raw</button>
+                            <button class="raw-btn text-[10px] text-gray-500 hover:text-gray-300 transition-colors" data-mode="rendered" data-raw="${escapeHtml(msg.content)}" ${msg.templateKwargs ? `data-kwargs='${JSON.stringify(msg.templateKwargs).replace(/'/g, "&#39;")}'` : ''} onclick="toggleRaw(this, true)">View Raw</button>
                         </div>
                     </div>
                     ${msg.prefillMetrics ? `
@@ -3064,7 +3318,7 @@ function renderChatSession(messages, scrollToIndex = -1) {
                         </div>
                         <div class="reasoning-body text-xs text-gray-500 font-mono p-3 overflow-x-auto overflow-y-hidden relative cursor-pointer fade-bottom" style="max-height: 4.5rem;" onclick="toggleReasoning(this.previousElementSibling)">${escapeHtml(msg.reasoning)}</div>
                     </div>
-                    ` : ''}
+                    ` : (msg.templateKwargs ? `<div class="reasoning-container border border-gray-800 rounded-lg bg-gray-950/50 mb-3 mt-2"><div class="px-3 py-2">${buildKwargsAnnotation(msg.templateKwargs)}</div></div>` : '')}
                     <div class="msg-content prose prose-invert max-w-none text-sm overflow-x-auto break-words">${marked.parse(msg.content)}</div>
                 </div>
             `);
@@ -3167,20 +3421,43 @@ function renderChatHistory() {
 }
 
 function saveChatSession() {
+    // Strip .images from messages before persisting — base64 data URLs would
+    // blow past the ~5MB localStorage quota on a single photo upload.
+    const msgsWithoutImages = chatContext.map(({ images: _drop, ...rest }) => rest);
     const existingIndex = allChatSessions.findIndex(s => s.id === currentSessionId);
-    const session = { id: currentSessionId, messages: [...chatContext] };
+    const session = { id: currentSessionId, messages: msgsWithoutImages };
     if (existingIndex > -1) {
         allChatSessions[existingIndex] = session;
     } else {
         allChatSessions.push(session);
     }
-    localStorage.setItem('cluster_chat_history', JSON.stringify(allChatSessions));
+    try {
+        localStorage.setItem('cluster_chat_history', JSON.stringify(allChatSessions));
+    } catch (e) {
+        // If we still exceed quota (old data from before the strip), wipe and retry
+        if (e.name === 'QuotaExceededError') {
+            console.warn('Chat history exceeded localStorage quota; trimming old sessions.');
+            while (allChatSessions.length > 1) allChatSessions.shift();
+            try { localStorage.setItem('cluster_chat_history', JSON.stringify(allChatSessions)); } catch(e2) {
+                console.warn('Still over quota after trim; clearing history.', e2.message);
+                localStorage.removeItem('cluster_chat_history');
+            }
+        } else throw e;
+    }
     renderChatHistory();
 }
 
 try {
     const saved = localStorage.getItem('cluster_chat_history');
-    if (saved) { allChatSessions = JSON.parse(saved); renderChatHistory(); }
+    if (saved) {
+        allChatSessions = JSON.parse(saved);
+        // Strip any images from previously-loaded sessions (may have been
+        // saved before the strip fix, or from a different client version).
+        allChatSessions.forEach(s => {
+            s.messages.forEach(m => { delete m.images; });
+        });
+        renderChatHistory();
+    }
 } catch(e) {}
 
 document.getElementById('btn-clear-history').addEventListener('click', () => {
@@ -3280,6 +3557,73 @@ let expandedChartInst = null;
 let currentExpandedChartId = null;
 let currentExpandedIsHw = false;
 
+// Renders the launch-config + metrics details panel below the expanded omni
+// chart. Called from expandMonitorRequestChart when a row is clicked.
+function renderExpandDetails(row) {
+    const det = document.getElementById('expand-details');
+    if (!det) return;
+    const d = row.detail;
+    if (!d) { det.innerHTML = ''; det.classList.add('hidden'); return; }
+    const cfg = d.config || {};
+    const fmt = (v, u) => v != null ? `${Number(v).toFixed(u ?? 1)}` : '--';
+    const fmtKb = v => v != null ? `${(Number(v) / 1024).toFixed(1)} GB` : '--';
+    const esc = v => v != null ? escapeHtml(String(v)) : '--';
+
+    // Build config section from parsed launch config
+    let cfgHtml = '';
+    if (cfg.modelPath) {
+        cfgHtml += `<div class="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-1 text-xs font-mono">`;
+        cfgHtml += `<span class="text-gray-500">model</span><span class="text-gray-200 col-span-2 break-all">${esc(cfg.modelPath)}</span>`;
+        if (cfg.ctx) cfgHtml += `<span class="text-gray-500">ctx</span><span class="text-gray-200">${cfg.ctx}</span>`;
+        if (cfg.ngl) cfgHtml += `<span class="text-gray-500">ngl</span><span class="text-gray-200">${cfg.ngl}</span>`;
+        if (cfg.port) cfgHtml += `<span class="text-gray-500">port</span><span class="text-gray-200">${cfg.port}</span>`;
+        if (cfg.build) cfgHtml += `<span class="text-gray-500">build</span><span class="text-gray-200">${esc(cfg.build)}</span>`;
+        if (cfg.devices) cfgHtml += `<span class="text-gray-500">devices</span><span class="text-gray-200">${esc(JSON.stringify(cfg.devices))}</span>`;
+        if (cfg.tensorSplit) cfgHtml += `<span class="text-gray-500">tensor-split</span><span class="text-gray-200">${esc(cfg.tensorSplit)}</span>`;
+        if (cfg.rpcTarget) cfgHtml += `<span class="text-gray-500">rpc</span><span class="text-gray-200">${esc(cfg.rpcTarget)}</span>`;
+        if (cfg.cacheK) cfgHtml += `<span class="text-gray-500">cache-k</span><span class="text-gray-200">${esc(cfg.cacheK)}${cfg.cacheV ? ' / ' + esc(cfg.cacheV) : ''}</span>`;
+        if (cfg.specType) cfgHtml += `<span class="text-gray-500">spec</span><span class="text-gray-200">${esc(cfg.specType)}${cfg.specDraftNMax != null ? ' (max ' + cfg.specDraftNMax + ')' : ''}</span>`;
+        if (cfg.sampling) {
+            const s = cfg.sampling;
+            cfgHtml += `<span class="text-gray-500">sampling</span><span class="text-gray-200">temp ${s.temp ?? '--'} top-k ${s.top_k ?? '--'} top-p ${s.top_p ?? '--'}${s.min_p != null ? ' min-p ' + s.min_p : ''}</span>`;
+        }
+        if (cfg.jinja !== undefined) cfgHtml += `<span class="text-gray-500">jinja</span><span class="text-gray-200">${cfg.jinja ? 'on' : 'off'}</span>`;
+        if (cfg.chatTemplateFile) cfgHtml += `<span class="text-gray-500">template</span><span class="text-gray-200">${esc(cfg.chatTemplateFile)}</span>`;
+        if (cfg.mmprojEnabled && cfg.mmprojPath) cfgHtml += `<span class="text-gray-500">mmproj</span><span class="text-gray-200">${esc(cfg.mmprojPath)}</span>`;
+        if (cfg.loadMode) cfgHtml += `<span class="text-gray-500">load</span><span class="text-gray-200">${esc(cfg.loadMode)}</span>`;
+        if (cfg.verbosity != null) cfgHtml += `<span class="text-gray-500">verbosity</span><span class="text-gray-200">${cfg.verbosity}</span>`;
+        cfgHtml += `</div>`;
+    }
+
+    // Raw command (copyable)
+    const rawCmd = d.launchCommand || cfg.rawCommand || cfg.argString || null;
+
+    det.innerHTML = `
+    <div class="bg-gray-900 border border-gray-700 rounded-xl p-4 text-xs space-y-3">
+        <h3 class="text-sm font-bold text-white mb-2">Request Details</h3>
+        ${cfgHtml}
+        ${rawCmd ? `<div class="mt-2"><div class="text-gray-500 mb-1">Launch command</div><div class="relative"><pre class="text-[10px] font-mono text-gray-300 bg-gray-950 rounded border border-gray-800 p-2 overflow-x-auto break-all">${esc(rawCmd)}</pre><button onclick="navigator.clipboard.writeText(this.parentElement.querySelector('pre').textContent);this.textContent='Copied!';setTimeout(()=>{this.textContent='Copy'},1500)" class="absolute top-1 right-1 text-[10px] text-gray-500 hover:text-gray-300 bg-gray-800 px-1.5 py-0.5 rounded border border-gray-700">Copy</button></div></div>` : ''}
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-1 text-xs font-mono">
+            <span class="text-gray-500">timestamp</span><span class="text-gray-200">${row.timestamp ? new Date(row.timestamp).toLocaleString() : '--'}</span>
+            <span class="text-gray-500">run id</span><span class="text-gray-200">${esc(row.runId)}</span>
+            <span class="text-gray-500">wall time</span><span class="text-gray-200">${fmt(row.wallTime)}s</span>
+            <span class="text-gray-500">load time</span><span class="text-gray-200">${fmt(d.loadTime)}s</span>
+            <span class="text-gray-500">prompt latency</span><span class="text-gray-200">${fmt(d.promptLatency)}s</span>
+            <span class="text-gray-500">reason tokens</span><span class="text-gray-200">${d.reasonTokens != null ? d.reasonTokens : '--'}</span>
+            <span class="text-gray-500">GPU util</span><span class="text-gray-200">${fmt(d.gpuUtil)}%</span>
+            <span class="text-gray-500">GPU power</span><span class="text-gray-200">${fmt(d.gpuPwr)}W</span>
+            <span class="text-gray-500">GPU temp</span><span class="text-gray-200">${fmt(d.gpuTemp)}°C</span>
+            <span class="text-gray-500">VRAM</span><span class="text-gray-200">${fmtKb(d.vram)}</span>
+            <span class="text-gray-500">CPU util</span><span class="text-gray-200">${fmt(d.cpuUtil)}%</span>
+            <span class="text-gray-500">CPU temp</span><span class="text-gray-200">${fmt(d.cpuTemp)}°C</span>
+            <span class="text-gray-500">RAM</span><span class="text-gray-200">${fmtKb(d.ram)}</span>
+            ${row.draftAcceptRate != null ? `<span class="text-gray-500">draft acc</span><span class="text-purple-400">${(row.draftAcceptRate * 100).toFixed(0)}% (${row.draftAccepted}/${row.draftGenerated})</span>` : ''}
+            ${row.aborted ? '<span class="text-orange-400 col-span-2">⚠ aborted</span>' : ''}
+        </div>
+    </div>`;
+    det.classList.remove('hidden');
+}
+
 function closeExpandModal() {
     const modal = document.getElementById('expand-modal');
     modal.classList.add('hidden');
@@ -3290,6 +3634,9 @@ function closeExpandModal() {
     currentExpandedIsHw = false;
     currentExpandedHwMetricsRef = null;
     currentExpandedMonitorRunId = null;
+    // Clear details panel
+    const det = document.getElementById('expand-details');
+    if (det) { det.innerHTML = ''; det.classList.add('hidden'); }
 }
 window.closeExpandModal = closeExpandModal;
 document.getElementById('expand-modal').addEventListener('click', (e) => {
@@ -3920,7 +4267,7 @@ window.expandHwChart = function(containerEl) {
 // which only covers recently-completed requests -- older ones have no sample
 // data to show, same as any CSV row from before this feature existed.
 let currentExpandedMonitorRunId = null;
-window.expandMonitorRequestChart = async function(runId, inlineMetrics) {
+window.expandMonitorRequestChart = async function(runId, inlineMetrics, row) {
     currentExpandedChartId = null;
     currentExpandedIsHw = false;
     currentExpandedHwMetricsRef = null;
@@ -3942,9 +4289,12 @@ window.expandMonitorRequestChart = async function(runId, inlineMetrics) {
     }
     if (!metrics || metrics.length < 2) {
         document.getElementById('expand-modal-title').innerText = 'No telemetry samples for this request';
+        // Still show details if available
+        if (row && row.detail) renderExpandDetails(row);
         return;
     }
     renderOmniChartCore(metrics, 'Request Telemetry', 'rgba(74,222,128,1)');
+    if (row && row.detail) renderExpandDetails(row);
 };
 
 // Live counterpart to refreshExpandedChartLive() for the hw chart -- called
@@ -3969,20 +4319,21 @@ function refreshExpandedHwChartLive() {
 // logged from the CSV on first visit, then also stays live via the same
 // COMPLETION events.
 let monitorTpsChart = null;
+const _monitorTpsLinearX = { value: true }; // true = time-spaced (linear), false = evenly-spaced (categorical)
 let monitorDataPoints = []; // [{time, promptTps, genTps}]
 let monitorRequestRows = []; // [{timestamp, model, promptTokens, promptTps, genTokens, genTps, wallTime}]
 let isMonitorModeActive = false;
 let isHistoryModeActive = false;
 const SESSION_HISTORY_CAP = 500;
 
-function initMonitorChart() {
-    if (monitorTpsChart) return;
-    const canvas = document.getElementById('monitorTpsChart');
-    if (!canvas) return;
-    monitorTpsChart = new Chart(canvas.getContext('2d'), {
+// Shared builder for the monitor/history token/sec charts — linearX controls
+// whether the x-axis is time-spaced (linear, elapsed seconds) or evenly-spaced
+// (categorical, one tick per data point). Both are useful: linear shows gaps
+// between requests; categorical gives a clean per-request view.
+function createTpsChart(canvas, linearX) {
+    return new Chart(canvas.getContext('2d'), {
         type: 'line',
         data: {
-            labels: [],
             datasets: [
                 { label: 'Prompt t/s', data: [], borderColor: 'rgba(96,165,250,1)', backgroundColor: 'rgba(96,165,250,0.08)', fill: true, borderWidth: 1.5, pointRadius: 2, tension: 0.2 },
                 { label: 'Gen t/s', data: [], borderColor: 'rgba(74,222,128,1)', backgroundColor: 'rgba(74,222,128,0.08)', fill: true, borderWidth: 1.5, pointRadius: 2, tension: 0.2 }
@@ -3993,18 +4344,38 @@ function initMonitorChart() {
             interaction: { intersect: false, mode: 'index' },
             plugins: { legend: { display: true, labels: { color: '#9ca3af' } } },
             scales: {
-                x: { ticks: { color: '#6b7280', maxTicksLimit: 8 }, grid: { color: 'rgba(55,65,81,0.3)' } },
+                x: linearX
+                    ? { type: 'linear', ticks: { color: '#6b7280', maxTicksLimit: 8, callback: v => v >= 60 ? `${Math.floor(v/60)}m` : `${Math.round(v)}s` }, grid: { color: 'rgba(55,65,81,0.3)' }, title: { display: true, text: 'Elapsed', color: '#6b7280', font: { size: 9 } } }
+                    : { ticks: { color: '#6b7280', maxTicksLimit: 8 }, grid: { color: 'rgba(55,65,81,0.3)' } },
                 y: { ticks: { color: '#6b7280' }, grid: { color: 'rgba(55,65,81,0.3)' }, beginAtZero: true }
             }
         }
     });
 }
+function initMonitorChart() {
+    if (monitorTpsChart) return;
+    const canvas = document.getElementById('monitorTpsChart');
+    if (!canvas) return;
+    _monitorTpsLinearX.value = localStorage.getItem('monitorTpsLinearX') !== 'false'; // default: linear
+    monitorTpsChart = createTpsChart(canvas, _monitorTpsLinearX.value);
+    window.monitorTpsChart = monitorTpsChart; // expose for toggle handler's getter
+    renderMonitorChart();
+    initTpsChartToggle('monitor-tps-xaxis-toggle', () => window.monitorTpsChart, _monitorTpsLinearX, 'monitorTpsLinearX', true);
+}
 
 function renderMonitorChart() {
     if (!monitorTpsChart) return;
-    monitorTpsChart.data.labels = monitorDataPoints.map(p => new Date(p.time).toLocaleTimeString());
-    monitorTpsChart.data.datasets[0].data = monitorDataPoints.map(p => p.promptTps);
-    monitorTpsChart.data.datasets[1].data = monitorDataPoints.map(p => p.genTps);
+    if (_monitorTpsLinearX.value) {
+        // Time-spaced: linear x-axis, elapsed seconds from first point
+        const base = monitorDataPoints[0]?.time || 0;
+        monitorTpsChart.data.datasets[0].data = monitorDataPoints.map(p => ({ x: (p.time - base) / 1000, y: p.promptTps }));
+        monitorTpsChart.data.datasets[1].data = monitorDataPoints.map(p => ({ x: (p.time - base) / 1000, y: p.genTps }));
+    } else {
+        // Categorical: evenly spaced, one label per point
+        monitorTpsChart.data.labels = monitorDataPoints.map(p => new Date(p.time).toLocaleTimeString());
+        monitorTpsChart.data.datasets[0].data = monitorDataPoints.map(p => p.promptTps);
+        monitorTpsChart.data.datasets[1].data = monitorDataPoints.map(p => p.genTps);
+    }
     monitorTpsChart.update('none');
 }
 
@@ -4028,13 +4399,13 @@ function renderRequestTable(rows, tbodyId, emptyId, clickVarName) {
     // (clickVarName) so switching tabs can't clobber the other's row index.
     window[clickVarName] = displayRows;
     tbody.innerHTML = displayRows.map((r, i) => `
-        <tr class="border-b border-gray-800/50 ${r.live ? 'text-amber-300/90' : 'hover:bg-gray-800/30 cursor-pointer'}" ${r.live ? '' : `onclick="expandMonitorRequestChart(window.${clickVarName}[${i}].runId, window.${clickVarName}[${i}].metrics)" title="Click for this request's telemetry"`}>
+        <tr class="border-b border-gray-800/50 ${r.live ? 'text-amber-300/90' : 'hover:bg-gray-800/30 cursor-pointer'}" ${r.live ? '' : `onclick="expandMonitorRequestChart(window.${clickVarName}[${i}].runId, window.${clickVarName}[${i}].metrics, window.${clickVarName}[${i}])" title="Click for this request's telemetry + launch details"`}>
             <td class="px-4 py-1.5 text-gray-500">${r.live ? '<span class="inline-block h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span> live' : (r.timestamp ? new Date(r.timestamp).toLocaleTimeString() : '--')}${r.aborted ? ' <span class="text-orange-400 cursor-help" title="Request was canceled by the client before finishing (agent tool-call aborts, user interrupts). Counts are the last values observed live, not final totals.">⚠</span>' : ''}</td>
             <td class="px-4 py-1.5 truncate max-w-[220px]" title="${escapeHtml(r.model || '')}">${escapeHtml(r.model || '--')}</td>
             <td class="px-4 py-1.5 text-right font-mono">${r.promptTokens ?? '--'}</td>
-            <td class="px-4 py-1.5 text-right font-mono text-blue-400">${r.promptTps != null ? Number(r.promptTps).toFixed(1) : '--'}</td>
+            <td class="px-4 py-1.5 text-right font-mono text-blue-400">${r.promptTpsRange || (r.promptTps != null ? Number(r.promptTps).toFixed(1) : '--')}</td>
             <td class="px-4 py-1.5 text-right font-mono">${r.genTokens ?? '--'}</td>
-            <td class="px-4 py-1.5 text-right font-mono text-green-400">${r.genTps != null ? Number(r.genTps).toFixed(1) : '--'}</td>
+            <td class="px-4 py-1.5 text-right font-mono text-green-400">${r.genTpsRange || (r.genTps != null ? Number(r.genTps).toFixed(1) : '--')}</td>
             <td class="px-4 py-1.5 text-right font-mono text-purple-400" title="${r.draftAcceptRate != null ? `${r.draftAccepted ?? '?'} accepted / ${r.draftGenerated ?? '?'} generated draft tokens${r.draftMeanLen != null ? `, mean accepted run ${Number(r.draftMeanLen).toFixed(2)}` : ''}` : 'no speculative drafting on this request'}">${r.draftAcceptRate != null ? (r.draftAcceptRate * 100).toFixed(0) + '%' : '--'}</td>
             <td class="px-4 py-1.5 text-right font-mono">${r.wallTime != null ? Number(r.wallTime).toFixed(1) : '--'}</td>
         </tr>
@@ -4226,8 +4597,21 @@ function handleMonitorCompletion(payload) {
         // Carried inline so this specific row's omni graph doesn't need a
         // round trip to /api/logs/samples -- only backfilled (History) rows
         // need that fallback.
-        metrics: (payload.metrics && payload.metrics.length >= 2) ? payload.metrics : null
+        metrics: (payload.metrics && payload.metrics.length >= 2) ? payload.metrics : null,
+        // Min-max range from live progress samples (only available when the
+        // dashboard itself was the client that generated this request).
+        // Only attach range for dashboard's own requests (abortController !== null).
+        // External requests (agents) share the same SSE stream, so their
+        // COMPLETION would wrongly consume the dashboard's live samples.
+        promptTpsRange: (abortController && activePrefillSamples.length > 0) ? fmtTpsWithRange(activePrefillSamples, payload.promptTps) : null,
+        genTpsRange: (abortController && activeGenSamples.length > 0) ? fmtTpsWithRange(activeGenSamples, payload.genTps) : null,
+        detail: payload.detail || null
     });
+    // Only consume samples for dashboard's own request completion.
+    if (abortController) {
+        activePrefillSamples = [];
+        activeGenSamples = [];
+    }
     if (monitorRequestRows.length > SESSION_HISTORY_CAP) monitorRequestRows.shift();
 
     if (payload.metrics && payload.metrics.length > 0) {
@@ -4246,6 +4630,7 @@ function handleMonitorCompletion(payload) {
 
 // --- History (all-time, backfilled from CSV) ---
 let historyTpsChart = null;
+const _historyTpsLinearX = { value: true }; // true = time-spaced (linear), false = evenly-spaced (categorical)
 let historyDataPoints = [];
 let historyRequestRows = [];
 const HISTORY_CAP = 200;
@@ -4254,32 +4639,24 @@ function initHistoryChart() {
     if (historyTpsChart) return;
     const canvas = document.getElementById('historyTpsChart');
     if (!canvas) return;
-    historyTpsChart = new Chart(canvas.getContext('2d'), {
-        type: 'line',
-        data: {
-            labels: [],
-            datasets: [
-                { label: 'Prompt t/s', data: [], borderColor: 'rgba(96,165,250,1)', backgroundColor: 'rgba(96,165,250,0.08)', fill: true, borderWidth: 1.5, pointRadius: 2, tension: 0.2 },
-                { label: 'Gen t/s', data: [], borderColor: 'rgba(74,222,128,1)', backgroundColor: 'rgba(74,222,128,0.08)', fill: true, borderWidth: 1.5, pointRadius: 2, tension: 0.2 }
-            ]
-        },
-        options: {
-            responsive: true, maintainAspectRatio: false, animation: { duration: 0 },
-            interaction: { intersect: false, mode: 'index' },
-            plugins: { legend: { display: true, labels: { color: '#9ca3af' } } },
-            scales: {
-                x: { ticks: { color: '#6b7280', maxTicksLimit: 8 }, grid: { color: 'rgba(55,65,81,0.3)' } },
-                y: { ticks: { color: '#6b7280' }, grid: { color: 'rgba(55,65,81,0.3)' }, beginAtZero: true }
-            }
-        }
-    });
+    _historyTpsLinearX.value = localStorage.getItem('historyTpsLinearX') !== 'false'; // default: linear
+    historyTpsChart = createTpsChart(canvas, _historyTpsLinearX.value);
+    window.historyTpsChart = historyTpsChart;
+    renderHistoryChart();
+    initTpsChartToggle('history-tps-xaxis-toggle', () => window.historyTpsChart, _historyTpsLinearX, 'historyTpsLinearX', false);
 }
 
 function renderHistoryChart() {
     if (!historyTpsChart) return;
-    historyTpsChart.data.labels = historyDataPoints.map(p => new Date(p.time).toLocaleTimeString());
-    historyTpsChart.data.datasets[0].data = historyDataPoints.map(p => p.promptTps);
-    historyTpsChart.data.datasets[1].data = historyDataPoints.map(p => p.genTps);
+    if (_historyTpsLinearX.value) {
+        const base = historyDataPoints[0]?.time || 0;
+        historyTpsChart.data.datasets[0].data = historyDataPoints.map(p => ({ x: (p.time - base) / 1000, y: p.promptTps }));
+        historyTpsChart.data.datasets[1].data = historyDataPoints.map(p => ({ x: (p.time - base) / 1000, y: p.genTps }));
+    } else {
+        historyTpsChart.data.labels = historyDataPoints.map(p => new Date(p.time).toLocaleTimeString());
+        historyTpsChart.data.datasets[0].data = historyDataPoints.map(p => p.promptTps);
+        historyTpsChart.data.datasets[1].data = historyDataPoints.map(p => p.genTps);
+    }
     historyTpsChart.update('none');
 }
 
@@ -4306,7 +4683,10 @@ async function backfillHistoryData() {
             draftGenerated: r.draftGenerated ?? null,
             draftMeanLen: r.draftMeanLen ?? null,
             aborted: !!r.aborted,
-            metrics: null // backfilled rows fetch samples on demand via /api/logs/samples
+            metrics: null,
+            promptTpsRange: null,
+            genTpsRange: null,
+            detail: r.detail || null // full row detail for expanded view
         }));
         if (statusEl) statusEl.textContent = '';
     } catch (e) {
@@ -4673,7 +5053,7 @@ function isBenchBoilerplate(l) {
 function splitBenchBlocks(lines) {
     const blocks = [];
     let cur = null;
-    const newBlock = () => { cur = { lines: [], title: '', time: '', dev: '', hasCmd: false, status: 'running' }; blocks.push(cur); };
+    const newBlock = () => { cur = { lines: [], title: '', time: '', dev: '', cmd: '', hasCmd: false, status: 'running' }; blocks.push(cur); };
     for (const line of lines) {
         if (line.startsWith('===== ')) { newBlock(); cur.title = line.replace(/=+/g, '').trim(); continue; }
         if (line.startsWith('--- ') && (!cur || cur.hasCmd)) { newBlock(); }
@@ -4681,6 +5061,7 @@ function splitBenchBlocks(lines) {
         if (line.startsWith('--- ')) { cur.time = line.replace(/---/g, '').trim(); continue; }
         if (line.startsWith('$ ')) {
             cur.hasCmd = true;
+            if (!cur.cmd) cur.cmd = line.slice(2).trim(); // first $ line is the launch/bench command
             const devM = line.match(/-dev\s+(\S+)/);
             if (devM) cur.dev = devM[1];
         }
@@ -4811,10 +5192,13 @@ function renderBenchOutput() {
         const starKey = `${rawTitle}|${b.time}`;
         const starred = !!benchStars[starKey];
         return `<details class="border ${starred ? 'border-yellow-700/60' : 'border-gray-800'} rounded-lg mb-2"${open}>
-            <summary class="cursor-pointer select-none px-3 py-1.5 text-[11px] text-gray-300 flex gap-3 items-baseline">
-                <span class="text-indigo-300 font-semibold">${title}</span>
-                <span class="text-gray-600">${escapeHtml(b.time)}</span>${statusBadge}
-                <button type="button" class="bench-star ml-auto ${starred ? 'text-yellow-400' : 'text-gray-600 hover:text-yellow-400'}" data-starkey="${escapeHtml(starKey)}" title="Bookmark this block">${starred ? '★' : '☆'}</button>
+            <summary class="cursor-pointer select-none px-3 py-1.5 text-[11px] text-gray-300">
+                <div class="flex gap-3 items-baseline">
+                    <span class="text-indigo-300 font-semibold">${title}</span>
+                    <span class="text-gray-600">${escapeHtml(b.time)}</span>${statusBadge}
+                    <button type="button" class="bench-star ml-auto ${starred ? 'text-yellow-400' : 'text-gray-600 hover:text-yellow-400'}" data-starkey="${escapeHtml(starKey)}" title="Bookmark this block">${starred ? '★' : '☆'}</button>
+                </div>
+                ${b.cmd ? `<div class="text-[10px] text-gray-500 font-mono truncate mt-0.5" title="${escapeHtml(b.cmd)}">${escapeHtml(b.cmd)}</div>` : ''}
             </summary>
             <div class="px-3 pb-2">${renderBenchChunk(b.lines)}${
                 benchBlockSamples[starKey]?.length
@@ -5449,6 +5833,7 @@ async function runSweep(onlyRow) {
                 `===== llama-server: ${row.label} =====`,
                 `--- ${new Date().toLocaleString()} ---`,
             ];
+            if (row.config && row.config.rawCommand) noteLines.push(`$ ${row.config.rawCommand}`);
             if (row.status === 'done' && (row.results || []).length > 0) {
                 noteLines.push('| rep | prompt tok | prompt t/s | gen tok | gen t/s | draft acc | wall (s) |');
                 noteLines.push('| --- | --- | --- | --- | --- | --- | --- |');
