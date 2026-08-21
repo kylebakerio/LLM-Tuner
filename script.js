@@ -5332,7 +5332,11 @@ async function runSweep(onlyRow) {
                 try {
                     const ml = await (await fetch('/api/master/logs')).json();
                     const tail = (ml.logs || '').split('\n').slice(-80).join('\n');
-                    if (tail.trim()) noteLines.push('--- master log (last 80 lines) ---', tail);
+                    // NOT '--- ...' -- splitBenchBlocks() treats any line
+                    // starting with that as a new block boundary (it's how it
+                    // detects the '--- <timestamp> ---' separator), which was
+                    // splitting this off into its own titleless block.
+                    if (tail.trim()) noteLines.push('[log] master log (last 80 lines):', tail);
                 } catch (e) { /* best-effort */ }
             }
             await fetch('/api/bench/note', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: noteLines }) });
