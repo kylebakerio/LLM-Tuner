@@ -265,6 +265,19 @@ let cpuTempChart = createDualLineChart('cpuTempChart');
 
 let tempHistory = []; let pwrHistory = []; let cpuHistory = [];
 let gpuUtilHistory = []; let cpuTempHistory = [];
+// These feed the expand view's scroll-back, so they deliberately keep far more
+// than the sidebar's last-30 -- but "unbounded for the life of the page" at one
+// sample/sec means ~43k entries per array over an overnight sweep. 20k is still
+// ~5.5h of scroll-back at 1Hz, with the memory actually bounded.
+const TELEMETRY_HISTORY_CAP = 20000;
+function capTelemetryHistories() {
+    for (const h of [tempHistory, pwrHistory, cpuHistory, gpuUtilHistory, cpuTempHistory]) {
+        if (h.length > TELEMETRY_HISTORY_CAP) h.splice(0, h.length - TELEMETRY_HISTORY_CAP);
+    }
+    if (window.chartEvents && window.chartEvents.length > 500) {
+        window.chartEvents.splice(0, window.chartEvents.length - 500);
+    }
+}
 // Full histories for expand modals (net/tps are single-line charts)
 let netHistoryFull = []; // {time, value}
 let tpsHistoryFull = []; // {time, value}
@@ -3062,11 +3075,12 @@ async function pollTelemetry() {
             document.getElementById('current-gpu-util').innerHTML = `<span class="text-yellow-400">${fmtPct(stats.master.gpu_util, 0)}</span> <span class="text-gray-500">/</span> <span class="text-red-400">${fmtPct(stats.worker.gpu_util, 0)}</span>`;
             document.getElementById('current-cpu-temp').innerHTML = `<span class="text-yellow-400">${fmtUnit(stats.master.cpu_temp, '°C')}</span> <span class="text-gray-500">/</span> <span class="text-red-400">${fmtUnit(stats.worker.cpu_temp, '°C')}</span>`;
             const now = Date.now();
-            tempHistory.push({ time: now, master: masterTemp, worker: workerTemp }); 
-            pwrHistory.push({ time: now, master: masterPwr, worker: workerPwr }); 
-            cpuHistory.push({ time: now, master: stats.master.cpu_util, worker: stats.worker.cpu_util }); 
-            gpuUtilHistory.push({ time: now, master: stats.master.gpu_util, worker: stats.worker.gpu_util }); 
-            cpuTempHistory.push({ time: now, master: stats.master.cpu_temp ?? 0, worker: stats.worker.cpu_temp ?? 0 }); 
+            tempHistory.push({ time: now, master: masterTemp, worker: workerTemp });
+            pwrHistory.push({ time: now, master: masterPwr, worker: workerPwr });
+            cpuHistory.push({ time: now, master: stats.master.cpu_util, worker: stats.worker.cpu_util });
+            gpuUtilHistory.push({ time: now, master: stats.master.gpu_util, worker: stats.worker.gpu_util });
+            cpuTempHistory.push({ time: now, master: stats.master.cpu_temp ?? 0, worker: stats.worker.cpu_temp ?? 0 });
+            capTelemetryHistories();
             
             const tSlice = tempHistory.slice(-30);
             tempChart.data.labels = tSlice.map(h => h.time); tempChart.data.datasets[0].data = tSlice.map(h => h.master); tempChart.data.datasets[1].data = tSlice.map(h => h.worker); tempChart.update('none');
@@ -3091,6 +3105,7 @@ async function pollTelemetry() {
             cpuHistory.push({ time: now, master: stats.master.cpu_util, worker: null });
             gpuUtilHistory.push({ time: now, master: stats.master.gpu_util, worker: null });
             cpuTempHistory.push({ time: now, master: stats.master.cpu_temp ?? 0, worker: null });
+            capTelemetryHistories();
 
             // Dataset[1] (the worker/GPU-B line) must still be cleared here, not
             // just left unset -- otherwise it keeps rendering whatever stale data
@@ -4970,6 +4985,12 @@ function startBenchOmniPoll() {
                 // sample count only changes when the server actually recorded
                 // something, and no redraw is needed at all if nothing is new.
                 const now = Date.now();
+                // Never pay chart-rebuild cost for a chart nobody can see.
+                // Samples keep accumulating either way, so a hidden/background
+                // tab (the overnight case) redraws once on return instead of
+                // thousands of times unseen -- which is what actually ran the
+                // renderer out of memory.
+                if (document.hidden) return;
                 if (benchOmniAccum.length &&
                     benchOmniAccum.length !== benchOmniLastCount &&
                     now - benchOmniLastRender > 2000) {
