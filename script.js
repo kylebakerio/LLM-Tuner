@@ -5298,8 +5298,14 @@ async function runSweep(onlyRow) {
                 });
                 if (!resp.ok) throw new Error(`request failed (${resp.status})`);
                 await resp.json();
-                // stats arrive via the COMPLETION broadcast shortly after
-                const payload = await Promise.race([completionArrived, new Promise(r => setTimeout(() => r(null), 15000))]);
+                // stats arrive via the COMPLETION broadcast shortly after --
+                // but logCompletedRequest() awaits fetchCurrentTelemetry()
+                // first, which shells out to nvidia-smi/amdgpu_top and is
+                // documented (see server4.js) to take up to 10s under load --
+                // worst load right when a request just finished. 15s was
+                // routinely losing that race on real, successful completions
+                // and reporting them as "no results captured".
+                const payload = await Promise.race([completionArrived, new Promise(r => setTimeout(() => r(null), 30000))]);
                 abCaptureResolve = null;
                 if (payload) { row.results.push(payload); abRenderResults(); abPersist(); }
             }
