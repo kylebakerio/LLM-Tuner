@@ -753,6 +753,14 @@
                         <label class="block text-[10px] text-gray-400 mb-1">Reps per config</label>
                         <input type="text" id="ab-reps" value="2" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono">
                     </div>
+                    <div>
+                        <label class="block text-[10px] text-gray-400 mb-1">Cool to &deg;C <span class="text-indigo-400 cursor-help" title="Before each config, idle until BOTH GPU and CPU are at or below this temperature. Removes the thermal ramp that otherwise makes later rows in a sweep slower than earlier ones. Blank or 0 disables.">?</span></label>
+                        <input type="text" id="ab-cool-temp" value="0" placeholder="0 = off" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono">
+                    </div>
+                    <div>
+                        <label class="block text-[10px] text-gray-400 mb-1">Max cool (s) <span class="text-indigo-400 cursor-help" title="Give up waiting after this many seconds and run anyway (the row is still flagged if it was hot).">?</span></label>
+                        <input type="text" id="ab-cool-max" value="300" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono">
+                    </div>
                 </div>
                 <div id="ab-results-card" class="hidden overflow-x-auto">
                     <table class="w-full text-[11px]">
@@ -764,6 +772,7 @@
                             <th class="text-right font-medium px-2 py-1">Gen t/s</th>
                             <th class="text-right font-medium px-2 py-1">Draft acc</th>
                             <th class="text-right font-medium px-2 py-1">Wall (s)</th>
+                            <th class="text-right font-medium px-2 py-1">Thermal</th>
                         </tr></thead>
                         <tbody id="ab-results-body" class="text-gray-300"></tbody>
                     </table>

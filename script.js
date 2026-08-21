@@ -5822,7 +5822,7 @@ function abRenderRows() {
 }
 function abRenderResults() {
     const tbody = document.getElementById('ab-results-body');
-    const results = abRows.flatMap(r => (r.results || []).map(res => ({ label: r.label, ...res })));
+    const results = abRows.flatMap(r => (r.results || []).map(res => ({ label: r.label, $therm: r.thermal, ...res })));
     document.getElementById('ab-results-card').classList.toggle('hidden', results.length === 0);
     tbody.innerHTML = results.map(r => `
         <tr class="border-b border-gray-800/50">
@@ -5833,9 +5833,61 @@ function abRenderResults() {
             <td class="px-2 py-1 text-right font-mono text-green-400">${r.genTps != null ? Number(r.genTps).toFixed(1) : '--'}</td>
             <td class="px-2 py-1 text-right font-mono text-purple-400">${r.draftAcceptRate != null ? (r.draftAcceptRate * 100).toFixed(0) + '%' : '--'}</td>
             <td class="px-2 py-1 text-right font-mono">${r.wallTime != null ? Number(r.wallTime).toFixed(1) : '--'}</td>
+            <td class="px-2 py-1 text-right font-mono">${thermalCell(r.$therm)}</td>
         </tr>`).join('');
 }
+// Runs that were heat-limited are NOT comparable to cool ones -- mark them so
+// a hot outlier is never silently averaged in with clean measurements.
+function thermalCell(t) {
+    if (!t) return '<span class="text-gray-600">--</span>';
+    const parts = [];
+    if (t.startGpu != null) parts.push(`start ${t.startGpu}/${t.startCpu ?? '?'}C`);
+    if (t.maxGpu != null) parts.push(`max ${t.maxGpu}/${t.maxCpu ?? '?'}C`);
+    const title = parts.join(' \u00b7 ');
+    if (t.throttled) return `<span class="text-orange-400" title="${title}">THROTTLED</span>`;
+    if (t.reachedTarget === false) return `<span class="text-yellow-500" title="${title}">hot start</span>`;
+    return `<span class="text-gray-500" title="${title}">${t.maxGpu ?? '?'}/${t.maxCpu ?? '?'}C</span>`;
+}
 function abStatus(msg) { document.getElementById('ab-status').textContent = msg; }
+
+// --- Thermal handling for sweeps ---------------------------------------
+// This rig's CPU shares a heatpipe/fin stack with the 4090, so the CPU sensor
+// reads total chassis heat, not CPU load (measured: 85% idle at 800-2800MHz
+// while the package sat at 89C). Either sensor being hot means the next row
+// starts on a heat-soaked machine, which showed up as a monotonic slowdown
+// across a sweep -- an identical control config spanned 24.8-38.7 gen t/s in
+// one night, far wider than any knob effect we were trying to measure.
+async function readTemps() {
+    try {
+        const d = await (await fetch('/api/telemetry/latest')).json();
+        const m = d?.stats?.master || {};
+        return { gpu: Number(m.gpu_temp) || null, cpu: Number(m.cpu_temp) || null,
+                 reasons: m.throttle_reasons || [] };
+    } catch (e) { return { gpu: null, cpu: null, reasons: [] }; }
+}
+// sw_power_cap is ALWAYS on here (the 80W firmware cap) -- only thermal
+// reasons indicate the run was actually heat-limited.
+function isThermalReason(reasons) {
+    return (reasons || []).some(r => /thermal/i.test(String(r)));
+}
+async function coolDownBeforeRow(label) {
+    const target = parseFloat(document.getElementById('ab-cool-temp').value) || 0;
+    if (target <= 0) return null;
+    const maxSec = Math.max(0, parseFloat(document.getElementById('ab-cool-max').value) || 0);
+    const t0 = Date.now();
+    let last = await readTemps();
+    while ((Date.now() - t0) / 1000 < maxSec) {
+        const hot = (last.gpu != null && last.gpu > target) || (last.cpu != null && last.cpu > target);
+        if (!hot) break;
+        const waited = Math.round((Date.now() - t0) / 1000);
+        abStatus(`${label}: cooling ${last.gpu ?? '?'}C GPU / ${last.cpu ?? '?'}C CPU -> ${target}C (${waited}s)`);
+        await new Promise(r => setTimeout(r, 5000));
+        last = await readTemps();
+    }
+    const waited = Math.round((Date.now() - t0) / 1000);
+    return { waited, gpu: last.gpu, cpu: last.cpu,
+             reachedTarget: !((last.gpu != null && last.gpu > target) || (last.cpu != null && last.cpu > target)) };
+}
 
 
 // --- Manual run lines: 'label :: -m <model-substring> <args...>' ---
@@ -5931,8 +5983,21 @@ async function runSweep(onlyRow) {
     abRenderRows(); abRenderResults(); abPersist();
     for (const row of targets) {
         row.status = 'running'; abRenderRows();
+        // Cool the machine BEFORE the load, so the row starts from a known
+        // thermal state rather than inheriting the previous row's heat.
+        const cool = await coolDownBeforeRow(row.label);
         abStatus(`launching: ${row.label}`);
         beginLiveSweepBlock(row.label, row.config?.rawCommand);
+        row.thermal = { startGpu: cool?.gpu ?? null, startCpu: cool?.cpu ?? null,
+                        cooledFor: cool?.waited ?? 0, reachedTarget: cool?.reachedTarget ?? null,
+                        maxGpu: null, maxCpu: null, throttled: false };
+        const thermWatch = setInterval(async () => {
+            const t = await readTemps();
+            const th = row.thermal;
+            if (t.gpu != null) th.maxGpu = Math.max(th.maxGpu ?? 0, t.gpu);
+            if (t.cpu != null) th.maxCpu = Math.max(th.maxCpu ?? 0, t.cpu);
+            if (isThermalReason(t.reasons)) th.throttled = true;
+        }, 5000);
         try {
             await fetch('/api/stop', { method: 'POST' }).catch(() => {});
             await new Promise(r => setTimeout(r, 3000));
@@ -5996,6 +6061,7 @@ async function runSweep(onlyRow) {
             row.error = e.message;
             abStatus(`${row.label}: ${e.message}`);
         }
+        clearInterval(thermWatch);
         abRenderRows(); abPersist();
         // Preserve this config's results in the shared bench transcript
         // (accordion + logs/bench-history.log) so sweeps survive like runs do.
@@ -6010,6 +6076,14 @@ async function runSweep(onlyRow) {
                 noteLines.push('| --- | --- | --- | --- | --- | --- | --- |');
                 row.results.forEach((r, ri) => noteLines.push(
                     `| ${ri + 1} | ${r.promptTokens ?? ''} | ${r.promptTps != null ? Number(r.promptTps).toFixed(1) : ''} | ${r.genTokens ?? ''} | ${r.genTps != null ? Number(r.genTps).toFixed(1) : ''} | ${r.draftAcceptRate != null ? (r.draftAcceptRate * 100).toFixed(0) + '%' : ''} | ${r.wallTime != null ? Number(r.wallTime).toFixed(1) : ''} |`));
+                const th = row.thermal;
+                if (th) {
+                    noteLines.push(`[thermal] start ${th.startGpu ?? '?'}C GPU / ${th.startCpu ?? '?'}C CPU` +
+                        (th.cooledFor ? ` after ${th.cooledFor}s cooldown` : '') +
+                        ` | peak ${th.maxGpu ?? '?'}C / ${th.maxCpu ?? '?'}C` +
+                        (th.throttled ? ' | THERMALLY THROTTLED -- not comparable to cool runs' : '') +
+                        (th.reachedTarget === false ? ' | HOT START (cooldown timed out)' : ''));
+                }
                 noteLines.push('[sweep] done');
             } else {
                 noteLines.push(`[sweep] failed: ${row.error || 'no results captured'}`);
