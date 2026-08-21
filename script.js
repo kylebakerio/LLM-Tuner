@@ -5082,6 +5082,9 @@ function startBenchOmniPoll() {
                     if (s.t >= benchOmniPollStartedAt && !seen.has(s.t)) benchOmniAccum.push(s);
                 }
                 benchOmniAccum.sort((a, b) => a.t - b.t);
+                // Still bound the accumulator itself (the display window below
+                // limits what's DRAWN, not what's retained).
+                if (benchOmniAccum.length > 20000) benchOmniAccum = downsampleSeries(benchOmniAccum, 10000);
                 // The mini chart is a LIVE view, so keep the 1/s cadence --
                 // just bound what it has to draw. Only the last
                 // BENCH_OMNI_WINDOW_MS is plotted (older samples stay in the
@@ -5286,8 +5289,27 @@ function saveBlockSamples(key, samples) {
         if (keys.length > BENCH_BLOCK_SAMPLES_MAX) {
             for (const k of keys.slice(0, keys.length - BENCH_BLOCK_SAMPLES_MAX)) delete benchBlockSamples[k];
         }
-        localStorage.setItem(BENCH_BLOCK_SAMPLES_KEY, JSON.stringify(benchBlockSamples));
-    } catch (e) { /* quota -- graphs are a nicety, never break the run over it */ }
+        // Retry on quota by evicting the oldest entries. Silently swallowing a
+        // QuotaExceededError meant that once the store filled up -- which it
+        // did, because an earlier version wrote the whole running accumulator
+        // per row -- EVERY later save failed and only the entries written
+        // before the store filled kept their graphs.
+        let attempts = 0;
+        for (;;) {
+            try {
+                localStorage.setItem(BENCH_BLOCK_SAMPLES_KEY, JSON.stringify(benchBlockSamples));
+                break;
+            } catch (err) {
+                const ks = Object.keys(benchBlockSamples).filter(k => k !== key);
+                if (!ks.length || ++attempts > 40) {
+                    // Can't fit even alone: drop everything else and keep this one.
+                    try { localStorage.setItem(BENCH_BLOCK_SAMPLES_KEY, JSON.stringify({ [key]: benchBlockSamples[key] })); } catch (e2) {}
+                    break;
+                }
+                for (const k of ks.slice(0, Math.max(1, Math.ceil(ks.length / 4)))) delete benchBlockSamples[k];
+            }
+        }
+    } catch (e) { /* graphs are a nicety, never break the run over it */ }
 }
 
 // --- In-progress sweep row (live accordion block) ---
