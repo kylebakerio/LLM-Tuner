@@ -5647,7 +5647,17 @@ async function runSweep(onlyRow) {
             const ready = await abWaitForState(
                 () => lastKnownServerState === 'ready',
                 15 * 60 * 1000,
-                (elapsed) => elapsed > 20000 && lastKnownServerState === 'stopped');
+                // Fail fast on a REAL reported failure (the close handler
+                // broadcasts 'Launch failed: ...' the moment a process exits
+                // before reaching ready -- see server4.js's proc.on('close')),
+                // not on lastKnownServerState still reading 'stopped'. That
+                // state check was a proxy for "never started", but it's also
+                // just the default/pre-launch value, and a slow-but-healthy
+                // load (this rig runs close to its VRAM ceiling and can take
+                // a while past the fit-params warning before the first state
+                // broadcast lands) was tripping it before the real allocator
+                // ever got a chance to finish.
+                (elapsed) => elapsed > 5000 && !!lastKnownServerError);
             if (!ready) {
                 // pull the real reason: the broadcast error if one arrived, else
                 // the last error-level lines from the server's log buffer
