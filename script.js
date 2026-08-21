@@ -279,7 +279,12 @@ async function fetchModels() {
         const models = await res.json();
         const select = document.getElementById('model-select');
         select.innerHTML = '';
-        models.forEach(m => { 
+        // Sorted by name: the API returns local-dir models then HF-cache ones,
+        // in readdir order, which is effectively arbitrary and made a specific
+        // quant hard to pick out of a long list. numeric:true so Q3/Q6/Q8 and
+        // 3.6/3.8 sort naturally rather than lexically.
+        models.sort((a, b) => String(a.name).localeCompare(String(b.name), undefined, { numeric: true, sensitivity: 'base' }));
+        models.forEach(m => {
             const opt = document.createElement('option'); 
             // IMPORTANT: value is the full host path (not just filename) so the
             // server can correctly resolve models that live outside the local
