@@ -738,7 +738,10 @@
                     <button id="ab-clear-btn" class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-400 rounded-md text-xs font-semibold transition-colors">Clear</button>
                 </div>
                 <div>
-                    <label class="block text-[10px] text-gray-400 mb-1">Test prompt <span class="text-indigo-400 cursor-help" title="Sent identically to every config. Use something representative of your real work -- ngram results especially depend on content (repetitive/code-heavy vs novel prose).">?</span></label>
+                    <label class="block text-[10px] text-gray-400 mb-1 flex items-center justify-between">
+                        <span>Test prompt <span class="text-indigo-400 cursor-help" title="Sent identically to every config. Use something representative of your real work -- ngram results especially depend on content (repetitive/code-heavy vs novel prose).">?</span></span>
+                        <span id="ab-prompt-token-count" class="text-gray-500 normal-case">~0 tokens</span>
+                    </label>
                     <textarea id="ab-prompt" rows="3" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono" placeholder="paste a representative task prompt here"></textarea>
                 </div>
                 <div class="grid grid-cols-4 gap-2">
