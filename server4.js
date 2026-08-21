@@ -613,7 +613,15 @@ function tokenizeCommand(str) {
 // client aborts and per-request errors all the time, and the old substring
 // check would have SIGTERM'd a healthy model server over any of them. A
 // process that exits on its own is handled by the 'close' handler below.
-const FATAL_LINE_RE = /failed to fit params to free device memory|llama_server: fatal error|segfault|out of memory/i;
+// "failed to fit params to free device memory" was here too, but it's not
+// actually fatal: llama.cpp's own common_init_result ctor calls
+// common_fit_params(), ignores its return value, and proceeds to
+// llama_model_load_from_file() regardless. It fires whenever -ngl/-ts are
+// pinned and the config is close to the edge (which ours always is), and the
+// real allocator frequently succeeds anyway -- killing on sight of this line
+// was aborting launches that would have come up fine. Genuine failures still
+// surface via the 'ready' timeout or a real exit/crash (see 'close' handler).
+const FATAL_LINE_RE = /llama_server: fatal error|segfault|out of memory/i;
 // The master is always a directly-spawned llama-server binary now (no Docker
 // invocation). `onErrorCleanup`, if given, is called (in addition to
 // `proc.kill()`) when handleLogs detects an abort/OOM/error line -- currently
