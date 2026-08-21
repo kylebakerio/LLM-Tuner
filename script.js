@@ -3570,6 +3570,11 @@ let expandedChartInst = null;
 // arrays get a new data point, so the modal updates in real time instead of
 // showing a static snapshot from the moment it was opened.
 let currentExpandedChartId = null;
+// Long-omni expand state: the full series plus the colour it's drawn in.
+// Declared here with the other expand state (not beside renderOmniChartCore)
+// because closeExpandModal/expandChart, defined above it, both reset it.
+let omniExpandFull = null;
+let omniExpandColor = 'rgba(74,222,128,1)';
 let currentExpandedIsHw = false;
 
 // Renders the launch-config + metrics details panel below the expanded omni
@@ -3648,6 +3653,7 @@ function closeExpandModal() {
     currentExpandedChartId = null;
     currentExpandedIsHw = false;
     currentExpandedHwMetricsRef = null;
+    omniExpandFull = null; // stale omni state must not hijack the slider
     currentExpandedMonitorRunId = null;
     // Clear details panel
     const det = document.getElementById('expand-details');
@@ -3670,14 +3676,17 @@ document.getElementById('expand-scroll-slider').addEventListener('input', () => 
     // getExpandChartData) reads this slider's own current value/max to decide
     // both the visible window AND whether to treat the new position as "live"
     // going forward, so a manual drag just needs to trigger a re-render.
+    if (redrawOmniExpandWindow()) return;
     refreshExpandedChartLive();
 });
 document.getElementById('expand-zoom-in').addEventListener('click', () => {
     expandWindowSize = Math.max(10, Math.round(expandWindowSize / 1.5));
+    if (redrawOmniExpandWindow()) return;
     refreshExpandedChartLive();
 });
 document.getElementById('expand-zoom-out').addEventListener('click', () => {
     expandWindowSize = Math.min(5000, Math.round(expandWindowSize * 1.5));
+    if (redrawOmniExpandWindow()) return;
     refreshExpandedChartLive();
 });
 
@@ -3764,6 +3773,7 @@ window.expandChart = function(chartId, title) {
     modal.classList.remove('hidden'); modal.classList.add('flex');
     currentExpandedChartId = chartId;
     currentExpandedIsHw = false;
+    omniExpandFull = null; // classic chart owns the slider now
 
     // Fresh zoom/scroll state each time a (possibly different) chart is
     // opened -- start at the default 3x-mini window, pinned to live (slider
@@ -4232,29 +4242,56 @@ function buildOmniOptions() {
     };
 }
 
-function renderOmniChartCore(metrics, titleText, tpsLineColor) {
+function renderOmniChartCore(metrics, titleText, tpsLineColor, windowed) {
     const modal = document.getElementById('expand-modal');
     const titleEl = document.getElementById('expand-modal-title');
     const canvas = document.getElementById('expandedChartCanvas');
     titleEl.innerText = titleText;
     modal.classList.remove('hidden'); modal.classList.add('flex');
-    // Time-window scroll/zoom controls only apply to the classic single/dual-
-    // line sidebar charts (see expandChart, which shows this same row) -- omni
-    // graphs are either a fixed, already-complete per-request sample set, or
-    // (session graph) already show their own bounded window with its own
-    // "click to expand full session" affordance, so windowing on top of that
-    // doesn't apply the same way.
-    document.getElementById('expand-time-controls').classList.add('hidden');
-    document.getElementById('expand-time-controls').classList.remove('flex');
+    // Zoom/scroll used to be hidden for every omni chart on the grounds that
+    // they were "already-complete per-request" sets. That stopped being true
+    // for the bench run chart, which now accumulates across a whole sweep --
+    // so callers with a long series opt in via `windowed` and get the same
+    // controls the classic sidebar charts use.
+    const ctrls = document.getElementById('expand-time-controls');
+    ctrls.classList.toggle('hidden', !windowed);
+    ctrls.classList.toggle('flex', !!windowed);
+    omniExpandFull = windowed ? metrics : null;
+    omniExpandColor = tpsLineColor;
+    if (windowed) { expandWindowSize = Math.min(EXPAND_DEFAULT_WINDOW * 4, Math.max(60, metrics.length)); }
+    const view = windowed ? applyOmniExpandWindow(metrics) : metrics;
     if (expandedChartInst) { expandedChartInst.destroy(); }
     expandedChartInst = new Chart(canvas.getContext('2d'), {
         type: 'line',
-        data: { datasets: buildOmniDatasets(metrics, tpsLineColor) },
+        data: { datasets: buildOmniDatasets(view, tpsLineColor) },
         options: buildOmniOptions(),
         plugins: [omniPointLabelsPlugin, omniGapBandsPlugin]
     });
     expandedChartInst.$lastMetrics = metrics;
     expandedChartInst.$lastColor = tpsLineColor;
+}
+
+// Index-window the omni series using the same slider/zoom state the classic
+// charts use, so the controls behave identically in both places.
+function applyOmniExpandWindow(full) {
+    const slider = document.getElementById('expand-scroll-slider');
+    const L = full.length;
+    const prevMax = parseInt(slider.max, 10) || 0;
+    const prevValue = parseInt(slider.value, 10) || 0;
+    const wasLive = prevValue >= prevMax;
+    const newMax = Math.max(0, L - expandWindowSize);
+    slider.max = newMax;
+    slider.value = wasLive ? newMax : Math.min(prevValue, newMax);
+    const start = parseInt(slider.value, 10) || 0;
+    const end = Math.min(start + expandWindowSize, L);
+    const statusEl = document.getElementById('expand-time-status');
+    if (statusEl) statusEl.textContent = `${end >= L ? 'Live' : 'Paused'} · ${Math.max(end - start, 0)} of ${L} samples`;
+    return full.slice(start, end);
+}
+function redrawOmniExpandWindow() {
+    if (!omniExpandFull || !expandedChartInst) return false;
+    setOmniDatasets(expandedChartInst, buildOmniDatasets(applyOmniExpandWindow(omniExpandFull), omniExpandColor));
+    return true;
 }
 
 window.expandHwChart = function(containerEl) {
@@ -4934,7 +4971,7 @@ function scheduleBenchRender() {
 }
 // Bench telemetry omni chart -- same dataset builder as everywhere else.
 let benchOmniChartInst = null;
-function renderBenchOmni(samples) {
+function renderBenchOmni(samples, full) {
     const canvas = document.getElementById('benchOmniChart');
     if (!canvas) return;
     if (!benchOmniChartInst) {
@@ -4949,12 +4986,15 @@ function renderBenchOmni(samples) {
         canvas.style.cursor = 'pointer';
         canvas.title = 'Click to expand';
         canvas.addEventListener('click', () => {
-            if (benchOmniChartInst.$lastSamples?.length) {
-                renderOmniChartCore(benchOmniChartInst.$lastSamples, 'Bench Run Telemetry', 'rgba(74,222,128,1)');
-            }
+            const full = benchOmniChartInst.$fullSamples?.length
+                ? benchOmniChartInst.$fullSamples : benchOmniChartInst.$lastSamples;
+            if (full?.length) renderOmniChartCore(full, 'Bench Run Telemetry', 'rgba(74,222,128,1)', true);
         });
     }
+    // $lastSamples is what's DRAWN (the 10-minute live window); $fullSamples is
+    // everything recorded this run, which is what the expand view should show.
     benchOmniChartInst.$lastSamples = samples || [];
+    benchOmniChartInst.$fullSamples = (full && full.length) ? full : (samples || []);
     setOmniDatasets(benchOmniChartInst, buildOmniDatasets(samples || [], 'rgba(74,222,128,1)'));
 }
 let benchOmniPollTimer = null;
@@ -4974,19 +5014,22 @@ const BENCH_OMNI_WINDOW_MS = 10 * 60 * 1000;
 // browser offers it) so a slow rebuild never blocks input handling. Any
 // samples that arrive while a draw is pending simply replace the pending one.
 let benchOmniPendingDraw = null;
+let benchOmniPendingFull = null;
 let benchOmniDrawScheduled = false;
 const scheduleIdle = window.requestIdleCallback
     ? (fn) => window.requestIdleCallback(fn, { timeout: 1000 })
     : (fn) => requestAnimationFrame(fn);
-function scheduleBenchOmniDraw(view) {
+function scheduleBenchOmniDraw(view, full) {
     benchOmniPendingDraw = view;
+    benchOmniPendingFull = full;
     if (benchOmniDrawScheduled) return;
     benchOmniDrawScheduled = true;
     scheduleIdle(() => {
         benchOmniDrawScheduled = false;
         const v = benchOmniPendingDraw;
-        benchOmniPendingDraw = null;
-        if (v && !document.hidden) renderBenchOmni(v);
+        const f = benchOmniPendingFull;
+        benchOmniPendingDraw = null; benchOmniPendingFull = null;
+        if (v && !document.hidden) renderBenchOmni(v, f);
     });
 }
 function startBenchOmniPoll() {
@@ -5028,7 +5071,7 @@ function startBenchOmniPoll() {
                 if (document.hidden || !view.length) return;
                 if (view.length !== benchOmniLastCount) {
                     benchOmniLastCount = view.length;
-                    scheduleBenchOmniDraw(view);
+                    scheduleBenchOmniDraw(view, benchOmniAccum);
                 }
             }
         } catch (e) {}
