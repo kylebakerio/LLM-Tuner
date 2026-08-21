@@ -547,6 +547,7 @@ function handleSseMessage(e) {
             // in server4.js.
             try {
                 const payload = JSON.parse(data.log.slice('COMPLETION:'.length));
+                console.log(`[sse] COMPLETION received: runId=${payload.runId} genTps=${payload.genTps} abCaptureResolve armed = ${!!abCaptureResolve}`);
                 handleMonitorCompletion(payload);
                 // Avg Speed used to only update from this dashboard's own chat
                 // stream-reading code (submitPrompt), so it silently stayed at
@@ -5674,12 +5675,15 @@ async function runSweep(onlyRow) {
             for (let rep = 0; rep < reps; rep++) {
                 abStatus(`${row.label} -- request ${rep + 1}/${reps}`);
                 const completionArrived = new Promise(res => { abCaptureResolve = res; });
+                console.log(`[ab-sweep] ${row.label} rep ${rep + 1}: sending request, abCaptureResolve armed = ${!!abCaptureResolve}`);
+                const reqSentAt = Date.now();
                 const resp = await fetch('http://localhost:8080/v1/chat/completions', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ model: 'ab-test', messages: [{ role: 'user', content: prompt }], max_tokens: maxTokens, stream: false })
                 });
                 if (!resp.ok) throw new Error(`request failed (${resp.status})`);
                 await resp.json();
+                console.log(`[ab-sweep] ${row.label} rep ${rep + 1}: HTTP response done at +${Date.now() - reqSentAt}ms, waiting on COMPLETION broadcast`);
                 // stats arrive via the COMPLETION broadcast shortly after --
                 // but logCompletedRequest() awaits fetchCurrentTelemetry()
                 // first, which shells out to nvidia-smi/amdgpu_top and is
@@ -5688,6 +5692,7 @@ async function runSweep(onlyRow) {
                 // routinely losing that race on real, successful completions
                 // and reporting them as "no results captured".
                 const payload = await Promise.race([completionArrived, new Promise(r => setTimeout(() => r(null), 30000))]);
+                console.log(`[ab-sweep] ${row.label} rep ${rep + 1}: race settled at +${Date.now() - reqSentAt}ms, payload = ${payload ? 'RECEIVED' : 'NULL (timed out)'}`);
                 abCaptureResolve = null;
                 if (payload) { row.results.push(payload); abRenderResults(); abPersist(); }
             }
