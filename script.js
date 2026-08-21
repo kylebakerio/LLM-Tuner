@@ -4537,22 +4537,41 @@ function renderBenchOmni(samples) {
     setOmniDatasets(benchOmniChartInst, buildOmniDatasets(samples || [], 'rgba(74,222,128,1)'));
 }
 let benchOmniPollTimer = null;
+// Accumulated across the whole run, NOT just the current request. The server
+// hands out per-request sample buffers: takeRequestSamples() empties
+// activeRequestSamples on every request's "total time" line, so polling it
+// directly made the chart wipe and restart from one sample after every
+// request (2 reps => the graph visibly "reset" mid-run). Merge by timestamp
+// instead so one sweep row draws one continuous series. Cleared when a run
+// starts, and by the existing "reset lines" control.
+let benchOmniAccum = [];
 function startBenchOmniPoll() {
     if (benchOmniPollTimer) return;
+    benchOmniAccum = [];
     benchOmniPollTimer = setInterval(async () => {
         try {
             const data = await (await fetch('/api/logs/active-samples')).json();
             // keep showing the last finished run's series between runs instead
             // of blanking the chart with an empty active buffer
-            if (data.samples?.length) renderBenchOmni(data.samples);
+            if (data.samples?.length) {
+                const seen = new Set(benchOmniAccum.map(s => s.t));
+                for (const s of data.samples) if (!seen.has(s.t)) benchOmniAccum.push(s);
+                benchOmniAccum.sort((a, b) => a.t - b.t);
+                renderBenchOmni(benchOmniAccum);
+            }
         } catch (e) {}
     }, Math.max(500, currentTelemetryRateMs));
 }
 function stopBenchOmniPoll() {
     clearInterval(benchOmniPollTimer);
     benchOmniPollTimer = null;
-    // one last fetch for the finished run's full series
-    fetch('/api/bench/status').then(r => r.json()).then(st => renderBenchOmni(st.samples || [])).catch(() => {});
+    // one last fetch for the finished run's full series -- but don't let it
+    // replace a richer accumulated series (llama-server sweeps accumulate
+    // across several requests; /api/bench/status only carries the last one).
+    fetch('/api/bench/status').then(r => r.json()).then(st => {
+        const final = st.samples || [];
+        renderBenchOmni(final.length >= benchOmniAccum.length ? final : benchOmniAccum);
+    }).catch(() => {});
 }
 
 function benchElapsedText() {
