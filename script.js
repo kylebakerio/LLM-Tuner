@@ -4936,9 +4936,13 @@ let benchOmniPollTimer = null;
 // starts, and by the existing "reset lines" control.
 let benchOmniAccum = [];
 let benchOmniPollStartedAt = 0;
+let benchOmniLastCount = -1;
+let benchOmniLastRender = 0;
 function startBenchOmniPoll() {
     if (benchOmniPollTimer) return;
     benchOmniAccum = [];
+    benchOmniLastCount = -1;
+    benchOmniLastRender = 0;
     // Anything already in the server's buffer predates this run -- it's the
     // tail of the PREVIOUS request (sampling keeps going for
     // ACTIVITY_TIMEOUT_MS after one finishes). Including it stranded a few
@@ -4956,12 +4960,23 @@ function startBenchOmniPoll() {
                     if (s.t >= benchOmniPollStartedAt && !seen.has(s.t)) benchOmniAccum.push(s);
                 }
                 benchOmniAccum.sort((a, b) => a.t - b.t);
-                // Bounded: this accumulates for the whole sweep (hours
-                // overnight) and is re-plotted every poll tick, so an
-                // unbounded array is both a memory leak and a growing
-                // per-tick render cost. Thin the oldest half when it gets big.
-                if (benchOmniAccum.length > 4000) benchOmniAccum = downsampleSeries(benchOmniAccum, 2000);
-                if (benchOmniAccum.length) renderBenchOmni(benchOmniAccum);
+                // Bounded HARD: this accumulates for the whole sweep and every
+                // redraw rebuilds ~14 datasets from it. 2000 points was still
+                // enough to make the tab crawl (30s to paint a selection, and
+                // Chrome's "page unresponsive"). A ~1500px-wide, 128px-tall
+                // chart cannot resolve past a few hundred points anyway.
+                if (benchOmniAccum.length > 900) benchOmniAccum = downsampleSeries(benchOmniAccum, 600);
+                // Skip redundant redraws: the poll ticks about 1/s but the
+                // sample count only changes when the server actually recorded
+                // something, and no redraw is needed at all if nothing is new.
+                const now = Date.now();
+                if (benchOmniAccum.length &&
+                    benchOmniAccum.length !== benchOmniLastCount &&
+                    now - benchOmniLastRender > 2000) {
+                    benchOmniLastCount = benchOmniAccum.length;
+                    benchOmniLastRender = now;
+                    renderBenchOmni(benchOmniAccum);
+                }
             }
         } catch (e) {}
     }, Math.max(500, currentTelemetryRateMs));
