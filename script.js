@@ -5895,7 +5895,10 @@ function thermalCell(t) {
     if (t.startGpu != null) parts.push(`start ${t.startGpu}/${t.startCpu ?? '?'}C`);
     if (t.maxGpu != null) parts.push(`max ${t.maxGpu}/${t.maxCpu ?? '?'}C`);
     const title = parts.join(' \u00b7 ');
-    if (t.throttled) return `<span class="text-orange-400" title="${title}">THROTTLED</span>`;
+    if (t.throttled) {
+        const why = t.reasons ? [...t.reasons].join(', ') : 'thermal';
+        return `<span class="text-orange-400" title="${why} -- ${title}">THROTTLED (${why.replace(/_slowdown/g,'').replace(/_/g,' ')})</span>`;
+    }
     if (t.reachedTarget === false) return `<span class="text-yellow-500" title="${title}">hot start</span>`;
     return `<span class="text-gray-500" title="${title}">${t.maxGpu ?? '?'}/${t.maxCpu ?? '?'}C</span>`;
 }
@@ -6050,7 +6053,13 @@ async function runSweep(onlyRow) {
             const th = row.thermal;
             if (t.gpu != null) th.maxGpu = Math.max(th.maxGpu ?? 0, t.gpu);
             if (t.cpu != null) th.maxCpu = Math.max(th.maxCpu ?? 0, t.cpu);
-            if (isThermalReason(t.reasons)) th.throttled = true;
+            // Record WHICH reasons fired, not just a boolean -- 'THROTTLED'
+            // with no reason is unactionable, and a mislabelled flag is worse
+            // than none (sw_power_cap is permanently active here and must not
+            // count).
+            for (const r of (t.reasons || [])) {
+                if (/thermal/i.test(String(r))) { th.throttled = true; (th.reasons ||= new Set()).add(r); }
+            }
         }, 5000);
         try {
             await fetch('/api/stop', { method: 'POST' }).catch(() => {});
