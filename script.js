@@ -616,8 +616,8 @@ function handleSseMessage(e) {
         resetRunningAverages();
         timerDiv.classList.remove('hidden');
         // Show boot overlay in chat area
-        bootOverlay.classList.remove('hidden');
-        bootOverlay.classList.add('flex');
+        bootOverlayWanted = true;
+        syncBootOverlay();
         // Hide empty state while booting
         const emptyStateEl = document.getElementById('empty-state');
         if (emptyStateEl) emptyStateEl.classList.add('hidden');
@@ -648,8 +648,8 @@ function handleSseMessage(e) {
     if (data.state === 'stopped') {
         clearInterval(uiTimerInterval); uiTimerInterval = null;
         // Hide boot overlay when engine is stopped
-        bootOverlay.classList.add('hidden');
-        bootOverlay.classList.remove('flex');
+        bootOverlayWanted = false;
+        syncBootOverlay();
         bootProgressFill.style.width = '0%';
         timerDiv.classList.add('hidden');
         // Restore empty state
@@ -799,8 +799,8 @@ function handleSseMessage(e) {
         // todo: the badge outline and background and text colors are still red
         badge.innerHTML = `<span class="h-2 w-2 rounded-full bg-green-500 animate-pulse"></span> ${data.state === 'ready' ? 'RUNNING' : 'BOOTING...'}`;
         setTimeout(() => {
-            bootOverlay.classList.add('hidden');
-            bootOverlay.classList.remove('flex');
+            bootOverlayWanted = false;
+            syncBootOverlay();
             // Restore empty state if chat is empty
             const emptyStateEl = document.getElementById('empty-state');
             if (emptyStateEl) emptyStateEl.classList.remove('hidden');
@@ -4338,6 +4338,19 @@ const _monitorTpsLinearX = { value: true }; // true = time-spaced (linear), fals
 let monitorDataPoints = []; // [{time, promptTps, genTps}]
 let monitorRequestRows = []; // [{timestamp, model, promptTokens, promptTps, genTokens, genTps, wallTime}]
 let isMonitorModeActive = false;
+// The boot overlay is absolutely positioned within <main>, so it covers
+// whichever view is active -- including Bench, where it blocked interaction
+// with a sweep for the entire model load. Track whether a boot is in progress
+// separately from whether the overlay should be VISIBLE (interactive tab only).
+let isInteractiveModeActive = true;
+let bootOverlayWanted = false;
+function syncBootOverlay() {
+    const el = document.getElementById('boot-overlay');
+    if (!el) return;
+    const show = bootOverlayWanted && isInteractiveModeActive;
+    el.classList.toggle('hidden', !show);
+    el.classList.toggle('flex', show);
+}
 let isHistoryModeActive = false;
 const SESSION_HISTORY_CAP = 500;
 
@@ -4718,6 +4731,7 @@ function setTabButtonActive(id, active) {
         : 'px-4 py-2 text-xs font-semibold text-gray-500 border-b-2 border-transparent hover:text-gray-300';
 }
 document.getElementById('tab-interactive').addEventListener('click', () => {
+    isInteractiveModeActive = true; syncBootOverlay();
     isMonitorModeActive = false;
     isHistoryModeActive = false;
     stopSessionOmniRefresh();
@@ -4735,6 +4749,7 @@ document.getElementById('tab-interactive').addEventListener('click', () => {
     document.getElementById('chat-input-bar').classList.remove('hidden');
 });
 document.getElementById('tab-monitor').addEventListener('click', () => {
+    isInteractiveModeActive = false; syncBootOverlay();
     isMonitorModeActive = true;
     isHistoryModeActive = false;
     setTabButtonActive('tab-monitor', true);
@@ -4757,6 +4772,7 @@ document.getElementById('tab-monitor').addEventListener('click', () => {
     startSessionOmniRefresh();
 });
 document.getElementById('tab-history').addEventListener('click', () => {
+    isInteractiveModeActive = false; syncBootOverlay();
     isMonitorModeActive = false;
     isHistoryModeActive = true;
     stopSessionOmniRefresh();
@@ -4952,12 +4968,31 @@ let benchOmniPollTimer = null;
 let benchOmniAccum = [];
 let benchOmniPollStartedAt = 0;
 let benchOmniLastCount = -1;
-let benchOmniLastRender = 0;
+// Live mini-chart window: plot only the last 10 minutes.
+const BENCH_OMNI_WINDOW_MS = 10 * 60 * 1000;
+// Draw off the critical path: coalesce to one draw per frame (idle if the
+// browser offers it) so a slow rebuild never blocks input handling. Any
+// samples that arrive while a draw is pending simply replace the pending one.
+let benchOmniPendingDraw = null;
+let benchOmniDrawScheduled = false;
+const scheduleIdle = window.requestIdleCallback
+    ? (fn) => window.requestIdleCallback(fn, { timeout: 1000 })
+    : (fn) => requestAnimationFrame(fn);
+function scheduleBenchOmniDraw(view) {
+    benchOmniPendingDraw = view;
+    if (benchOmniDrawScheduled) return;
+    benchOmniDrawScheduled = true;
+    scheduleIdle(() => {
+        benchOmniDrawScheduled = false;
+        const v = benchOmniPendingDraw;
+        benchOmniPendingDraw = null;
+        if (v && !document.hidden) renderBenchOmni(v);
+    });
+}
 function startBenchOmniPoll() {
     if (benchOmniPollTimer) return;
     benchOmniAccum = [];
     benchOmniLastCount = -1;
-    benchOmniLastRender = 0;
     // Anything already in the server's buffer predates this run -- it's the
     // tail of the PREVIOUS request (sampling keeps going for
     // ACTIVITY_TIMEOUT_MS after one finishes). Including it stranded a few
@@ -4975,28 +5010,25 @@ function startBenchOmniPoll() {
                     if (s.t >= benchOmniPollStartedAt && !seen.has(s.t)) benchOmniAccum.push(s);
                 }
                 benchOmniAccum.sort((a, b) => a.t - b.t);
-                // Bounded HARD: this accumulates for the whole sweep and every
-                // redraw rebuilds ~14 datasets from it. 2000 points was still
-                // enough to make the tab crawl (30s to paint a selection, and
-                // Chrome's "page unresponsive"). A ~1500px-wide, 128px-tall
-                // chart cannot resolve past a few hundred points anyway.
-                if (benchOmniAccum.length > 900) benchOmniAccum = downsampleSeries(benchOmniAccum, 600);
-                // Skip redundant redraws: the poll ticks about 1/s but the
-                // sample count only changes when the server actually recorded
-                // something, and no redraw is needed at all if nothing is new.
-                const now = Date.now();
+                // The mini chart is a LIVE view, so keep the 1/s cadence --
+                // just bound what it has to draw. Only the last
+                // BENCH_OMNI_WINDOW_MS is plotted (older samples stay in the
+                // accumulator for the per-block save), and the window is
+                // thinned to something a 128px-tall chart can actually
+                // resolve. Rebuilding ~14 full-length datasets every second is
+                // what made the tab unresponsive.
+                const cutoff = Date.now() - BENCH_OMNI_WINDOW_MS;
+                const win = benchOmniAccum.filter(s => s.t >= cutoff);
+                const view = win.length > 400 ? downsampleSeries(win, 400) : win;
                 // Never pay chart-rebuild cost for a chart nobody can see.
                 // Samples keep accumulating either way, so a hidden/background
                 // tab (the overnight case) redraws once on return instead of
                 // thousands of times unseen -- which is what actually ran the
                 // renderer out of memory.
-                if (document.hidden) return;
-                if (benchOmniAccum.length &&
-                    benchOmniAccum.length !== benchOmniLastCount &&
-                    now - benchOmniLastRender > 2000) {
-                    benchOmniLastCount = benchOmniAccum.length;
-                    benchOmniLastRender = now;
-                    renderBenchOmni(benchOmniAccum);
+                if (document.hidden || !view.length) return;
+                if (view.length !== benchOmniLastCount) {
+                    benchOmniLastCount = view.length;
+                    scheduleBenchOmniDraw(view);
                 }
             }
         } catch (e) {}
@@ -5168,7 +5200,16 @@ function downsampleSeries(samples, max) {
 function saveBlockSamples(key, samples) {
     try {
         // store a trimmed copy -- only the fields the omni chart plots
-        benchBlockSamples[key] = downsampleSeries(samples, 600).map(s => ({ ...s }));
+        benchBlockSamples[key] = downsampleSeries(samples, 200).map(s => ({
+            t: s.t, masterPwr: s.masterPwr, workerPwr: s.workerPwr,
+            masterTemp: s.masterTemp, workerTemp: s.workerTemp,
+            masterGpuUtil: s.masterGpuUtil, workerGpuUtil: s.workerGpuUtil,
+            masterVram: s.masterVram, workerVram: s.workerVram,
+            masterCpuUtil: s.masterCpuUtil, netMbps: s.netMbps,
+            prefillTps: s.prefillTps, genTps: s.genTps,
+            thinkTps: s.thinkTps, answerTps: s.answerTps,
+            prefillProgress: s.prefillProgress,
+        }));
         const keys = Object.keys(benchBlockSamples);
         if (keys.length > BENCH_BLOCK_SAMPLES_MAX) {
             for (const k of keys.slice(0, keys.length - BENCH_BLOCK_SAMPLES_MAX)) delete benchBlockSamples[k];
@@ -5184,6 +5225,7 @@ function saveBlockSamples(key, samples) {
 let liveSweepBlock = null;
 function beginLiveSweepBlock(label, cmd) {
     liveSweepBlock = {
+        startedAt: Date.now(),
         lines: [`$ ${cmd || ''}`, '[sweep] starting…'],
         title: `llama-server: ${label}`,
         time: new Date().toLocaleString(),
@@ -5331,6 +5373,7 @@ async function startBenchRun(body) {
 }
 
 document.getElementById('tab-bench').addEventListener('click', async () => {
+    isInteractiveModeActive = false; syncBootOverlay();
     isMonitorModeActive = false;
     isHistoryModeActive = false;
     stopSessionOmniRefresh();
@@ -5948,8 +5991,14 @@ async function runSweep(onlyRow) {
             // Persist this run's telemetry series under the note's own key so
             // the finished block can redraw its graph later (see
             // benchBlockSamples / renderBenchChunk).
-            if (benchOmniAccum.length) {
-                saveBlockSamples(`llama-server: ${row.label}|${noteLines[1].replace(/---/g, '').trim()}`, benchOmniAccum);
+            // Only THIS row's samples, not the whole sweep so far. Saving the
+            // running accumulator meant every block stored an ever-growing
+            // superset -- wrong content (a block's graph showed earlier rows
+            // too) and enough bulk that localStorage hit quota partway through
+            // a sweep, which is why only the last block kept its graph.
+            const rowSamples = benchOmniAccum.filter(s => s.t >= (liveSweepBlock?.startedAt ?? 0));
+            if (rowSamples.length) {
+                saveBlockSamples(`llama-server: ${row.label}|${noteLines[1].replace(/---/g, '').trim()}`, rowSamples);
             }
             await fetch('/api/bench/note', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: noteLines }) });
         } catch (e) { /* transcript note is best-effort */ }
