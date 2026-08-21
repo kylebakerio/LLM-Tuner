@@ -318,7 +318,12 @@ async function fetchModels() {
         const models = await res.json();
         const select = document.getElementById('model-select');
         select.innerHTML = '';
-        models.forEach(m => { 
+        // Sorted by name: the API returns local-dir models then HF-cache ones,
+        // in readdir order, which is effectively arbitrary and made a specific
+        // quant hard to pick out of a long list. numeric:true so Q3/Q6/Q8 and
+        // 3.6/3.8 sort naturally rather than lexically.
+        models.sort((a, b) => String(a.name).localeCompare(String(b.name), undefined, { numeric: true, sensitivity: 'base' }));
+        models.forEach(m => {
             const opt = document.createElement('option'); 
             // IMPORTANT: value is the full host path (not just filename) so the
             // server can correctly resolve models that live outside the local
@@ -4923,9 +4928,16 @@ let benchOmniPollTimer = null;
 // instead so one sweep row draws one continuous series. Cleared when a run
 // starts, and by the existing "reset lines" control.
 let benchOmniAccum = [];
+let benchOmniPollStartedAt = 0;
 function startBenchOmniPoll() {
     if (benchOmniPollTimer) return;
     benchOmniAccum = [];
+    // Anything already in the server's buffer predates this run -- it's the
+    // tail of the PREVIOUS request (sampling keeps going for
+    // ACTIVITY_TIMEOUT_MS after one finishes). Including it stranded a few
+    // orphan points minutes to the left of the real data, stretching the axis
+    // and painting the whole model-load window as one huge gap band.
+    benchOmniPollStartedAt = Date.now();
     benchOmniPollTimer = setInterval(async () => {
         try {
             const data = await (await fetch('/api/logs/active-samples')).json();
@@ -4933,9 +4945,11 @@ function startBenchOmniPoll() {
             // of blanking the chart with an empty active buffer
             if (data.samples?.length) {
                 const seen = new Set(benchOmniAccum.map(s => s.t));
-                for (const s of data.samples) if (!seen.has(s.t)) benchOmniAccum.push(s);
+                for (const s of data.samples) {
+                    if (s.t >= benchOmniPollStartedAt && !seen.has(s.t)) benchOmniAccum.push(s);
+                }
                 benchOmniAccum.sort((a, b) => a.t - b.t);
-                renderBenchOmni(benchOmniAccum);
+                if (benchOmniAccum.length) renderBenchOmni(benchOmniAccum);
             }
         } catch (e) {}
     }, Math.max(500, currentTelemetryRateMs));
