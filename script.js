@@ -4956,6 +4956,11 @@ function startBenchOmniPoll() {
                     if (s.t >= benchOmniPollStartedAt && !seen.has(s.t)) benchOmniAccum.push(s);
                 }
                 benchOmniAccum.sort((a, b) => a.t - b.t);
+                // Bounded: this accumulates for the whole sweep (hours
+                // overnight) and is re-plotted every poll tick, so an
+                // unbounded array is both a memory leak and a growing
+                // per-tick render cost. Thin the oldest half when it gets big.
+                if (benchOmniAccum.length > 4000) benchOmniAccum = downsampleSeries(benchOmniAccum, 2000);
                 if (benchOmniAccum.length) renderBenchOmni(benchOmniAccum);
             }
         } catch (e) {}
@@ -5107,11 +5112,27 @@ try { benchStars = JSON.parse(localStorage.getItem('bench_stars') || '{}'); } ca
 const BENCH_BLOCK_SAMPLES_KEY = 'bench_block_samples';
 const BENCH_BLOCK_SAMPLES_MAX = 40;
 let benchBlockSamples = {};
+// Chart instances currently on screen, keyed by block identity, so each render
+// can destroy the previous ones instead of leaking them. Declared here (not
+// beside renderBenchOutput) because `const` has no hoisting and that function
+// reads it.
+const benchBlockCharts = new Map();
 try { benchBlockSamples = JSON.parse(localStorage.getItem(BENCH_BLOCK_SAMPLES_KEY) || '{}'); } catch (e) {}
+// Evenly thin a series to at most `max` points. A multi-minute run at 1
+// sample/s is thousands of points -- far more than a 128px-tall chart can
+// show, and enough to blow the localStorage quota once a few runs pile up.
+function downsampleSeries(samples, max) {
+    if (samples.length <= max) return samples.slice();
+    const step = samples.length / max;
+    const out = [];
+    for (let i = 0; i < max; i++) out.push(samples[Math.floor(i * step)]);
+    out[out.length - 1] = samples[samples.length - 1]; // keep the true end
+    return out;
+}
 function saveBlockSamples(key, samples) {
     try {
         // store a trimmed copy -- only the fields the omni chart plots
-        benchBlockSamples[key] = samples.map(s => ({ ...s }));
+        benchBlockSamples[key] = downsampleSeries(samples, 600).map(s => ({ ...s }));
         const keys = Object.keys(benchBlockSamples);
         if (keys.length > BENCH_BLOCK_SAMPLES_MAX) {
             for (const k of keys.slice(0, keys.length - BENCH_BLOCK_SAMPLES_MAX)) delete benchBlockSamples[k];
@@ -5138,9 +5159,18 @@ function beginLiveSweepBlock(label, cmd) {
 }
 function updateLiveSweepBlock(text) {
     if (!liveSweepBlock) return;
+    const structureChanged = liveSweepBlock.lines.length !== liveSweepBlock.reps.length + 2;
     liveSweepBlock.liveLine = text;
     // rebuild: command, any finished reps, then the current live line
     liveSweepBlock.lines = [liveSweepBlock.lines[0], ...liveSweepBlock.reps, text];
+    // Fast path: this fires on every progress event (multiple times a second
+    // during prefill). A full renderBenchOutput() there rebuilds the entire
+    // transcript's innerHTML and re-instantiates every block chart, which is
+    // both janky and how the tab used to run itself out of memory. Only the
+    // one status line actually changed, so poke it directly and re-render
+    // solely when the block's structure changed (a rep landed).
+    const liveEl = document.getElementById('live-sweep-line');
+    if (liveEl && !structureChanged) { liveEl.textContent = text; return; }
     renderBenchOutput();
 }
 function addLiveSweepRep(res, repIdx) {
@@ -5200,7 +5230,12 @@ function renderBenchOutput() {
                 </div>
                 ${b.cmd ? `<div class="text-[10px] text-gray-500 font-mono truncate mt-0.5" title="${escapeHtml(b.cmd)}">${escapeHtml(b.cmd)}</div>` : ''}
             </summary>
-            <div class="px-3 pb-2">${renderBenchChunk(b.lines)}${
+            <div class="px-3 pb-2">${
+                b === liveSweepBlock
+                    ? renderBenchChunk(b.lines.slice(0, -1)) +
+                      `<div id="live-sweep-line" class="text-amber-300/90 font-mono text-[11px] whitespace-pre-wrap break-all">${escapeHtml(b.liveLine || '')}</div>`
+                    : renderBenchChunk(b.lines)
+            }${
                 benchBlockSamples[starKey]?.length
                     ? `<div class="mt-2"><div class="text-[10px] text-gray-600 mb-1">run telemetry</div>
                        <div class="h-32"><canvas data-blockchart="${escapeHtml(starKey)}"></canvas></div></div>`
@@ -5208,24 +5243,38 @@ function renderBenchOutput() {
             }</div>
         </details>`;
     }).join('');
+    // Destroy the previous render's charts BEFORE dropping their canvases.
+    // innerHTML replacement discards the canvas elements but Chart.js keeps
+    // every instance in its own global registry, so without this each render
+    // leaked one live Chart per block -- which, at one render per progress
+    // event over a long sweep, is enough to OOM the tab ("Aww, Snap").
+    for (const c of benchBlockCharts.values()) { try { c.destroy(); } catch (e) {} }
+    benchBlockCharts.clear();
     el.innerHTML = html;
     el.scrollTop = prevScroll;
-    // Draw stored series into each block's canvas. Only <details> that are
-    // actually open have laid-out canvases; the rest draw on first expand.
-    el.querySelectorAll('canvas[data-blockchart]').forEach(cv => {
-        const samples = benchBlockSamples[cv.dataset.blockchart];
-        if (!samples?.length || cv.$drawn) return;
-        try {
-            new Chart(cv.getContext('2d'), {
-                type: 'line',
-                data: { datasets: buildOmniDatasets(samples, 'rgba(74,222,128,1)') },
-                options: (() => { const o = buildOmniOptions(); o.scales.x.title.display = false; return o; })(),
-                plugins: [omniPointLabelsPlugin, omniGapBandsPlugin]
-            });
-            cv.$drawn = true;
-        } catch (e) { /* a chart failure must not blank the transcript */ }
-    });
+    // Draw only into blocks the user actually has expanded; collapsed ones
+    // get their chart on first open (see the toggle handler below). Keeps a
+    // long transcript from instantiating dozens of charts at once.
+    el.querySelectorAll('details[open] canvas[data-blockchart]').forEach(drawBlockChart);
 }
+function drawBlockChart(cv) {
+    const key = cv.dataset.blockchart;
+    const samples = benchBlockSamples[key];
+    if (!samples?.length || benchBlockCharts.has(key)) return;
+    try {
+        benchBlockCharts.set(key, new Chart(cv.getContext('2d'), {
+            type: 'line',
+            data: { datasets: buildOmniDatasets(samples, 'rgba(74,222,128,1)') },
+            options: (() => { const o = buildOmniOptions(); o.scales.x.title.display = false; return o; })(),
+            plugins: [omniPointLabelsPlugin, omniGapBandsPlugin]
+        }));
+    } catch (e) { /* a chart failure must not blank the transcript */ }
+}
+// Lazy-draw on expand ('toggle' doesn't bubble, so capture).
+document.getElementById('bench-output')?.addEventListener('toggle', (e) => {
+    const d = e.target;
+    if (d.tagName === 'DETAILS' && d.open) d.querySelectorAll('canvas[data-blockchart]').forEach(drawBlockChart);
+}, true);
 
 async function startBenchRun(body) {
     try {
