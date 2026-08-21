@@ -1363,7 +1363,7 @@ async function logCompletedRequest(timing, samples, completedAt, { config: cfgPa
                 rpc: cfg.rpcTarget ?? 'no',
                 transport: cfg.rpcTarget ? (cfg.transport || '') : 'Local',
                 devices: cfg.devices ?? null,
-                launchCommand,
+                launchCommand: launchCmd,
                 promptLatency: timing.promptLatency || null,
                 gpuUtil: master.gpu_util ?? null,
                 gpuMemory: master.gpu_mem_used ?? null,
