@@ -3030,6 +3030,14 @@ async function pollTelemetry() {
             'sw_power_cap': 'SW Power Cap',
             'hw_power_brake_slowdown': 'HW Power Brake'
         };
+        // What each badge actually MEANS for a benchmark reading -- the labels
+        // alone don't say whether a lit badge invalidates a measurement.
+        const throttleHelp = {
+            'hw_thermal_slowdown': 'The GPU itself cut clocks to protect the die. Any timing taken while this is lit is heat-limited and NOT comparable to a cool run.',
+            'sw_thermal_slowdown': 'The driver reduced clocks because of temperature. Timings taken while lit are heat-limited and not comparable to a cool run.',
+            'sw_power_cap': 'Clocks limited by the POWER cap, not heat. On a power-limited laptop GPU this is normally lit continuously and is expected -- it is not a reason to discard a measurement.',
+            'hw_power_brake_slowdown': 'An external power limit (brake) is cutting clocks -- e.g. insufficient supply, not temperature.'
+        };
         // Map reason -> Set<'master'|'worker'>
         const reasonMap = new Map();
         for (const r of mReasons) {
@@ -3059,9 +3067,10 @@ async function pollTelemetry() {
                 ? 'bg-red-900/40 text-red-300 border border-red-500/50'
                 : 'bg-yellow-900/30 text-yellow-300 border border-yellow-600/50';
             const inactiveClasses = 'bg-gray-800/40 text-gray-600 border border-gray-700/50';
+            const help = throttleHelp[reason] || '';
             const tooltip = active
-                ? `${[...sources].join(' + ').replace(/^./, c => c.toUpperCase())}: ${label}`
-                : `${label} (not currently active)`;
+                ? `${[...sources].join(' + ').replace(/^./, c => c.toUpperCase())}: ${label} -- ACTIVE. ${help}`
+                : `${label}: not active. ${help}`;
             const badge = `<span class="px-1.5 py-0.5 text-[9px] font-semibold rounded ${active ? activeClasses : inactiveClasses}" title="${tooltip}">${label}</span>`;
             if (isThermal) badgeHTML += badge; else badgeHTMLPwr += badge;
         }
@@ -3980,14 +3989,34 @@ const omniGapBandsPlugin = {
         ctx.restore();
     }
 };
+// Thermal-throttle highlighting: any segment of a temperature line whose
+// endpoint was recorded while the card reported a THERMAL throttle reason is
+// drawn thick and red, so a heat-limited stretch is visible at a glance rather
+// than having to be inferred from the temperature's absolute value (which on
+// this rig looks unremarkable -- the 4090 throttles in the 80s).
+// sw_power_cap is excluded upstream; it is always on here.
+function thermalSegment(metrics, field) {
+    if (!metrics?.some(m => m && m[field])) return {};
+    const hot = (ctx) => {
+        const i = ctx.p1DataIndex;
+        return metrics[i] && metrics[i][field];
+    };
+    return {
+        segment: {
+            borderColor: (ctx) => hot(ctx) ? 'rgba(239,68,68,1)' : undefined,
+            borderWidth: (ctx) => hot(ctx) ? 2.5 : undefined,
+            borderDash: (ctx) => hot(ctx) ? [] : undefined,
+        }
+    };
+}
 function buildOmniDatasets(metrics, tpsLineColor) {
     metrics = injectGapBreaks(metrics);
     const A = omniGpuA, B = omniGpuB;
     return [
         { label: `${A} Power (W)`, data: toPoints(metrics, 'masterPwr'), borderColor: 'rgba(250,204,21,1)', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, yAxisID: 'y' },
         { label: `${B} Power (W)`, data: toPoints(metrics, 'workerPwr'), borderColor: 'rgba(248,113,113,1)', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, yAxisID: 'y' },
-        { label: `${A} Temp (°C)`, data: toPoints(metrics, 'masterTemp'), borderColor: 'rgba(251,146,60,1)', backgroundColor: 'transparent', borderWidth: 1, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, borderDash: [3,3], yAxisID: 'y2' },
-        { label: `${B} Temp (°C)`, data: toPoints(metrics, 'workerTemp'), borderColor: 'rgba(244,63,94,1)', backgroundColor: 'transparent', borderWidth: 1, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, borderDash: [3,3], yAxisID: 'y2' },
+        { label: `${A} Temp (°C)`, data: toPoints(metrics, 'masterTemp'), borderColor: 'rgba(251,146,60,1)', backgroundColor: 'transparent', borderWidth: 1, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, borderDash: [3,3], yAxisID: 'y2', ...thermalSegment(metrics, 'masterThermal') },
+        { label: `${B} Temp (°C)`, data: toPoints(metrics, 'workerTemp'), borderColor: 'rgba(244,63,94,1)', backgroundColor: 'transparent', borderWidth: 1, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, borderDash: [3,3], yAxisID: 'y2', ...thermalSegment(metrics, 'workerThermal') },
         { label: `${A} Util (%)`, data: toPoints(metrics, 'masterGpuUtil'), borderColor: 'rgba(167,139,250,1)', backgroundColor: 'transparent', borderWidth: 1, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, borderDash: [2,2], yAxisID: 'y2' },
         { label: `${B} Util (%)`, data: toPoints(metrics, 'workerGpuUtil'), borderColor: 'rgba(217,70,239,1)', backgroundColor: 'transparent', borderWidth: 1, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, borderDash: [2,2], yAxisID: 'y2' },
         { label: 'Net MB/s', data: toPoints(metrics, 'netMbps'), borderColor: 'rgba(96,165,250,1)', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, yAxisID: 'y' },
@@ -5876,17 +5905,20 @@ async function coolDownBeforeRow(label) {
     const maxSec = Math.max(0, parseFloat(document.getElementById('ab-cool-max').value) || 0);
     const t0 = Date.now();
     let last = await readTemps();
+    // Gate on GPU temp ONLY. The CPU shares cooling with the dGPU here, so its
+    // sensor lags and reads chassis heat -- gating on it would stall every row
+    // for minutes on a reading that isn't what limits the GPU's clocks. CPU
+    // temp is still recorded and shown, just not a gate.
     while ((Date.now() - t0) / 1000 < maxSec) {
-        const hot = (last.gpu != null && last.gpu > target) || (last.cpu != null && last.cpu > target);
-        if (!hot) break;
+        if (!(last.gpu != null && last.gpu > target)) break;
         const waited = Math.round((Date.now() - t0) / 1000);
-        abStatus(`${label}: cooling ${last.gpu ?? '?'}C GPU / ${last.cpu ?? '?'}C CPU -> ${target}C (${waited}s)`);
+        abStatus(`${label}: cooling GPU ${last.gpu}C -> ${target}C (${waited}s, CPU ${last.cpu ?? '?'}C)`);
         await new Promise(r => setTimeout(r, 5000));
         last = await readTemps();
     }
     const waited = Math.round((Date.now() - t0) / 1000);
     return { waited, gpu: last.gpu, cpu: last.cpu,
-             reachedTarget: !((last.gpu != null && last.gpu > target) || (last.cpu != null && last.cpu > target)) };
+             reachedTarget: !(last.gpu != null && last.gpu > target) };
 }
 
 

@@ -1159,6 +1159,12 @@ async function takeOneTelemetrySample(statsArg) {
             t: Date.now(),
             netMbps,
             masterPwr: stats.master?.gpu_pwr ?? 0, masterTemp: stats.master?.gpu_temp ?? 0,
+            // Per-sample thermal-throttle state, so the charts can mark the
+            // exact stretch where a card was heat-limited. Deliberately only
+            // /thermal/ reasons: sw_power_cap is permanently active on this rig
+            // (80W firmware cap) and would mark every single sample.
+            masterThermal: (stats.master?.throttle_reasons || []).some(r => /thermal/i.test(String(r))),
+            workerThermal: (stats.worker?.throttle_reasons || []).some(r => /thermal/i.test(String(r))),
             masterGpuUtil: stats.master?.gpu_util ?? 0, masterCpuUtil: stats.master?.cpu_util ?? 0,
             workerPwr: stats.worker?.gpu_pwr ?? 0, workerTemp: stats.worker?.gpu_temp ?? 0,
             workerGpuUtil: stats.worker?.gpu_util ?? 0,

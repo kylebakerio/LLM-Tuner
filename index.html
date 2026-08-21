@@ -754,7 +754,7 @@
                         <input type="text" id="ab-reps" value="2" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono">
                     </div>
                     <div>
-                        <label class="block text-[10px] text-gray-400 mb-1">Cool to &deg;C <span class="text-indigo-400 cursor-help" title="Before each config, idle until BOTH GPU and CPU are at or below this temperature. Removes the thermal ramp that otherwise makes later rows in a sweep slower than earlier ones. Blank or 0 disables.">?</span></label>
+                        <label class="block text-[10px] text-gray-400 mb-1">Cool to &deg;C <span class="text-indigo-400 cursor-help" title="Before each config, idle until the GPU is at or below this temperature. Removes the thermal ramp that otherwise makes later rows in a sweep slower than earlier ones. CPU temp is recorded but not gated on -- it shares cooling with the dGPU and lags. Blank or 0 disables.">?</span></label>
                         <input type="text" id="ab-cool-temp" value="0" placeholder="0 = off" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono">
                     </div>
                     <div>
