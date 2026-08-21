@@ -6148,6 +6148,17 @@ async function runSweep(onlyRow) {
                         (th.reachedTarget === false ? ' | HOT START (cooldown timed out)' : ''));
                 }
                 noteLines.push('[sweep] done');
+                // Capture notable startup lines on SUCCESS too. Previously only
+                // failures snapshotted the log, so a run that succeeded but did
+                // something significant during load -- e.g. 'retrying without
+                // pipeline parallelism', which silently costs ~2x split prefill
+                // -- left no record, and the buffer is cleared by the next launch.
+                try {
+                    const ml = await (await fetch('/api/master/logs')).json();
+                    const notable = (ml.logs || '').split('\n').filter(l =>
+                        /pipeline parallelism|compute buffer|failed to allocate|out of memory|fit params|model loaded|n_slots|graph_reserve|unused tensor/i.test(l));
+                    if (notable.length) noteLines.push('[log] notable startup lines:', ...notable.slice(0, 40));
+                } catch (e) { /* best-effort */ }
             } else {
                 noteLines.push(`[sweep] failed: ${row.error || 'no results captured'}`);
                 // The next row's launch clears masterLogBuffer immediately, so
