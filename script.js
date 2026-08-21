@@ -5905,15 +5905,18 @@ function abRenderResults() {
 function thermalCell(t) {
     if (!t) return '<span class="text-gray-600">--</span>';
     const parts = [];
-    if (t.startGpu != null) parts.push(`start ${t.startGpu}/${t.startCpu ?? '?'}C`);
-    if (t.maxGpu != null) parts.push(`max ${t.maxGpu}/${t.maxCpu ?? '?'}C`);
+    if (t.startGpu != null) parts.push(`start GPU ${t.startGpu}C / CPU ${t.startCpu ?? '?'}C`);
+    if (t.maxGpu != null) parts.push(`peak GPU ${t.maxGpu}C / CPU ${t.maxCpu ?? '?'}C`);
+    // CPU here is chassis-shared cooling, not a GPU reading -- label it so a
+    // high number isn't misread as the GPU being hot.
+    parts.push('(CPU shares cooling with the dGPU)');
     const title = parts.join(' \u00b7 ');
     if (t.throttled) {
         const why = t.reasons ? [...t.reasons].join(', ') : 'thermal';
         return `<span class="text-orange-400" title="${why} -- ${title}">THROTTLED (${why.replace(/_slowdown/g,'').replace(/_/g,' ')})</span>`;
     }
     if (t.reachedTarget === false) return `<span class="text-yellow-500" title="${title}">hot start</span>`;
-    return `<span class="text-gray-500" title="${title}">${t.maxGpu ?? '?'}/${t.maxCpu ?? '?'}C</span>`;
+    return `<span class="text-gray-500" title="${title}">GPU ${t.maxGpu ?? '?'}C</span>`;
 }
 function abStatus(msg) { document.getElementById('ab-status').textContent = msg; }
 
@@ -5939,7 +5942,13 @@ function isThermalReason(reasons) {
 }
 async function coolDownBeforeRow(label) {
     const target = parseFloat(document.getElementById('ab-cool-temp').value) || 0;
-    if (target <= 0) return null;
+    // Always record the starting temperature, even with the gate disabled --
+    // "what temperature did this row start at" is useful on every run, and
+    // returning null here made every uncooled row report 'start ?C'.
+    if (target <= 0) {
+        const t = await readTemps();
+        return { waited: 0, gpu: t.gpu, cpu: t.cpu, reachedTarget: null };
+    }
     const maxSec = Math.max(0, parseFloat(document.getElementById('ab-cool-max').value) || 0);
     const t0 = Date.now();
     let last = await readTemps();
@@ -6154,9 +6163,9 @@ async function runSweep(onlyRow) {
                     `| ${ri + 1} | ${r.promptTokens ?? ''} | ${r.promptTps != null ? Number(r.promptTps).toFixed(1) : ''} | ${r.genTokens ?? ''} | ${r.genTps != null ? Number(r.genTps).toFixed(1) : ''} | ${r.draftAcceptRate != null ? (r.draftAcceptRate * 100).toFixed(0) + '%' : ''} | ${r.wallTime != null ? Number(r.wallTime).toFixed(1) : ''} |`));
                 const th = row.thermal;
                 if (th) {
-                    noteLines.push(`[thermal] start ${th.startGpu ?? '?'}C GPU / ${th.startCpu ?? '?'}C CPU` +
+                    noteLines.push(`[thermal] start GPU ${th.startGpu ?? '?'}C (CPU ${th.startCpu ?? '?'}C)` +
                         (th.cooledFor ? ` after ${th.cooledFor}s cooldown` : '') +
-                        ` | peak ${th.maxGpu ?? '?'}C / ${th.maxCpu ?? '?'}C` +
+                        ` | peak GPU ${th.maxGpu ?? '?'}C (CPU ${th.maxCpu ?? '?'}C)` +
                         (th.throttled ? ' | THERMALLY THROTTLED -- not comparable to cool runs' : '') +
                         (th.reachedTarget === false ? ' | HOT START (cooldown timed out)' : ''));
                 }
