@@ -1192,7 +1192,11 @@ function startTelemetryLoop() {
         const stats = await fetchCurrentTelemetry();
         if (!stats) return;
         lastServerTelemetry = { t: Date.now(), stats };
-        const recording = benchRunning || (Date.now() - lastActivityTimestamp < ACTIVITY_TIMEOUT_MS);
+        // Also record while a model is loading: on a VRAM-tight rig the load
+        // window (VRAM climbing, power/temp ramp) is real signal, and skipping
+        // it left a minutes-long hole at the head of every run's chart.
+        const loading = serverState === 'starting' || serverState === 'loading';
+        const recording = benchRunning || loading || (Date.now() - lastActivityTimestamp < ACTIVITY_TIMEOUT_MS);
         if (recording) await takeOneTelemetrySample(stats);
     }, telemetryPollMs);
 }

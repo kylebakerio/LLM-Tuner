@@ -1509,7 +1509,9 @@ function handlePrefillProgress(progress, tps, nTokens) {
     liveMonitorRow = { ...(liveMonitorRow || { startedAt: Date.now() }), live: true, model: lastKnownModelName, promptTokens: isNaN(nTokens) ? null : nTokens, promptTps: isNaN(tps) ? null : tps };
     if (isMonitorModeActive) renderMonitorTable();
     const abLive = document.getElementById('ab-live');
-    if (abLive) abLive.textContent = `prefill ${(progress * 100).toFixed(1)}% — ${isNaN(nTokens) ? '?' : nTokens.toLocaleString()} tok @ ${isNaN(tps) ? '?' : tps.toFixed(1)} t/s`;
+    const abLiveText = `prefill ${(progress * 100).toFixed(1)}% — ${isNaN(nTokens) ? '?' : nTokens.toLocaleString()} tok @ ${isNaN(tps) ? '?' : tps.toFixed(1)} t/s`;
+    if (abLive) abLive.textContent = abLiveText;
+    updateLiveSweepBlock(abLiveText);
     const pct = isNaN(progress) ? 0 : (progress * 100).toFixed(1);
     // status-indicator's ticking text is owned solely by submitPrompt's own
     // tpsLoop (1s interval) -- it used to also get overwritten from here,
@@ -1563,7 +1565,9 @@ function handleGenProgress(tps, nDecoded) {
     liveMonitorRow = { ...(liveMonitorRow || { startedAt: Date.now() }), live: true, model: lastKnownModelName, genTokens: isNaN(nDecoded) ? null : nDecoded, genTps: isNaN(tps) ? null : tps };
     if (isMonitorModeActive) renderMonitorTable();
     const abLiveG = document.getElementById('ab-live');
-    if (abLiveG) abLiveG.textContent = `generating ${isNaN(nDecoded) ? '?' : nDecoded.toLocaleString()} tok @ ${isNaN(tps) ? '?' : tps.toFixed(1)} t/s`;
+    const abLiveGText = `generating ${isNaN(nDecoded) ? '?' : nDecoded.toLocaleString()} tok @ ${isNaN(tps) ? '?' : tps.toFixed(1)} t/s`;
+    if (abLiveG) abLiveG.textContent = abLiveGText;
+    updateLiveSweepBlock(abLiveGText);
 
     // Live gen speed in the sidebar card
     if (!isNaN(tps)) {
@@ -4464,6 +4468,7 @@ async function initBenchTab() {
     } catch (e) {}
 }
 let benchIsRunning = false;
+let abRunning = false; // llama-server sweep in flight (see runSweep)
 function setBenchRunningUI(running) {
     benchIsRunning = running;
     const rq = document.getElementById('bench-run-queued');
@@ -4712,6 +4717,60 @@ function renderBenchChunk(lines) {
 // don't shed the handlers.
 let benchStars = {};
 try { benchStars = JSON.parse(localStorage.getItem('bench_stars') || '{}'); } catch (e) {}
+
+// --- Per-block telemetry series (historical graphs in the accordion) ---
+// Keyed by the same "title|time" identity the star bookmarks use, so a
+// finished block can redraw the telemetry it was recorded with. Persisted to
+// localStorage (the server does NOT keep per-run sample series on disk), and
+// capped since each series is a few hundred points.
+const BENCH_BLOCK_SAMPLES_KEY = 'bench_block_samples';
+const BENCH_BLOCK_SAMPLES_MAX = 40;
+let benchBlockSamples = {};
+try { benchBlockSamples = JSON.parse(localStorage.getItem(BENCH_BLOCK_SAMPLES_KEY) || '{}'); } catch (e) {}
+function saveBlockSamples(key, samples) {
+    try {
+        // store a trimmed copy -- only the fields the omni chart plots
+        benchBlockSamples[key] = samples.map(s => ({ ...s }));
+        const keys = Object.keys(benchBlockSamples);
+        if (keys.length > BENCH_BLOCK_SAMPLES_MAX) {
+            for (const k of keys.slice(0, keys.length - BENCH_BLOCK_SAMPLES_MAX)) delete benchBlockSamples[k];
+        }
+        localStorage.setItem(BENCH_BLOCK_SAMPLES_KEY, JSON.stringify(benchBlockSamples));
+    } catch (e) { /* quota -- graphs are a nicety, never break the run over it */ }
+}
+
+// --- In-progress sweep row (live accordion block) ---
+// Shape matches splitBenchBlocks() output so renderBenchOutput can treat it
+// like any other block. `liveLine` is the one mutable status line (prefill %
+// / generating N tok @ X t/s) updated straight from the SSE progress events.
+let liveSweepBlock = null;
+function beginLiveSweepBlock(label, cmd) {
+    liveSweepBlock = {
+        lines: [`$ ${cmd || ''}`, '[sweep] starting…'],
+        title: `llama-server: ${label}`,
+        time: new Date().toLocaleString(),
+        dev: '', hasCmd: true, status: 'running',
+        liveLine: '[sweep] starting…',
+        reps: [],
+    };
+    renderBenchOutput();
+}
+function updateLiveSweepBlock(text) {
+    if (!liveSweepBlock) return;
+    liveSweepBlock.liveLine = text;
+    // rebuild: command, any finished reps, then the current live line
+    liveSweepBlock.lines = [liveSweepBlock.lines[0], ...liveSweepBlock.reps, text];
+    renderBenchOutput();
+}
+function addLiveSweepRep(res, repIdx) {
+    if (!liveSweepBlock) return;
+    liveSweepBlock.reps.push(
+        `[rep ${repIdx}] prompt ${res.promptTokens ?? '?'} tok @ ${res.promptTps != null ? Number(res.promptTps).toFixed(1) : '?'} t/s · ` +
+        `gen ${res.genTokens ?? '?'} tok @ ${res.genTps != null ? Number(res.genTps).toFixed(1) : '?'} t/s` +
+        (res.draftAcceptRate != null ? ` · draft ${(res.draftAcceptRate * 100).toFixed(0)}%` : ''));
+    updateLiveSweepBlock(liveSweepBlock.liveLine);
+}
+function endLiveSweepBlock() { liveSweepBlock = null; renderBenchOutput(); }
 document.getElementById('bench-output').addEventListener('click', (e) => {
     const btn = e.target.closest('.bench-star');
     if (!btn) return;
@@ -4728,12 +4787,18 @@ function renderBenchOutput() {
     if (!el) return;
     const prevScroll = el.scrollTop;
     const blocks = splitBenchBlocks(benchOutputLines);
+    // In-progress sweep row: a synthetic newest block so a running config is
+    // visible in the transcript WHILE it runs (with its live prefill/gen
+    // numbers inline), instead of only appearing once it has finished and
+    // written its note. Not part of benchOutputLines -- purely a render-time
+    // overlay, replaced by the real block when the note lands.
+    if (liveSweepBlock) blocks.push(liveSweepBlock);
     const html = blocks.slice().reverse().map((b, ri) => {
         const isNewest = ri === 0;
         // A block with no exit line is only "running" if it's the newest AND a
         // bench is actually in flight -- anything else died mid-run (killed
         // process, dashboard restart) and should say so.
-        if (b.status === 'running' && !(isNewest && benchIsRunning)) b.status = 'interrupted';
+        if (b.status === 'running' && !(isNewest && (benchIsRunning || abRunning))) b.status = 'interrupted';
         const statusBadge = b.status === 'ok' ? '<span class="text-green-400">done</span>'
             : b.status === 'fail' ? '<span class="text-orange-400">failed</span>'
             : b.status === 'interrupted' ? '<span class="text-gray-500">interrupted</span>'
@@ -4751,11 +4816,31 @@ function renderBenchOutput() {
                 <span class="text-gray-600">${escapeHtml(b.time)}</span>${statusBadge}
                 <button type="button" class="bench-star ml-auto ${starred ? 'text-yellow-400' : 'text-gray-600 hover:text-yellow-400'}" data-starkey="${escapeHtml(starKey)}" title="Bookmark this block">${starred ? '★' : '☆'}</button>
             </summary>
-            <div class="px-3 pb-2">${renderBenchChunk(b.lines)}</div>
+            <div class="px-3 pb-2">${renderBenchChunk(b.lines)}${
+                benchBlockSamples[starKey]?.length
+                    ? `<div class="mt-2"><div class="text-[10px] text-gray-600 mb-1">run telemetry</div>
+                       <div class="h-32"><canvas data-blockchart="${escapeHtml(starKey)}"></canvas></div></div>`
+                    : ''
+            }</div>
         </details>`;
     }).join('');
     el.innerHTML = html;
     el.scrollTop = prevScroll;
+    // Draw stored series into each block's canvas. Only <details> that are
+    // actually open have laid-out canvases; the rest draw on first expand.
+    el.querySelectorAll('canvas[data-blockchart]').forEach(cv => {
+        const samples = benchBlockSamples[cv.dataset.blockchart];
+        if (!samples?.length || cv.$drawn) return;
+        try {
+            new Chart(cv.getContext('2d'), {
+                type: 'line',
+                data: { datasets: buildOmniDatasets(samples, 'rgba(74,222,128,1)') },
+                options: (() => { const o = buildOmniOptions(); o.scales.x.title.display = false; return o; })(),
+                plugins: [omniPointLabelsPlugin, omniGapBandsPlugin]
+            });
+            cv.$drawn = true;
+        } catch (e) { /* a chart failure must not blank the transcript */ }
+    });
 }
 
 async function startBenchRun(body) {
@@ -5119,7 +5204,10 @@ let lastKnownServerState = 'stopped';
 let lastKnownServerError = '';
 let abCaptureResolve = null;
 let abRows = [];
-let abRunning = false;
+// abRunning is declared up with benchIsRunning (renderBenchOutput reads it to
+// decide whether a block is genuinely running vs interrupted, and `let` has no
+// hoisting -- keeping it here risked a temporal-dead-zone ReferenceError if a
+// render ever fired during module evaluation).
 
 function abPersist() {
     try {
@@ -5289,6 +5377,7 @@ async function runSweep(onlyRow) {
     for (const row of targets) {
         row.status = 'running'; abRenderRows();
         abStatus(`launching: ${row.label}`);
+        beginLiveSweepBlock(row.label, row.config?.rawCommand);
         try {
             await fetch('/api/stop', { method: 'POST' }).catch(() => {});
             await new Promise(r => setTimeout(r, 3000));
@@ -5344,7 +5433,7 @@ async function runSweep(onlyRow) {
                 const payload = await Promise.race([completionArrived, new Promise(r => setTimeout(() => r(null), 30000))]);
                 console.log(`[ab-sweep] ${row.label} rep ${rep + 1}: race settled at +${Date.now() - reqSentAt}ms, payload = ${payload ? 'RECEIVED' : 'NULL (timed out)'}`);
                 abCaptureResolve = null;
-                if (payload) { row.results.push(payload); abRenderResults(); abPersist(); }
+                if (payload) { row.results.push(payload); addLiveSweepRep(payload, rep + 1); abRenderResults(); abPersist(); }
             }
             row.status = 'done';
         } catch (e) {
@@ -5386,8 +5475,15 @@ async function runSweep(onlyRow) {
                     if (tail.some(l => l.trim())) noteLines.push('[log] master log (last 80 lines):', ...tail);
                 } catch (e) { /* best-effort */ }
             }
+            // Persist this run's telemetry series under the note's own key so
+            // the finished block can redraw its graph later (see
+            // benchBlockSamples / renderBenchChunk).
+            if (benchOmniAccum.length) {
+                saveBlockSamples(`llama-server: ${row.label}|${noteLines[1].replace(/---/g, '').trim()}`, benchOmniAccum);
+            }
             await fetch('/api/bench/note', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: noteLines }) });
         } catch (e) { /* transcript note is best-effort */ }
+        endLiveSweepBlock();
     }
     await fetch('/api/stop', { method: 'POST' }).catch(() => {});
     abRunning = false;
