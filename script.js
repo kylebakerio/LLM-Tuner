@@ -5708,6 +5708,15 @@ async function runSweep(onlyRow) {
                 noteLines.push('[sweep] done');
             } else {
                 noteLines.push(`[sweep] failed: ${row.error || 'no results captured'}`);
+                // The next row's launch clears masterLogBuffer immediately, so
+                // a failure that isn't diagnosed right now is undiagnosable
+                // later -- snapshot it into the persisted transcript while
+                // it's still this row's log.
+                try {
+                    const ml = await (await fetch('/api/master/logs')).json();
+                    const tail = (ml.logs || '').split('\n').slice(-80).join('\n');
+                    if (tail.trim()) noteLines.push('--- master log (last 80 lines) ---', tail);
+                } catch (e) { /* best-effort */ }
             }
             await fetch('/api/bench/note', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: noteLines }) });
         } catch (e) { /* transcript note is best-effort */ }
