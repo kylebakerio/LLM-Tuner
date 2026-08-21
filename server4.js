@@ -1398,10 +1398,24 @@ const server = http.createServer(async (req, res) => {
     try {
         // --- UI ---
         if (req.url === '/' || req.url === '/index.html') {
-            const content = await fs.readFile(path.join(__dirname, 'index.html'), 'utf-8');
-            // no-store: index.html and script.js evolve together; a cached copy
-            // of one against a fresh copy of the other produces bizarre
-            // rendering bugs (e.g. new renderer writing into an old <pre>).
+            let content = await fs.readFile(path.join(__dirname, 'index.html'), 'utf-8');
+            // Cache-busting: no-store alone proved insufficient -- browsers
+            // still served a stale script.js (silently running old code against
+            // a fresh index.html, which is exactly the mismatch the header was
+            // meant to prevent). Stamp every local asset URL with its file
+            // mtime so a changed file is a different URL and CANNOT be served
+            // from cache, while an unchanged one still caches normally.
+            const stamp = async (relPath) => {
+                try {
+                    const st = await fs.stat(path.join(__dirname, relPath));
+                    return String(Math.floor(st.mtimeMs));
+                } catch { return String(Date.now()); }
+            };
+            const assetRe = /(src|href)="(\.\/[^"?]+\.(?:js|css))"/g;
+            const matches = [...content.matchAll(assetRe)];
+            const versions = await Promise.all(matches.map(m => stamp(m[2])));
+            let i = 0;
+            content = content.replace(assetRe, (full, attr, url) => `${attr}="${url}?v=${versions[i++]}"`);
             res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-store' });
             return res.end(content);
         }
@@ -1456,8 +1470,12 @@ const server = http.createServer(async (req, res) => {
             return res.end(JSON.stringify(uniqueModels));
         }
 
-        else if (req.url.match(/^\/(?:vendor\/)?[\w.-]+\.(js|css|map|ico|png|svg)$/)) {
-            const filePath = path.join(__dirname, req.url);
+        // Strip the ?v=<mtime> cache-busting stamp the html handler adds before
+        // matching/resolving -- the pattern is $-anchored and the query is not
+        // part of the filename.
+        else if (req.url.split('?')[0].match(/^\/(?:vendor\/)?[\w.-]+\.(js|css|map|ico|png|svg)$/)) {
+            const urlPath = req.url.split('?')[0];
+            const filePath = path.join(__dirname, urlPath);
             // Prevent path traversal — ensure resolved path stays in __dirname
             if (!filePath.startsWith(__dirname)) {
                 res.writeHead(403);
@@ -1476,7 +1494,7 @@ const server = http.createServer(async (req, res) => {
                 const headers = { 'Content-Type': types[path.extname(filePath)] || 'application/octet-stream' };
                 // vendor/ assets are stable; the app's own js/css must never be
                 // cached against a mismatched index.html (see the html handler).
-                if (!req.url.startsWith('/vendor/')) headers['Cache-Control'] = 'no-store';
+                if (!urlPath.startsWith('/vendor/')) headers['Cache-Control'] = 'no-store';
                 res.writeHead(200, headers);
                 return res.end(content);
             } catch (err) {
