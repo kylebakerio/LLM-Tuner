@@ -422,6 +422,128 @@ workload it's a wash; 40/60 also preserves VRAM headroom on the 16GB card. Split
   + the spec/MTP context reservation) and refuses launches that would actually fit;
   `-fitt 256` reclaimed 262k context that the default margin refused.
 
+## 11. `--spec-draft-n-max 2` beats 3 on Q6: 2.3x prefill, free (2026-08-21)
+
+**The single largest win found so far, and it was hiding in the champion config.**
+`--spec-draft-n-max 3` (carried over untested from the original setup) costs
+**2.3x prefill** on Q6_K_XL vs `n-max 2`, for no generation benefit.
+
+| n-max | 4090 VRAM | prefill t/s | gen t/s |
+|---|---|---|---|
+| 1 | 14911 | 568 / 561 | ~26 |
+| **2** | **15173** | **584 / 572 / 566 / 556** | **~26** |
+| 3 | 15435 | 248 / 247 / 243 / 252 | ~25 |
+| 4 | 15699 | 243 / 244 | ~27 |
+
+Replicated 4/4 in a harness independent of the dashboard, alternating order
+(3,2,3,2), each run cooldown-gated:
+
+| run | order | start C | peak C | prefill |
+|---|---|---|---|---|
+| nmax3 | 1st | 41 | 58 | 246.99 |
+| nmax2 | 2nd | 53 | 63 | 571.89 |
+| nmax3 | 3rd | 57 | 62 | 243.49 |
+| nmax2 | 4th | 58 | 63 | 566.36 |
+
+**Not thermal** (the SLOW runs started up to 17C cooler), not order-dependent,
+not transient.
+
+### It is Q6-only, and the mechanism is NOT known
+
+- **Q3 and Q4 are flat across n-max 1-4.** Q3: 596-603 t/s at every n-max.
+  Q4: 582-598. So n-max>=3 is not intrinsically harmful.
+- **Each draft token costs a fixed ~262 MiB** of 4090 VRAM, identical on Q3
+  (260/260/266 steps) and Q6 (262/262/264) -- the per-branch recurrent-state
+  copy the hybrid linear-attention arch needs. Model-size independent.
+
+**Hypotheses tested and FALSIFIED** (recorded so they are not re-litigated):
+
+1. **VRAM pressure / capacity cliff.** Dead. Forcing Q3 onto the 4090 via
+   tensor split reached **15873 MiB -- more than Q6's slow runs use (15435) --
+   and ran at 655 t/s, the fastest reading in the ladder.** Q3 then hard-OOMs
+   at the next step; there is no degraded band.
+2. **Pipeline-parallelism fallback.** llama.cpp silently retries without
+   pipeline parallelism when a compute buffer will not fit
+   (`sched_reserve: compute buffer allocation failed, retrying without
+   pipeline parallelism`), which would plausibly halve split prefill. Dead: a
+   collapsed n-max 3 run logs `llama_context: pipeline parallelism enabled`.
+3. **Thermal.** Dead, see the replication table above.
+
+**Startup diff (`-lv 5`), n-max 2 vs 3 -- essentially identical:**
+
+| | n-max 2 (584 t/s) | n-max 3 (248 t/s) |
+|---|---|---|
+| pipeline parallelism | enabled | enabled |
+| CUDA0 compute buffer | 2169.13 MiB | 2169.13 MiB |
+| Vulkan2 compute buffer | 1431.73 MiB | 1443.73 MiB |
+| CUDA_Host compute buffer | 1045.14 MiB | 1045.14 MiB |
+| graph splits | 3 | 3 |
+| sched copies | 4 | 4 |
+| graph nodes | 4135 | 4279 |
+
++144 graph nodes (one draft token's ops) and +12 MiB on Vulkan2. Nothing in
+the load path explains 2.3x -- **the cost is a runtime effect.** Next tool if
+ever pursued: the existing `MTP_TRACE`/NVTX instrumentation on `mtp-diag`
+(`e955b70ff`, `e6dcba49d`), comparing per-ubatch `tgt_decode` at n-max 2 vs 3.
+Practically moot: n-max 2 is simply better.
+
+## 12. `--spec-draft-n-min` does nothing (2026-08-21)
+
+Q6, n-max 2, cooldown-gated, 5 reps, controls bracketing the ladder:
+
+| config | prefill | gen mean | gen sd | draft acc |
+|---|---|---|---|---|
+| ctrlA | 593.4 | 24.81 | 0.33 | 43.3% |
+| n-min 1 | 594.4 | 24.72 | 0.15 | 43.0% |
+| n-min 2 | 598.1 | 24.85 | 0.29 | 42.8% |
+| ctrlB | 601.3 | 25.41 | 0.47 | 44.7% |
+
+**Two identical controls differ by 0.60 t/s; the largest n-min effect is
+0.09 t/s** -- ~7x smaller than the control noise. Flat on prefill and draft
+acceptance too. Leave it unset. (Q3 sweep agreed: 595-608 prefill, gen means
+all inside the control range.)
+
+## 13. Thermal control is a prerequisite for measuring anything (2026-08-21)
+
+Before cooldown gating, an **identical** control config spanned **24.8-38.7
+gen t/s (48%) across one night** -- swamping every knob under test, and the
+source of several false conclusions. `corr(GPU temp, gen t/s) = -0.59`.
+
+- The CPU package shares a heatpipe/fin stack with the 4090. Measured at
+  **85.6% idle, 805-2835 MHz, yet 84-89C with the crit alarm latched** -- the
+  CPU sensor tracks chassis heat from the dGPU, not CPU load. Do not gate on
+  it (it lags); do record it.
+- **nvidia-smi's `Clocks Event Reasons Counters` are useless as a throttle
+  metric**: measured incrementing ~11-16s per 20s of wall time with the GPU
+  **idle at 0% util / 50C**. Totals reach 82-89% of uptime. They are "clocks
+  below max", not "throttled". Use the instantaneous
+  `clocks_throttle_reasons.*` flags instead -- and exclude `sw_power_cap`,
+  which is permanently Active here (80W firmware cap).
+- With a 60C cooldown gate + manual fans, per-config sd fell to
+  **0.15-0.47 t/s** -- good enough to resolve sub-1% differences.
+
+## 14. Chat template override is redundant (2026-08-21)
+
+`--chat-template-file qwen-3.8-unsloth-3.0-chat-template.gguf` (actually a
+plain Jinja file, not a GGUF) is **byte-identical to the model's embedded
+`tokenizer.chat_template`** except a trailing newline, Unsloth fixes included,
+on snapshot `27af057e`. `--jinja` alone is sufficient. Re-check if the snapshot
+changes.
+
+## Current daily config (Q6_K_XL)
+
+```
+llama-server -m Qwen3.8-27B-UD-Q6_K_XL.gguf -c 262144 -ngl 999 --host 0.0.0.0 \
+  --port 8080 --metrics -fa on --cache-type-k q8_0 --cache-type-v q8_0 \
+  --spec-type draft-mtp,ngram-map-k4v --spec-draft-n-max 2 \
+  --spec-draft-device CUDA0 -np 1 --reasoning-preserve --split-mode layer \
+  -dev CUDA0,Vulkan2 -ts 40,60 --temp 1 --top-k 20 --top-p 0.95 --jinja \
+  -lv 3 -fitt 256
+```
+
+Changed from the previous champion: `n-max 3 -> 2` (§11), `--chat-template-file`
+dropped (§14).
+
 ## Open items
 
 - [x] `-ub 256` / `-b 4096` / stacked — measured in llama-bench; server transfer FAILED (§5)
@@ -432,3 +554,7 @@ workload it's a wash; 40/60 also preserves VRAM headroom on the 16GB card. Split
 - [x] Rebuilt at `6d0549831` — MTP tax unchanged (§8); spec gen +13%, tuning deltas now noise (§7)
 - [ ] File upstream issue: MTP catch-up decode ~2× prefill cost on non-mem-shared archs
 - [x] f16-KV server confirmation — +7.5% prefill only; q8_0@262k final (§4/§5)
+- [x] n-max swept 1-4 on Q3/Q4/Q6 with controls -- n-max 2 wins on Q6, 2.3x prefill (§11)
+- [x] n-min swept -- no measurable effect, leave unset (§12)
+- [ ] Q6 n-max>=3 prefill collapse: mechanism unknown; VRAM, pipeline-parallelism
+      fallback and thermal all falsified (§11). Would need MTP_TRACE on `mtp-diag`.
