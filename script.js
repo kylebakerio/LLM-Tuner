@@ -2109,6 +2109,12 @@ document.getElementById('user-prompt').addEventListener('input', (e) => {
     document.getElementById('input-token-count').innerText = `~${est} tokens`;
 });
 
+// --- Same estimator, mirrored onto the A/B sweep's test prompt ---
+document.getElementById('ab-prompt').addEventListener('input', (e) => {
+    const est = Math.ceil(e.target.value.length / 4);
+    document.getElementById('ab-prompt-token-count').innerText = `~${est} tokens`;
+});
+
 // --- Initialize Context UI ---
 updateContextUI(0, document.getElementById('server-ctx').value);
 document.getElementById('server-ctx').addEventListener('input', (e) => {
@@ -5097,7 +5103,10 @@ function abRestore() {
         const saved = JSON.parse(localStorage.getItem('launch_ab') || 'null');
         if (!saved) return;
         abRows = saved.rows || [];
-        if (saved.prompt) document.getElementById('ab-prompt').value = saved.prompt;
+        if (saved.prompt) {
+            document.getElementById('ab-prompt').value = saved.prompt;
+            document.getElementById('ab-prompt-token-count').innerText = `~${Math.ceil(saved.prompt.length / 4)} tokens`;
+        }
         if (saved.genTokens) document.getElementById('ab-gen-tokens').value = saved.genTokens;
         if (saved.reps) document.getElementById('ab-reps').value = saved.reps;
         abRenderRows();
