@@ -692,7 +692,6 @@ function handleSseMessage(e) {
             // this 'green' exclusion isn't working, so this runs over and over again. not a significant bug, but annoying.
         );
         
-        console.log("removing clashing classes:", clashingClasses);
         if (clashingClasses.length > 0) {
             badge.classList.remove(...clashingClasses);
         }
