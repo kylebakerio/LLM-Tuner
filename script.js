@@ -3995,17 +3995,30 @@ const omniGapBandsPlugin = {
 // than having to be inferred from the temperature's absolute value (which on
 // this rig looks unremarkable -- the 4090 throttles in the 80s).
 // sw_power_cap is excluded upstream; it is always on here.
+const THERMAL_MIN_RUN = 3; // samples; ignore single-tick flaps
 function thermalSegment(metrics, field) {
     if (!metrics?.some(m => m && m[field])) return {};
-    const hot = (ctx) => {
-        const i = ctx.p1DataIndex;
-        return metrics[i] && metrics[i][field];
-    };
+    // Only mark SUSTAINED throttling. These reasons flap on and off between
+    // consecutive polls (sw_power_cap toggles every couple of seconds on this
+    // card even at 54W), and marking every flap produced scattered highlighting
+    // that read as random rather than as signal.
+    const sustained = new Array(metrics.length).fill(false);
+    let run = 0;
+    for (let i = 0; i < metrics.length; i++) {
+        if (metrics[i] && metrics[i][field]) {
+            run++;
+            if (run >= THERMAL_MIN_RUN) for (let j = i - run + 1; j <= i; j++) sustained[j] = true;
+        } else run = 0;
+    }
+    if (!sustained.some(Boolean)) return {};
+    // Magenta, NOT red: this chart already carries two red series (7900XTX
+    // Power and 7900XTX Temp), and a red overlay on a temperature line was
+    // indistinguishable from them.
     return {
         segment: {
-            borderColor: (ctx) => hot(ctx) ? 'rgba(239,68,68,1)' : undefined,
-            borderWidth: (ctx) => hot(ctx) ? 2.5 : undefined,
-            borderDash: (ctx) => hot(ctx) ? [] : undefined,
+            borderColor: (ctx) => sustained[ctx.p1DataIndex] ? 'rgba(232,121,249,1)' : undefined,
+            borderWidth: (ctx) => sustained[ctx.p1DataIndex] ? 3 : undefined,
+            borderDash: (ctx) => sustained[ctx.p1DataIndex] ? [] : undefined,
         }
     };
 }
