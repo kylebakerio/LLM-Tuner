@@ -5,8 +5,19 @@ measured at **≤22k prompt tokens**. Real usage runs to 262k, prefill visibly
 collapses at depth, and **no knob has been tested there.** This doc covers the
 harness for that and the tests worth running.
 
-Harness: `bench-tools/depth_sweep.py`. **Written but never executed** — validate
-on one short run before trusting a long batch.
+Harness: `bench-tools/depth_sweep.py`. **Written and reviewed, but never
+executed** (the GPU was in use at handoff). Smoke-test it first:
+
+```bash
+# ~5 min, one config, shallow -- proves the whole path works end to end
+python3 bench-tools/depth_sweep.py --target 20000 --cool 0 \
+        --out /tmp/depth_smoke.json
+```
+
+Expect ~4 turns of output like
+`[nmax2] turn 0 depth 6100 new 6100 prefill 588.0 gen 26.4 63C`, and a JSON
+file with a populated `points` array. If `prefill` or `gen` come back `None`,
+the log parser needs adjusting before any long batch is worth starting.
 
 ---
 
@@ -149,6 +160,26 @@ mechanism suggested by llama.cpp issue #27444's comment about `fattn.cu`
 switching from vec to MMA kernels at a size boundary).
 
 ---
+
+### Known confound: depth vs heat
+
+A run takes many minutes, so **later (deeper) turns are measured on a hotter
+GPU** — and prefill is temperature-sensitive (`corr(temp, prefill) = -0.89`,
+§13/§15). A declining prefill curve therefore mixes a depth effect with a
+thermal one.
+
+Two mitigations, both built in:
+
+- Every point records `gpu_temp`. **Check it first.** If temperature is flat
+  across the run, the curve is clean; if it climbs, some of the decline is heat.
+- `--cool-every-turn` idles to `--cool` before *each* turn, isolating depth from
+  thermal drift at roughly 2× runtime. Off by default because a real session
+  also runs hot, so the uncooled curve is the more realistic one — but the
+  cooled curve is the one that answers "is this depth or heat?".
+
+Best practice: run uncooled first (realistic, faster), and if prefill declines
+*and* temperature climbed, re-run the most interesting config with
+`--cool-every-turn` to separate the two.
 
 ## 4. Methodology rules — learned the hard way, do not skip
 

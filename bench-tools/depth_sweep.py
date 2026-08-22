@@ -71,7 +71,12 @@ def load_chunks(chunk_chars, corpus=None):
     return chunks
 
 def parse_last(logtxt):
-    """Most recent prompt-eval and eval rates + context depth from the log."""
+    """Prompt-eval and eval rates from a slice of log text.
+
+    Callers pass ONLY the text written since the request started -- scanning the
+    whole file and taking the last match would silently re-report the previous
+    turn's numbers whenever a turn produced no timing line (fully-cached turn,
+    aborted request), attributing stale data to the current depth."""
     pref = gen = ntok = None
     for line in logtxt.splitlines():
         if "print_timing" not in line:
@@ -97,19 +102,32 @@ def run_config(tag, extra, args):
         p = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, preexec_fn=os.setsid)
     points, messages = [], []
     try:
+        ready = False
         for _ in range(500):
             time.sleep(2)
             txt = open(log).read() if os.path.exists(log) else ""
             if "model loaded" in txt:
+                ready = True
                 break
             if "cudaMalloc failed" in txt or "failed to load" in txt:
-                return {"tag": tag, "error": "load failed"}
+                return {"tag": tag, "error": "load failed (OOM or bad config)"}
+        if not ready:
+            return {"tag": tag, "error": "timed out waiting for model to load"}
         time.sleep(3)
         chunks = load_chunks(args.chunk_chars, args.corpus)
         depth = 0
         for idx, chunk in enumerate(chunks):
             if depth >= args.target:
                 break
+            # Optional per-turn cooling. Depth and heat are otherwise
+            # CONFOUNDED: a run takes many minutes, so later (deeper) turns are
+            # measured on a hotter GPU, and prefill is temperature-sensitive
+            # (corr(temp, prefill) = -0.89 measured). Off by default because it
+            # roughly doubles runtime and a real session runs hot too -- turn it
+            # on when you need depth isolated from thermal drift.
+            if args.cool_every_turn:
+                cool(args.cool)
+            log_pos = os.path.getsize(log) if os.path.exists(log) else 0
             messages.append({"role": "user", "content": chunk})
             body = json.dumps({"model": "x", "max_tokens": args.gen,
                                "stream": False, "messages": messages}).encode()
@@ -127,7 +145,10 @@ def run_config(tag, extra, args):
             messages.append({"role": "assistant", "content": msg.get("content", "")})
             usage = resp.get("usage", {}) or {}
             depth = usage.get("prompt_tokens", depth)
-            pref, gen, newtok = parse_last(open(log).read())
+            with open(log) as fh:
+                fh.seek(log_pos)
+                fresh = fh.read()
+            pref, gen, newtok = parse_last(fresh)
             pt = {"turn": idx, "depth_tokens": depth, "new_tokens": newtok,
                   "prefill_tps": pref, "gen_tps": gen, "wall_s": round(wall, 1),
                   "gpu_temp": gpu_temp()}
@@ -150,9 +171,19 @@ def main():
     ap.add_argument("--chunk-chars", type=int, default=24000)  # ~6k tokens/turn
     ap.add_argument("--gen", type=int, default=192)
     ap.add_argument("--cool", type=int, default=65)
+    ap.add_argument("--cool-every-turn", action="store_true",
+                    help="cool before EVERY turn, not just config -- isolates depth from thermal drift at ~2x runtime")
     ap.add_argument("--corpus", default=None)
     ap.add_argument("--out", default=os.path.join(TMP, "depth_results.json"))
     args = ap.parse_args()
+
+    # Context has to hold the target plus the assistant replies we keep in
+    # history; overrunning it makes llama-server truncate or error mid-run and
+    # silently invalidates the deep end of the curve.
+    if args.target > args.ctx * 0.85:
+        print(f"WARNING: --target {args.target} is close to --ctx {args.ctx}; "
+              f"assistant replies push actual depth higher. Consider "
+              f"--target {int(args.ctx * 0.8)} or a larger --ctx.", flush=True)
 
     configs = [
         ("nmax2", ["--spec-draft-n-max", "2"]),
