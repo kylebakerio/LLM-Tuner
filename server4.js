@@ -1463,11 +1463,44 @@ async function logCompletedRequest(timing, samples, completedAt, { config: cfgPa
 async function initLogsDir() {
     try {
         await fs.mkdir(LOGS_DIR, { recursive: true });
-        try { await fs.access(CSV_FILE); } catch {
+        try {
+            await fs.access(CSV_FILE);
+            await migrateCsvHeader();
+        } catch {
             await fs.writeFile(CSV_FILE, CSV_HEADERS);
         }
     } catch (err) {
         console.warn('Failed to init logs directory:', err.message);
+    }
+}
+
+// The header is written ONCE, at file creation. Every column added since then
+// (draft stats, then the tps ranges) was appended to the ROWS without updating
+// it, so the on-disk header drifted out of sync -- 32 names against 38-value
+// rows. Positional readers (/api/logs/recent, /api/logs/summary) were fine, but
+// anything name-based -- pandas, Excel, csv.DictReader -- silently mislabels
+// every column past the truncation point and reads draft acceptance as empty.
+// Rewrite the header in place whenever it doesn't match. Columns are only ever
+// APPENDED, so old short rows stay valid: readers already guard with
+// `cols.length > N`.
+async function migrateCsvHeader() {
+    try {
+        const content = await fs.readFile(CSV_FILE, 'utf-8');
+        const nl = content.indexOf('\n');
+        if (nl === -1) return;
+        const current = content.slice(0, nl + 1);
+        if (current === CSV_HEADERS) return;
+        const oldCols = current.trim().split(',').length;
+        const newCols = CSV_HEADERS.trim().split(',').length;
+        if (newCols < oldCols) {
+            console.warn(`CSV header has MORE columns (${oldCols}) than the code expects (${newCols}) -- refusing to truncate; leaving as is.`);
+            return;
+        }
+        await fs.writeFile(CSV_FILE + '.bak', content);
+        await fs.writeFile(CSV_FILE, CSV_HEADERS + content.slice(nl + 1));
+        console.log(`CSV header migrated ${oldCols} -> ${newCols} columns (backup at ${CSV_FILE}.bak)`);
+    } catch (err) {
+        console.warn('CSV header migration skipped:', err.message);
     }
 }
 
