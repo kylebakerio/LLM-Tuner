@@ -140,9 +140,18 @@ def run_config(tag, extra, args):
                 points.append({"turn": idx, "error": str(e)[:120]})
                 break
             wall = time.time() - t0
-            # keep the assistant turn so context grows the way real use does
+            # Keep the assistant turn so context grows the way real use does --
+            # INCLUDING reasoning. On a thinking model max_tokens is a shared
+            # budget for reasoning + answer, and the visible `content` can come
+            # back empty while dozens of reasoning tokens were generated. With
+            # --reasoning-preserve the server keeps that trace in history, so
+            # dropping it here would grow context far slower than reality and
+            # under-report the depth each turn is actually measured at.
             msg = (resp.get("choices") or [{}])[0].get("message", {})
-            messages.append({"role": "assistant", "content": msg.get("content", "")})
+            body_txt = msg.get("content") or ""
+            reasoning = msg.get("reasoning_content") or ""
+            messages.append({"role": "assistant", "content": (reasoning + "\n" + body_txt).strip()
+                             if reasoning else body_txt})
             usage = resp.get("usage", {}) or {}
             depth = usage.get("prompt_tokens", depth)
             with open(log) as fh:
@@ -151,6 +160,8 @@ def run_config(tag, extra, args):
             pref, gen, newtok = parse_last(fresh)
             pt = {"turn": idx, "depth_tokens": depth, "new_tokens": newtok,
                   "prefill_tps": pref, "gen_tps": gen, "wall_s": round(wall, 1),
+                  "gen_tokens": (resp.get("usage") or {}).get("completion_tokens"),
+                  "reasoning_chars": len(reasoning), "content_chars": len(body_txt),
                   "gpu_temp": gpu_temp()}
             points.append(pt)
             print(f"  [{tag}] turn {idx:2d} depth {depth:>7} new {str(newtok):>6} "
