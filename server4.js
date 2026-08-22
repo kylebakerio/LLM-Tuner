@@ -240,6 +240,25 @@ function broadcastState(logLine = '', errorMessage = '') {
     clients = clients.filter(c => !deadClients.includes(c));
 }
 
+// --- SSE HEARTBEAT ---
+// Comment-line keepalives on /api/status so idle SSE connections don't get
+// reaped by proxies, terminals, or idle timeouts. SSE spec: lines starting
+// with ':' are comments -- the browser EventSource and the llama-cli TUI both
+// ignore them (the CLI uses them to detect a healthy but quiet stream).
+// .unref(): a test harness that closes the server should not be held open by
+// this timer.
+setInterval(() => {
+    const deadClients = [];
+    for (const client of clients) {
+        try {
+            client.write(': ping\n\n');
+        } catch (err) {
+            deadClients.push(client);
+        }
+    }
+    if (deadClients.length > 0) clients = clients.filter(c => !deadClients.includes(c));
+}, 15000).unref();
+
 // --- SAFE REQUEST BODY PARSER ---
 function parseBody(req) {
     return new Promise((resolve, reject) => {
