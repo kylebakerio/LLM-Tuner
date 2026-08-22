@@ -487,6 +487,44 @@ ever pursued: the existing `MTP_TRACE`/NVTX instrumentation on `mtp-diag`
 (`e955b70ff`, `e6dcba49d`), comparing per-ubatch `tgt_decode` at n-max 2 vs 3.
 Practically moot: n-max 2 is simply better.
 
+### §11 addendum: tensor-split has no headroom at n-max 2, and an allocation oddity
+
+Q6 @ n-max 2, cooldown-gated, controls both ends:
+
+| ts | 4090 VRAM | prefill |
+|---|---|---|
+| 40/60 (ctrl A) | 15173 | 561.9 |
+| 41/59 | - | **OOM at load** |
+| 42/58 .. 44/56 | - | **OOM at load** |
+| 40/60 (ctrl B) | 15173 | 559.4 |
+
+**`-ts 40,60` is already the ceiling for Q6 at 262k** -- one point of tensor
+split (~241 MiB of weights) will not fit. So §9's "more layers on the CUDA card
+buys +5-7% prefill" is unreachable here; there is no split tuning left to do.
+
+**Unexplained allocation asymmetry** (worth noting, not chased): n-max 3
+successfully allocates **15435 MiB** and runs, but n-max 2 at ts41 -- needing
+roughly the same total -- **fails to allocate at all**. Total VRAM is therefore
+not the binding constraint; allocation *shape* is (one more whole layer of
+weights vs. incremental recurrent-state buffers). This also means the mechanism
+test (hold n-max at 2, push VRAM into the band where n-max 3 collapses) is
+**not runnable on Q6** -- there is no headroom to do it.
+
+**Memory breakdown diff, n-max 2 vs 3 (`-lv 5`)** -- the delta is isolated
+entirely to context:
+
+| CUDA0 | n-max 2 (562 t/s) | n-max 3 (247 t/s) |
+|---|---|---|
+| model | 8650 | 8650 |
+| context | 4049 | **4311** (+262) |
+| compute | 2169 | 2169 |
+
+Vulkan2 context likewise +337 MiB (6449 -> 6786). Model and compute buffers are
+identical on both devices. So the entire difference between full-speed and
+half-speed prefill is ~262 MiB more recurrent-state context on the 4090 --
+with no change to the compute graph's buffers, splits, sched copies, or
+pipeline-parallelism state (§11). Mechanism still unknown.
+
 ## 12. `--spec-draft-n-min` does nothing (2026-08-21)
 
 Q6, n-max 2, cooldown-gated, 5 reps, controls bracketing the ladder:
@@ -557,4 +595,10 @@ dropped (§14).
 - [x] n-max swept 1-4 on Q3/Q4/Q6 with controls -- n-max 2 wins on Q6, 2.3x prefill (§11)
 - [x] n-min swept -- no measurable effect, leave unset (§12)
 - [ ] Q6 n-max>=3 prefill collapse: mechanism unknown; VRAM, pipeline-parallelism
-      fallback and thermal all falsified (§11). Would need MTP_TRACE on `mtp-diag`.
+      fallback and thermal all falsified (§11). Delta isolated to +262 MiB of
+      context allocation with identical compute buffers (§11 addendum). Would
+      need MTP_TRACE on `mtp-diag` to go further.
+- [x] Tensor split re-check at n-max 2 -- 40/60 is the ceiling, ts41+ OOMs (§11 addendum)
+- [ ] Re-run §7 ngram knobs (M, min-hits) with the cooldown gate: "defaults win"
+      was concluded under the 48% thermal noise floor, so it is unverified in
+      BOTH directions. The harness now resolves <1%.
