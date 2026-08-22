@@ -541,11 +541,18 @@ function handleSseMessage(e) {
     } else if (data.log) {
         appendLogToUI(data.log);
         if (data.log.startsWith('PREFILL_PROGRESS:')) {
-            // Format from server: PREFILL_PROGRESS:<progress 0-1>:<tps>:<nTokens>
+            // PREFILL_PROGRESS:<progress 0-1>:<cumulativeTps>:<nTokens>:<instantTps>
+            // llama.cpp only reports the CUMULATIVE rate, which decays across a
+            // long prefill (664 -> 332 t/s on a 104k prompt) and looks like a
+            // rate curve while actually being a running average. The server
+            // derives the instantaneous rate from consecutive progress lines;
+            // prefer it, exactly as generation prefers tg_3s over tg.
             const parts = data.log.split(':');
             const progress = parseFloat(parts[1]);
-            const tps = parseFloat(parts[2]);
+            const cumTps = parseFloat(parts[2]);
             const nTokens = parseInt(parts[3]);
+            const instTps = parts[4] !== undefined && parts[4] !== '' ? parseFloat(parts[4]) : NaN;
+            const tps = Number.isFinite(instTps) ? instTps : cumTps;
             handlePrefillProgress(progress, tps, nTokens);
         }
         else if (data.log.startsWith('GEN_PROGRESS:')) {
@@ -4053,6 +4060,10 @@ function buildOmniDatasets(metrics, tpsLineColor) {
         // visibility state stable across setOmniDatasets updates); a dataset
         // with no non-null points simply draws nothing.
         { label: 'Prefill Tok/s', data: toPoints(metrics, 'prefillTps'), borderColor: 'rgba(234,179,8,1)', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, yAxisID: 'y3', spanGaps: false },
+        // Running average (llama.cpp's own figure, = the summary row's number).
+        // Dashed and dimmer so the solid line reads as the live rate; the two
+        // diverging IS the depth degradation, which a single averaged line hides.
+        { label: 'Prefill avg Tok/s', data: toPoints(metrics, 'prefillTpsAvg'), borderColor: 'rgba(234,179,8,0.5)', backgroundColor: 'transparent', borderWidth: 1, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, borderDash: [4,3], yAxisID: 'y3', spanGaps: false },
         { label: 'Thinking Tok/s', data: toPoints(metrics, 'thinkTps'), borderColor: 'rgba(59,130,246,1)', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, yAxisID: 'y3', spanGaps: false },
         { label: 'Answer Tok/s', data: toPoints(metrics, 'answerTps'), borderColor: 'rgba(74,222,128,1)', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, yAxisID: 'y3', spanGaps: false },
         { label: 'Gen Tok/s', data: toPoints(metrics, 'genTps'), borderColor: tpsLineColor, backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, yAxisID: 'y3', spanGaps: false },
@@ -5316,7 +5327,7 @@ function saveBlockSamples(key, samples) {
             masterGpuUtil: s.masterGpuUtil, workerGpuUtil: s.workerGpuUtil,
             masterVram: s.masterVram, workerVram: s.workerVram,
             masterCpuUtil: s.masterCpuUtil, netMbps: s.netMbps,
-            prefillTps: s.prefillTps, genTps: s.genTps,
+            prefillTps: s.prefillTps, prefillTpsAvg: s.prefillTpsAvg, genTps: s.genTps,
             thinkTps: s.thinkTps, answerTps: s.answerTps,
             prefillProgress: s.prefillProgress,
         }));
