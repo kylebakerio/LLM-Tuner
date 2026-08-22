@@ -33,6 +33,9 @@ let currentLaunchConfig = null;
 // per-request/monitor charts get REAL per-tick rates and prefill progress,
 // not just a flat completion-time average painted across the whole phase.
 let liveProgress = {};
+// Previous prompt-processing progress point, for deriving an instantaneous
+// prefill rate (llama.cpp only reports a cumulative one). Reset per request.
+let lastPrefillPoint = null;
 // net-throughput delta state for server-recorded samples
 let lastSampleNetBytes = null;
 let lastSampleNetTime = null;
@@ -681,21 +684,46 @@ function spawnLlamaProcess(command, args, { cwd, onErrorCleanup } = {}) {
                 // so it's the only reliable way to start Monitor Mode's telemetry
                 // sampling for short/fast requests that never cross those thresholds.
                 liveProgress = {}; // new request -- drop the previous one's phase state
+                lastPrefillPoint = null;
                 markRequestActivity();
             }
             else if (line.includes('prompt processing, n_tokens =')) {
+                // llama.cpp's progress line reports a CUMULATIVE rate
+                // (n_tokens / elapsed), not an instantaneous one. On a long
+                // prefill that decays steadily as the rate drops with depth --
+                // e.g. 664 -> 332 t/s over a 104k prompt -- so plotting it looks
+                // like a rate curve but is actually a running average, and its
+                // final value equals the summary line's average. Generation
+                // doesn't have this problem because llama.cpp prints tg_3s
+                // alongside tg; prefill has no equivalent, so derive it here
+                // from the delta between consecutive progress lines.
                 const nTokensMatch = line.match(/n_tokens =\s*(\d+)/);
                 const progressMatch = line.match(/progress = (0\.\d+|1\.00)/);
                 const tpsMatch = line.match(/(\d+\.?\d*)\s*tokens per second/);
+                const elapsedMatch = line.match(/t =\s*([\d.]+)\s*s/);
                 if (progressMatch) {
                     const nTokens = nTokensMatch ? nTokensMatch[1] : '0';
                     const tps = tpsMatch ? tpsMatch[1] : '0';
+                    const nTok = parseInt(nTokens, 10) || 0;
+                    const elapsed = elapsedMatch ? parseFloat(elapsedMatch[1]) : null;
+                    let instTps = null;
+                    if (elapsed != null && lastPrefillPoint) {
+                        const dTok = nTok - lastPrefillPoint.nTok;
+                        const dT = elapsed - lastPrefillPoint.t;
+                        if (dTok > 0 && dT > 0.01) instTps = dTok / dT;
+                    }
+                    if (elapsed != null) lastPrefillPoint = { nTok, t: elapsed };
+                    // First point of a prefill has no previous delta -- the
+                    // cumulative value IS the instantaneous one there.
+                    const shownTps = instTps != null ? instTps : (parseFloat(tps) || null);
                     liveProgress = {
-                        prefillTps: parseFloat(tps) || null,
+                        prefillTps: shownTps,               // instantaneous: what charts/samples want
+                        prefillTpsAvg: parseFloat(tps) || null, // cumulative, as llama.cpp reports it
                         prefillProgress: parseFloat(progressMatch[1]),
-                        prefillTokens: parseInt(nTokens, 10) || null,
+                        prefillTokens: nTok || null,
                     };
-                    broadcastState(`PREFILL_PROGRESS:${progressMatch[1]}:${tps}:${nTokens}`);
+                    // 4th field appended; older clients read only 1-3 and are unaffected.
+                    broadcastState(`PREFILL_PROGRESS:${progressMatch[1]}:${tps}:${nTokens}:${shownTps != null ? shownTps.toFixed(2) : ''}`);
                     markRequestActivity();
                 }
             }
@@ -1241,6 +1269,7 @@ function takeRequestSamples() {
     const samples = activeRequestSamples;
     activeRequestSamples = [];
     liveProgress = {}; // request over -- don't let its last rates bleed into trailing samples
+    lastPrefillPoint = null;
     return samples;
 }
 

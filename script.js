@@ -541,11 +541,18 @@ function handleSseMessage(e) {
     } else if (data.log) {
         appendLogToUI(data.log);
         if (data.log.startsWith('PREFILL_PROGRESS:')) {
-            // Format from server: PREFILL_PROGRESS:<progress 0-1>:<tps>:<nTokens>
+            // PREFILL_PROGRESS:<progress 0-1>:<cumulativeTps>:<nTokens>:<instantTps>
+            // llama.cpp only reports the CUMULATIVE rate, which decays across a
+            // long prefill (664 -> 332 t/s on a 104k prompt) and looks like a
+            // rate curve while actually being a running average. The server
+            // derives the instantaneous rate from consecutive progress lines;
+            // prefer it, exactly as generation prefers tg_3s over tg.
             const parts = data.log.split(':');
             const progress = parseFloat(parts[1]);
-            const tps = parseFloat(parts[2]);
+            const cumTps = parseFloat(parts[2]);
             const nTokens = parseInt(parts[3]);
+            const instTps = parts[4] !== undefined && parts[4] !== '' ? parseFloat(parts[4]) : NaN;
+            const tps = Number.isFinite(instTps) ? instTps : cumTps;
             handlePrefillProgress(progress, tps, nTokens);
         }
         else if (data.log.startsWith('GEN_PROGRESS:')) {
