@@ -19,6 +19,15 @@ function fmtUnit(value, unit, decimals = 0) { return isNum(value) ? `${value.toF
 // Compute "avg (min–max)" from an array of {tps} samples. Returns just the
 // average if there's only one sample (no meaningful range). Used for both
 // prefill and gen t/s display on completed Monitor/History rows.
+// Format "avg (lo-hi)" from the server-computed per-request range. Both Monitor
+// and History call THIS -- previously Monitor derived ranges client-side (only
+// for dashboard-originated requests) and History hardcoded null, so the two
+// views disagreed and most rows showed no range at all.
+function fmtTpsRange(avgTps, lo, hi) {
+    const avg = avgTps != null && isNum(avgTps) ? Number(avgTps).toFixed(1) : '--';
+    if (!isNum(lo) || !isNum(hi) || hi <= lo) return avg;
+    return `${avg} <span class="text-gray-500">(${Number(lo).toFixed(0)}\u2013${Number(hi).toFixed(0)})</span>`;
+}
 function fmtTpsWithRange(samples, avgTps) {
     if (!samples || samples.length === 0) return avgTps != null ? `${Number(avgTps).toFixed(1)}` : '--';
     const vals = samples.map(s => s.tps).filter(v => isNum(v) && v > 0);
@@ -4541,9 +4550,9 @@ function renderRequestTable(rows, tbodyId, emptyId, clickVarName) {
             <td class="px-4 py-1.5 text-gray-500">${r.live ? '<span class="inline-block h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span> live' : (r.timestamp ? new Date(r.timestamp).toLocaleTimeString() : '--')}${r.aborted ? ' <span class="text-orange-400 cursor-help" title="Request was canceled by the client before finishing (agent tool-call aborts, user interrupts). Counts are the last values observed live, not final totals.">⚠</span>' : ''}</td>
             <td class="px-4 py-1.5 truncate max-w-[220px]" title="${escapeHtml(r.model || '')}">${escapeHtml(r.model || '--')}</td>
             <td class="px-4 py-1.5 text-right font-mono">${r.promptTokens ?? '--'}</td>
-            <td class="px-4 py-1.5 text-right font-mono text-blue-400">${r.promptTpsRange || (r.promptTps != null ? Number(r.promptTps).toFixed(1) : '--')}</td>
+            <td class="px-4 py-1.5 text-right font-mono text-blue-400">${r.promptTpsRange || fmtTpsRange(r.promptTps, r.prefillTpsMin, r.prefillTpsMax)}</td>
             <td class="px-4 py-1.5 text-right font-mono">${r.genTokens ?? '--'}</td>
-            <td class="px-4 py-1.5 text-right font-mono text-green-400">${r.genTpsRange || (r.genTps != null ? Number(r.genTps).toFixed(1) : '--')}</td>
+            <td class="px-4 py-1.5 text-right font-mono text-green-400">${r.genTpsRange || fmtTpsRange(r.genTps, r.genTpsMin, r.genTpsMax)}</td>
             <td class="px-4 py-1.5 text-right font-mono text-purple-400" title="${r.draftAcceptRate != null ? `${r.draftAccepted ?? '?'} accepted / ${r.draftGenerated ?? '?'} generated draft tokens${r.draftMeanLen != null ? `, mean accepted run ${Number(r.draftMeanLen).toFixed(2)}` : ''}` : 'no speculative drafting on this request'}">${r.draftAcceptRate != null ? (r.draftAcceptRate * 100).toFixed(0) + '%' : '--'}</td>
             <td class="px-4 py-1.5 text-right font-mono">${r.wallTime != null ? Number(r.wallTime).toFixed(1) : '--'}</td>
         </tr>
@@ -4727,6 +4736,8 @@ function handleMonitorCompletion(payload) {
         timestamp: payload.timestamp, model: payload.model, runId: payload.runId,
         promptTokens: payload.promptTokens, promptTps: payload.promptTps,
         genTokens: payload.genTokens, genTps: payload.genTps,
+        prefillTpsMin: payload.prefillTpsMin ?? null, prefillTpsMax: payload.prefillTpsMax ?? null,
+        genTpsMin: payload.genTpsMin ?? null, genTpsMax: payload.genTpsMax ?? null,
         wallTime: payload.wallTime != null ? parseFloat(payload.wallTime) : null,
         draftAcceptRate: payload.draftAcceptRate ?? null,
         draftAccepted: payload.draftAccepted ?? null,
@@ -4824,6 +4835,10 @@ async function backfillHistoryData() {
             draftMeanLen: r.draftMeanLen ?? null,
             aborted: !!r.aborted,
             metrics: null,
+            // Same server-computed range Monitor uses; null on rows logged
+            // before ranges were persisted.
+            prefillTpsMin: r.prefillTpsMin ?? null, prefillTpsMax: r.prefillTpsMax ?? null,
+            genTpsMin: r.genTpsMin ?? null, genTpsMax: r.genTpsMax ?? null,
             promptTpsRange: null,
             genTpsRange: null,
             detail: r.detail || null // full row detail for expanded view

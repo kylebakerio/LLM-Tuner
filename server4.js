@@ -956,7 +956,7 @@ function spawnLlamaProcess(command, args, { cwd, onErrorCleanup } = {}) {
 // this row, as JSON. Lets a later model-select/launch-mode change look up
 // "what did I run last time for this exact combo" and restore it exactly,
 // rather than reconstructing a guess from the scattered individual columns.
-const CSV_HEADERS = "Timestamp,run_id,model_name,Model_Path,Ctx,NGL,RPC,Transport,arg_string,launch_command,Prompt Tok/s,Gen Tok/s,Prompt Latency (s),prompt_tokens,Master GPU Util (%),Master GPU Pwr (W),Master GPU Temp (C),Master CPU Util (%),Master CPU Temp (C),Master VRAM (MB),Master RAM (MB),Worker GPU Util (%),Worker GPU Pwr (W),Worker GPU Temp (C),Worker CPU Temp (C),Worker VRAM (MB),Worker RAM (MB),Net Throughput (MB/s),Gen Tokens,Reasoning Tokens,Wall Time (s),Load Time,config_json,Draft Accept Rate,Draft Accepted,Draft Generated,Draft Mean Len,Aborted\n";
+const CSV_HEADERS = "Timestamp,run_id,model_name,Model_Path,Ctx,NGL,RPC,Transport,arg_string,launch_command,Prompt Tok/s,Gen Tok/s,Prompt Latency (s),prompt_tokens,Master GPU Util (%),Master GPU Pwr (W),Master GPU Temp (C),Master CPU Util (%),Master CPU Temp (C),Master VRAM (MB),Master RAM (MB),Worker GPU Util (%),Worker GPU Pwr (W),Worker GPU Temp (C),Worker CPU Temp (C),Worker VRAM (MB),Worker RAM (MB),Net Throughput (MB/s),Gen Tokens,Reasoning Tokens,Wall Time (s),Load Time,config_json,Draft Accept Rate,Draft Accepted,Draft Generated,Draft Mean Len,Aborted,Prefill Tps Min,Prefill Tps Max,Gen Tps Min,Gen Tps Max\n";
 const LOGS_DIR = path.join(ROOT_DIR, 'logs');
 const CSV_FILE = path.join(LOGS_DIR, 'benchmarks.csv');
 
@@ -1082,7 +1082,10 @@ async function appendBenchmarkRow(data) {
         csvValue(data.draftAccepted),
         csvValue(data.draftGenerated),
         csvValue(data.draftMeanLen),
-        data.aborted ? '1' : ''
+        data.aborted ? '1' : '',
+        // Per-request peak/low, appended like the draft columns before them.
+        csvValue(data.prefillTpsMin), csvValue(data.prefillTpsMax),
+        csvValue(data.genTpsMin), csvValue(data.genTpsMax)
     ];
     await fs.appendFile(CSV_FILE, fields.join(',') + '\n');
     return runId;
@@ -1329,6 +1332,19 @@ async function fetchCurrentTelemetry() {
     }
 }
 
+// Peak/low for one request, from its own phase-tagged sample series. Computed
+// HERE rather than in the browser because the client-side version was gated on
+// the dashboard's own chat controller -- a request from opencode, curl or the
+// bench sweep silently got no range at all. Persisting it also lets History
+// show ranges, which it never could: the CSV carried no sample data and the
+// in-memory series is a bounded ring buffer.
+function tpsRange(samples, key) {
+    const vals = (samples || []).map(x => x && x[key])
+        .filter(v => typeof v === 'number' && isFinite(v) && v > 0);
+    if (vals.length < 2) return { min: null, max: null };
+    return { min: Math.min(...vals), max: Math.max(...vals) };
+}
+
 // Fires once per completed request (on that task's "total time" line). Logs a
 // CSV row and broadcasts a COMPLETION SSE event so any connected client
 // (Monitor Mode) can update live -- independent of whether this dashboard's
@@ -1372,7 +1388,11 @@ async function logCompletedRequest(timing, samples, completedAt, { config: cfgPa
         const stats = await fetchCurrentTelemetry();
         const master = stats?.master || {};
         const worker = stats?.worker || {};
+        const pRange = tpsRange(samples, 'prefillTps');
+        const gRange = tpsRange(samples, 'genTps');
         const runId = await appendBenchmarkRow({
+            prefillTpsMin: pRange.min, prefillTpsMax: pRange.max,
+            genTpsMin: gRange.min, genTpsMax: gRange.max,
             model: cfg.modelPath || '',
             ctx: cfg.ctx || '',
             ngl: cfg.ngl || '',
@@ -1415,6 +1435,8 @@ async function logCompletedRequest(timing, samples, completedAt, { config: cfgPa
             draftGenerated: timing.draftGenerated ?? null,
             draftMeanLen: timing.draftMeanLen ?? null,
             aborted: !!timing.aborted,
+            prefillTpsMin: pRange.min, prefillTpsMax: pRange.max,
+            genTpsMin: gRange.min, genTpsMax: gRange.max,
             metrics: samples,
             detail: {
                 modelPath: cfg.modelPath,
@@ -1651,6 +1673,12 @@ const server = http.createServer(async (req, res) => {
                         draftGenerated: cols.length > 35 ? parseNumOrNull(cols[35]) : null,
                         draftMeanLen: cols.length > 36 ? parseNumOrNull(cols[36]) : null,
                         aborted: cols.length > 37 ? cols[37] === '1' : false,
+                        // Range columns (38+) exist only on rows logged since
+                        // ranges were persisted; null on older rows.
+                        prefillTpsMin: cols.length > 38 ? parseNumOrNull(cols[38]) : null,
+                        prefillTpsMax: cols.length > 39 ? parseNumOrNull(cols[39]) : null,
+                        genTpsMin: cols.length > 40 ? parseNumOrNull(cols[40]) : null,
+                        genTpsMax: cols.length > 41 ? parseNumOrNull(cols[41]) : null,
                         // Full row detail for the expanded row view
                         detail: {
                             modelPath: cols[3] || null,
