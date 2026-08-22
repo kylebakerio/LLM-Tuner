@@ -2367,28 +2367,27 @@ function renderAttachedImageThumbnails() {
 
 // --- Tokens/sec chart x-axis toggle (time-spaced vs evenly-spaced) ---
 // `flag` is an object { value: boolean } so the closure reads/writes it directly.
-function initTpsChartToggle(btnId, chartGetter, flag, storageKey, isMonitor) {
+// `chartSetter` is REQUIRED, not optional: the toggle destroys the chart and
+// builds a new one, and the module-level `monitorTpsChart`/`historyTpsChart`
+// bindings are what renderMonitorChart()/renderHistoryChart() actually read.
+// Assigning only to window.* left those bindings pointing at the destroyed
+// chart, so every render wrote into a dead object while the visible canvas held
+// an empty new one -- the graph blanked on first toggle and never came back.
+function initTpsChartToggle(btnId, chartGetter, chartSetter, flag, storageKey, canvasId, pointsFor, renderFn) {
     const btn = document.getElementById(btnId);
     if (!btn) return;
-    const chart = chartGetter();
-    if (!chart) return;
+    if (!chartGetter()) return;
     btn.textContent = flag.value ? 'time' : 'cat';
     btn.addEventListener('click', () => {
         const c = chartGetter();
         if (!c) return;
         flag.value = !flag.value;
         localStorage.setItem(storageKey, flag.value);
-        c.destroy();
-        const canvas = document.getElementById(isMonitor ? 'monitorTpsChart' : 'historyTpsChart');
-        if (canvas) {
-            if (isMonitor) {
-                window.monitorTpsChart = createTpsChart(canvas, flag.value, () => monitorDataPoints);
-                renderMonitorChart();
-            } else {
-                window.historyTpsChart = createTpsChart(canvas, flag.value, () => historyDataPoints);
-                renderHistoryChart();
-            }
-        }
+        const canvas = document.getElementById(canvasId);
+        if (!canvas) return;
+        try { c.destroy(); } catch (e) {}
+        chartSetter(createTpsChart(canvas, flag.value, pointsFor));
+        renderFn();
         btn.textContent = flag.value ? 'time' : 'cat';
     });
 }
@@ -4507,7 +4506,9 @@ function initMonitorChart() {
     monitorTpsChart = createTpsChart(canvas, _monitorTpsLinearX.value, () => monitorDataPoints);
     window.monitorTpsChart = monitorTpsChart; // expose for toggle handler's getter
     renderMonitorChart();
-    initTpsChartToggle('monitor-tps-xaxis-toggle', () => window.monitorTpsChart, _monitorTpsLinearX, 'monitorTpsLinearX', true);
+    initTpsChartToggle('monitor-tps-xaxis-toggle', () => monitorTpsChart,
+        (c) => { monitorTpsChart = c; window.monitorTpsChart = c; },
+        _monitorTpsLinearX, 'monitorTpsLinearX', 'monitorTpsChart', () => monitorDataPoints, renderMonitorChart);
 }
 
 function renderMonitorChart() {
@@ -4793,7 +4794,9 @@ function initHistoryChart() {
     historyTpsChart = createTpsChart(canvas, _historyTpsLinearX.value, () => historyDataPoints);
     window.historyTpsChart = historyTpsChart;
     renderHistoryChart();
-    initTpsChartToggle('history-tps-xaxis-toggle', () => window.historyTpsChart, _historyTpsLinearX, 'historyTpsLinearX', false);
+    initTpsChartToggle('history-tps-xaxis-toggle', () => historyTpsChart,
+        (c) => { historyTpsChart = c; window.historyTpsChart = c; },
+        _historyTpsLinearX, 'historyTpsLinearX', 'historyTpsChart', () => historyDataPoints, renderHistoryChart);
 }
 
 function renderHistoryChart() {
