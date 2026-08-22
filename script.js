@@ -2366,10 +2366,10 @@ function initTpsChartToggle(btnId, chartGetter, flag, storageKey, isMonitor) {
         const canvas = document.getElementById(isMonitor ? 'monitorTpsChart' : 'historyTpsChart');
         if (canvas) {
             if (isMonitor) {
-                window.monitorTpsChart = createTpsChart(canvas, flag.value);
+                window.monitorTpsChart = createTpsChart(canvas, flag.value, () => monitorDataPoints);
                 renderMonitorChart();
             } else {
-                window.historyTpsChart = createTpsChart(canvas, flag.value);
+                window.historyTpsChart = createTpsChart(canvas, flag.value, () => historyDataPoints);
                 renderHistoryChart();
             }
         }
@@ -3847,7 +3847,10 @@ window.expandChart = function(chartId, title) {
                 options: {
                     responsive: true, maintainAspectRatio: false, animation: { duration: 0 },
                     interaction: { intersect: false, mode: 'index' },
-                    plugins: { legend: { display: true, labels: { color: '#9ca3af' } } },
+                    plugins: {
+                legend: { display: true, labels: { color: '#9ca3af' } },
+                tooltip: { callbacks: { afterBody: tokenLines } }
+            },
                     scales: { x: { display: false }, y: { grid: { color: 'rgba(55, 65, 81, 0.5)' }, ticks: { color: '#9ca3af' } } }
                 }
             });
@@ -4437,7 +4440,24 @@ const SESSION_HISTORY_CAP = 500;
 // whether the x-axis is time-spaced (linear, elapsed seconds) or evenly-spaced
 // (categorical, one tick per data point). Both are useful: linear shows gaps
 // between requests; categorical gives a clean per-request view.
-function createTpsChart(canvas, linearX) {
+// `pointsFor` returns the backing data array so the tooltip can show the token
+// counts behind each t/s point -- a rate alone doesn't say whether it came from
+// a 200-token turn or a 100k one, which is exactly what you need to interpret
+// a slow point.
+function createTpsChart(canvas, linearX, pointsFor) {
+    const tokenLines = (items) => {
+        const src = typeof pointsFor === 'function' ? pointsFor() : null;
+        const i = items && items.length ? items[0].dataIndex : -1;
+        const p = src && i >= 0 ? src[i] : null;
+        if (!p) return [];
+        const out = [];
+        const n = (v) => Number(v).toLocaleString();
+        if (p.promptTokens != null) out.push(`prefilled: ${n(p.promptTokens)} tok`);
+        if (p.genTokens != null) out.push(`generated: ${n(p.genTokens)} tok`);
+        const ctx = (Number(p.promptTokens) || 0) + (Number(p.genTokens) || 0);
+        if (ctx > 0) out.push(`context at end: ${n(ctx)} tok`);
+        return out;
+    };
     return new Chart(canvas.getContext('2d'), {
         type: 'line',
         data: {
@@ -4464,7 +4484,7 @@ function initMonitorChart() {
     const canvas = document.getElementById('monitorTpsChart');
     if (!canvas) return;
     _monitorTpsLinearX.value = localStorage.getItem('monitorTpsLinearX') !== 'false'; // default: linear
-    monitorTpsChart = createTpsChart(canvas, _monitorTpsLinearX.value);
+    monitorTpsChart = createTpsChart(canvas, _monitorTpsLinearX.value, () => monitorDataPoints);
     window.monitorTpsChart = monitorTpsChart; // expose for toggle handler's getter
     renderMonitorChart();
     initTpsChartToggle('monitor-tps-xaxis-toggle', () => window.monitorTpsChart, _monitorTpsLinearX, 'monitorTpsLinearX', true);
@@ -4689,7 +4709,8 @@ function handleMonitorCompletion(payload) {
     const abLiveC = document.getElementById('ab-live');
     if (abLiveC && abLiveC.textContent) abLiveC.textContent = `last: ${payload.genTokens ?? '?'} tok gen @ ${payload.genTps != null ? Number(payload.genTps).toFixed(1) : '?'} t/s${payload.draftAcceptRate != null ? `, draft acc ${(payload.draftAcceptRate * 100).toFixed(0)}%` : ''}`;
     updateLiveRequestCard('idle', {});
-    monitorDataPoints.push({ time: payload.timestamp || Date.now(), promptTps: payload.promptTps, genTps: payload.genTps });
+    monitorDataPoints.push({ time: payload.timestamp || Date.now(), promptTps: payload.promptTps, genTps: payload.genTps,
+        promptTokens: payload.promptTokens, genTokens: payload.genTokens });
     if (monitorDataPoints.length > SESSION_HISTORY_CAP) monitorDataPoints.shift();
     monitorRequestRows.push({
         timestamp: payload.timestamp, model: payload.model, runId: payload.runId,
@@ -4747,7 +4768,7 @@ function initHistoryChart() {
     const canvas = document.getElementById('historyTpsChart');
     if (!canvas) return;
     _historyTpsLinearX.value = localStorage.getItem('historyTpsLinearX') !== 'false'; // default: linear
-    historyTpsChart = createTpsChart(canvas, _historyTpsLinearX.value);
+    historyTpsChart = createTpsChart(canvas, _historyTpsLinearX.value, () => historyDataPoints);
     window.historyTpsChart = historyTpsChart;
     renderHistoryChart();
     initTpsChartToggle('history-tps-xaxis-toggle', () => window.historyTpsChart, _historyTpsLinearX, 'historyTpsLinearX', false);
@@ -4780,7 +4801,8 @@ async function backfillHistoryData() {
         const res = await fetch(`/api/logs/recent?limit=${HISTORY_CAP}`);
         const data = await res.json();
         const rows = data.rows || [];
-        historyDataPoints = rows.map(r => ({ time: new Date(r.timestamp).getTime(), promptTps: r.promptTps, genTps: r.genTps }));
+        historyDataPoints = rows.map(r => ({ time: new Date(r.timestamp).getTime(), promptTps: r.promptTps, genTps: r.genTps,
+            promptTokens: r.promptTokens, genTokens: r.genTokens }));
         historyRequestRows = rows.map(r => ({
             timestamp: r.timestamp, model: r.model, runId: r.runId,
             promptTokens: r.promptTokens, promptTps: r.promptTps,
