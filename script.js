@@ -4060,6 +4060,10 @@ function buildOmniDatasets(metrics, tpsLineColor) {
         // visibility state stable across setOmniDatasets updates); a dataset
         // with no non-null points simply draws nothing.
         { label: 'Prefill Tok/s', data: toPoints(metrics, 'prefillTps'), borderColor: 'rgba(234,179,8,1)', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, yAxisID: 'y3', spanGaps: false },
+        // Running average (llama.cpp's own figure, = the summary row's number).
+        // Dashed and dimmer so the solid line reads as the live rate; the two
+        // diverging IS the depth degradation, which a single averaged line hides.
+        { label: 'Prefill avg Tok/s', data: toPoints(metrics, 'prefillTpsAvg'), borderColor: 'rgba(234,179,8,0.5)', backgroundColor: 'transparent', borderWidth: 1, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, borderDash: [4,3], yAxisID: 'y3', spanGaps: false },
         { label: 'Thinking Tok/s', data: toPoints(metrics, 'thinkTps'), borderColor: 'rgba(59,130,246,1)', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, yAxisID: 'y3', spanGaps: false },
         { label: 'Answer Tok/s', data: toPoints(metrics, 'answerTps'), borderColor: 'rgba(74,222,128,1)', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, yAxisID: 'y3', spanGaps: false },
         { label: 'Gen Tok/s', data: toPoints(metrics, 'genTps'), borderColor: tpsLineColor, backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, yAxisID: 'y3', spanGaps: false },
@@ -5323,7 +5327,7 @@ function saveBlockSamples(key, samples) {
             masterGpuUtil: s.masterGpuUtil, workerGpuUtil: s.workerGpuUtil,
             masterVram: s.masterVram, workerVram: s.workerVram,
             masterCpuUtil: s.masterCpuUtil, netMbps: s.netMbps,
-            prefillTps: s.prefillTps, genTps: s.genTps,
+            prefillTps: s.prefillTps, prefillTpsAvg: s.prefillTpsAvg, genTps: s.genTps,
             thinkTps: s.thinkTps, answerTps: s.answerTps,
             prefillProgress: s.prefillProgress,
         }));

@@ -1203,6 +1203,11 @@ async function takeOneTelemetrySample(statsArg) {
             // Real per-tick phase data from llama-server's own progress lines
             // (see liveProgress). Null in whichever phase doesn't apply.
             prefillTps: liveProgress.prefillTps ?? null,
+            // Cumulative rate as llama.cpp reports it -- charted alongside the
+            // instantaneous one so the running average stays visible (it is what
+            // the per-request summary row shows) without being mistaken for the
+            // live rate.
+            prefillTpsAvg: liveProgress.prefillTpsAvg ?? null,
             prefillProgress: liveProgress.prefillProgress ?? null,
             prefillPos: liveProgress.prefillTokens ?? null,
             genTps: liveProgress.genTps ?? null,
