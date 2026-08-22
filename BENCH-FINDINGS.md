@@ -568,6 +568,44 @@ plain Jinja file, not a GGUF) is **byte-identical to the model's embedded
 on snapshot `27af057e`. `--jinja` alone is sufficient. Re-check if the snapshot
 changes.
 
+## 15. ngram knobs: verified null at n=10 (2026-08-22)
+
+§7's tuning claims are now settled. Q6, n-max 2, 10 reps per config, three
+identical controls bracketing the ladder:
+
+| config | n | gen mean | sd | draft acc |
+|---|---|---|---|---|
+| ctrlA | 10 | 28.22 | 2.71 | 52.5% |
+| min-hits 2 | 10 | 29.51 | 3.41 | 59.9% |
+| ctrlB | 10 | 29.40 | 2.55 | 57.7% |
+| min-hits 3 | 10 | 29.52 | 2.20 | 59.6% |
+| ctrlC | 10 | 30.41 | 1.99 | 58.4% |
+
+**min-hits 2: +0.17 t/s vs pooled controls (t=0.13). min-hits 3: +0.18 (t=0.20).**
+Both inside the 2.19 t/s spread between the three IDENTICAL controls. Draft
+acceptance likewise (+3.7 / +3.4 pts vs a 5.9 pt control spread).
+
+**§7's original "min-hits=2 is +17%" is dead, and the post-rebuild "defaults
+win" is CONFIRMED** rather than merely unverified. Leave every ngram knob at
+its default (`size_n=12`, `size_m=48`, `min_hits=1`).
+
+An earlier n=3 pass of the same comparison showed min-hits 2 apparently
+*outside* the control spread. It was a false positive. **Three reps cannot
+resolve gen differences on this rig; ten can.** Treat any n=3 gen result as a
+hypothesis, never a finding.
+
+From the same n=3 batch, two other knobs, also null at the noise floor:
+`size_n` 8/16 and `--spec-draft-p-min 0.5` (p-min raised acceptance to 68% --
+the highest measured -- with no gen gain at all, a clean illustration that
+**acceptance is a diagnostic, not a target**). `size_m 96` was the only real
+effect: **-9% prefill** (533.6 vs ~586 control), i.e. bigger M is actively bad.
+
+**Order/thermal caveat**: controls drifted monotonically in run order (gen
+28.22 -> 29.40 -> 30.41; prefill 586.7 -> 576.4 -> 575.1) tracking a 69 -> 74C
+climb, `corr(temp, prefill) = -0.89`. The cooldown gate was off for this batch.
+Prefill degrading with heat is the expected direction; set the gate for
+anything further.
+
 ## Current daily config (Q6_K_XL)
 
 ```
@@ -599,6 +637,10 @@ dropped (§14).
       context allocation with identical compute buffers (§11 addendum). Would
       need MTP_TRACE on `mtp-diag` to go further.
 - [x] Tensor split re-check at n-max 2 -- 40/60 is the ceiling, ts41+ OOMs (§11 addendum)
-- [ ] Re-run §7 ngram knobs (M, min-hits) with the cooldown gate: "defaults win"
-      was concluded under the 48% thermal noise floor, so it is unverified in
-      BOTH directions. The harness now resolves <1%.
+- [x] §7 ngram knobs re-run at n=10 -- verified null; defaults confirmed (§15)
+- [ ] Depth behaviour: everything above is measured at <=22k prompt. Prefill is
+      known to degrade badly at depth in real use, and the ngram knobs index a
+      token history that GROWS with context, so §15's null may not hold at 150k+.
+      Depth-sweep harness built (grows a conversation incrementally, measuring
+      delta-prefill and gen at each depth); needs a real agentic transcript as
+      corpus to reach past ~150k.
