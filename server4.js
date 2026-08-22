@@ -1163,8 +1163,8 @@ async function takeOneTelemetrySample(statsArg) {
             // exact stretch where a card was heat-limited. Deliberately only
             // /thermal/ reasons: sw_power_cap is permanently active on this rig
             // (80W firmware cap) and would mark every single sample.
-            masterThermal: (stats.master?.throttle_reasons || []).some(r => /thermal/i.test(String(r))),
-            workerThermal: (stats.worker?.throttle_reasons || []).some(r => /thermal/i.test(String(r))),
+            masterThermal: isRealThermal(stats.master),
+            workerThermal: isRealThermal(stats.worker),
             masterGpuUtil: stats.master?.gpu_util ?? 0, masterCpuUtil: stats.master?.cpu_util ?? 0,
             workerPwr: stats.worker?.gpu_pwr ?? 0, workerTemp: stats.worker?.gpu_temp ?? 0,
             workerGpuUtil: stats.worker?.gpu_util ?? 0,
@@ -1183,6 +1183,22 @@ async function takeOneTelemetrySample(statsArg) {
     } finally {
         telemetrySampleInFlight = false;
     }
+}
+
+// A REAL thermal limit, as opposed to what nvidia-smi's reason flags say.
+// Measured on this rig: `sw_thermal_slowdown` asserts while the GPU is idle or
+// at low clocks (it fires throughout model load at 40-52C and goes quiet under
+// full compute at 60-63C) -- it means "clocks below max", not "too hot". Its
+// matching lifetime counter is equally useless, ticking ~11s per 20s of wall
+// time on a 50C idle GPU. So require corroboration from the actual
+// temperature, and treat hw_thermal_slowdown (real hardware protection) as
+// authoritative on its own.
+const THERMAL_TEMP_FLOOR = 75; // C -- below this, ignore any sw thermal claim
+function isRealThermal(dev) {
+    const reasons = dev?.throttle_reasons || [];
+    if (reasons.some(r => /hw_thermal/i.test(String(r)))) return true;
+    const temp = Number(dev?.gpu_temp);
+    return reasons.some(r => /thermal/i.test(String(r))) && Number.isFinite(temp) && temp >= THERMAL_TEMP_FLOOR;
 }
 
 function markRequestActivity() {

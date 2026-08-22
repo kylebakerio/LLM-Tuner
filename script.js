@@ -6079,8 +6079,15 @@ async function runSweep(onlyRow) {
             // with no reason is unactionable, and a mislabelled flag is worse
             // than none (sw_power_cap is permanently active here and must not
             // count).
+            // Same correction as server4.js's isRealThermal: sw_thermal_slowdown
+            // asserts at idle/low clocks on this card (it fires all through
+            // model load at 40-52C and goes quiet under load at 60-63C), so it
+            // needs temperature corroboration. hw_thermal is authoritative.
             for (const r of (t.reasons || [])) {
-                if (/thermal/i.test(String(r))) { th.throttled = true; (th.reasons ||= new Set()).add(r); }
+                const rs = String(r);
+                const real = /hw_thermal/i.test(rs) ||
+                    (/thermal/i.test(rs) && t.gpu != null && t.gpu >= 75);
+                if (real) { th.throttled = true; (th.reasons ||= new Set()).add(rs); }
             }
         }, 5000);
         try {
