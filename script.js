@@ -5888,17 +5888,110 @@ function abRenderResults() {
     const tbody = document.getElementById('ab-results-body');
     const results = abRows.flatMap(r => (r.results || []).map(res => ({ label: r.label, $therm: r.thermal, ...res })));
     document.getElementById('ab-results-card').classList.toggle('hidden', results.length === 0);
-    tbody.innerHTML = results.map(r => `
+
+    // Cache-hit reps (rep 2+ send an identical prompt, so llama-server reuses
+    // the KV and reprocesses ~4 tokens) have a meaningless "prompt t/s" -- it
+    // is 4 tokens over fixed per-request overhead, not a prefill rate. They
+    // must not take part in prefill ranking or they would all colour as worst.
+    const isColdPrefill = (r) => (r.promptTokens ?? 0) > 64;
+
+    // Rank a column and tint it -- but scale intensity by SIGNAL-TO-NOISE,
+    // not by raw spread. Spread alone is not signal: the gen column in a
+    // typical sweep spans ~26% while being entirely run-to-run noise (an
+    // identical control config has measured 24.8-38.7 t/s on this rig), and
+    // colouring that at full strength would assert a difference that is not
+    // there. So compare the spread of per-config MEANS against the typical
+    // spread WITHIN a config; only the excess is treated as real.
+    const buildCol = (rows, key, mult = 1) => {
+        const groups = new Map();
+        for (const r of rows) {
+            const v = r[key];
+            if (v == null) continue;
+            if (!groups.has(r.label)) groups.set(r.label, []);
+            groups.get(r.label).push(v * mult);
+        }
+        const all = [...groups.values()].flat();
+        if (all.length < 2) return null;
+        const mean = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+        const means = [...groups.values()].map(mean);
+        const between = Math.max(...means) - Math.min(...means);
+        // within-config spread, averaged over configs that have >1 rep
+        const withins = [...groups.values()].filter(a => a.length > 1)
+            .map(a => Math.max(...a) - Math.min(...a));
+        const within = withins.length ? mean(withins) : 0;
+        // No replication -> fall back to a mild fixed confidence.
+        const snr = within > 0 ? between / within : (between > 0 ? 2 : 0);
+        const confidence = Math.max(0, Math.min(1, (snr - 1) / 2));
+        return { min: Math.min(...all), max: Math.max(...all), confidence };
+    };
+    const scale = (colInfo, v, higherIsBetter) => {
+        if (!colInfo || v == null) return '';
+        const { min, max, confidence } = colInfo;
+        if (!(max > min) || confidence <= 0) return '';
+        let t = (v - min) / (max - min);            // 0 = lowest, 1 = highest
+        if (!higherIsBetter) t = 1 - t;             // 1 = best either way
+        const strength = Math.abs(t - 0.5) * 2;     // 0 at median, 1 at extremes
+        const alpha = +(strength * confidence * 0.45).toFixed(3);
+        if (alpha <= 0.02) return '';
+        return t >= 0.5 ? `background-color: rgba(34,197,94,${alpha})`
+                        : `background-color: rgba(239,68,68,${alpha})`;
+    };
+
+    const statSrc = results; // always judge signal/noise from the RAW reps
+    const vPrefill = buildCol(statSrc.filter(isColdPrefill), 'promptTps');
+    const vGen = buildCol(statSrc, 'genTps');
+    const vDraft = buildCol(statSrc, 'draftAcceptRate', 100);
+    const vWall = buildCol(statSrc, 'wallTime');
+
+    // Collapse reps into one row per config. Averaging is what the sweep is
+    // FOR -- a single rep is inside the noise floor on this rig -- and reading
+    // 3-10 raw rows per config makes that impossible to see at a glance.
+    // Prefill averages only cold reps: rep 2+ hit the prompt cache and their
+    // "prompt t/s" is 4 tokens over fixed overhead, not a rate.
+    const collapse = document.getElementById('ab-collapse-reps')?.checked;
+    let display = results;
+    if (collapse) {
+        const order = [], byLabel = new Map();
+        for (const r of results) {
+            if (!byLabel.has(r.label)) { byLabel.set(r.label, []); order.push(r.label); }
+            byLabel.get(r.label).push(r);
+        }
+        const avg = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
+        display = order.map(label => {
+            const rs = byLabel.get(label);
+            const coldRs = rs.filter(isColdPrefill);
+            const pick = (rows, key) => rows.map(x => x[key]).filter(v => v != null);
+            const gen = pick(rs, 'genTps');
+            return {
+                label, $therm: rs[0].$therm, $n: rs.length,
+                $genSpread: gen.length > 1 ? Math.max(...gen) - Math.min(...gen) : null,
+                promptTokens: coldRs.length ? coldRs[0].promptTokens : rs[0].promptTokens,
+                promptTps: avg(pick(coldRs, 'promptTps')),
+                genTokens: rs[0].genTokens,
+                genTps: avg(gen),
+                draftAcceptRate: avg(pick(rs, 'draftAcceptRate')),
+                wallTime: avg(pick(rs, 'wallTime')),
+            };
+        });
+    }
+
+    tbody.innerHTML = display.map(r => {
+        const draftPct = r.draftAcceptRate != null ? r.draftAcceptRate * 100 : null;
+        const isCold = isColdPrefill(r);
+        const prefStyle = isCold ? scale(vPrefill, r.promptTps, true) : '';
+        const prefTitle = isCold ? '' : ' title="cache hit -- not a prefill measurement"';
+        return `
         <tr class="border-b border-gray-800/50">
-            <td class="px-2 py-1 font-mono text-[10px]">${escapeHtml(r.label)}</td>
+            <td class="px-2 py-1 font-mono text-[10px]">${escapeHtml(r.label)}${r.$n ? `<span class="text-gray-600"> x${r.$n}${r.$genSpread != null ? ` &plusmn;${(r.$genSpread / 2).toFixed(1)}` : ''}</span>` : ''}</td>
             <td class="px-2 py-1 text-right font-mono">${r.promptTokens ?? '--'}</td>
-            <td class="px-2 py-1 text-right font-mono text-blue-400">${r.promptTps != null ? Number(r.promptTps).toFixed(1) : '--'}</td>
+            <td class="px-2 py-1 text-right font-mono text-blue-400" style="${prefStyle}"${prefTitle}>${r.promptTps != null ? Number(r.promptTps).toFixed(1) : '--'}</td>
             <td class="px-2 py-1 text-right font-mono">${r.genTokens ?? '--'}</td>
-            <td class="px-2 py-1 text-right font-mono text-green-400">${r.genTps != null ? Number(r.genTps).toFixed(1) : '--'}</td>
-            <td class="px-2 py-1 text-right font-mono text-purple-400">${r.draftAcceptRate != null ? (r.draftAcceptRate * 100).toFixed(0) + '%' : '--'}</td>
-            <td class="px-2 py-1 text-right font-mono">${r.wallTime != null ? Number(r.wallTime).toFixed(1) : '--'}</td>
+            <td class="px-2 py-1 text-right font-mono text-green-400" style="${scale(vGen, r.genTps, true)}">${r.genTps != null ? Number(r.genTps).toFixed(1) : '--'}</td>
+            <td class="px-2 py-1 text-right font-mono text-purple-400" style="${scale(vDraft, draftPct, true)}" title="acceptance is a diagnostic, not a target -- high acceptance with no gen gain is common">${draftPct != null ? draftPct.toFixed(0) + '%' : '--'}</td>
+            <td class="px-2 py-1 text-right font-mono" style="${scale(vWall, r.wallTime, false)}">${r.wallTime != null ? Number(r.wallTime).toFixed(1) : '--'}</td>
             <td class="px-2 py-1 text-right font-mono">${thermalCell(r.$therm)}</td>
-        </tr>`).join('');
+        </tr>`;
+    }).join('');
 }
 // Runs that were heat-limited are NOT comparable to cool ones -- mark them so
 // a hot outlier is never silently averaged in with clean measurements.
@@ -6176,6 +6269,18 @@ async function runSweep(onlyRow) {
                         (th.throttled ? ' | THERMALLY THROTTLED -- not comparable to cool runs' : '') +
                         (th.reachedTarget === false ? ' | HOT START (cooldown timed out)' : ''));
                 }
+                // Mean row so the persisted/accordion table carries the average
+                // too -- the per-rep rows alone make the reps hard to read, and
+                // averaging is the point of running them. Prefill averages only
+                // cold reps (rep 2+ are prompt-cache hits, ~4 tokens).
+                const rs = row.results || [];
+                const num = (a) => a.filter(v => v != null && !isNaN(v));
+                const mean = (a) => num(a).length ? num(a).reduce((x, y) => x + y, 0) / num(a).length : null;
+                const coldRs = rs.filter(x => (x.promptTokens ?? 0) > 64);
+                const fmt = (v, d = 1) => v == null ? '' : Number(v).toFixed(d);
+                const mGen = mean(rs.map(x => x.genTps));
+                const gens = num(rs.map(x => x.genTps));
+                noteLines.push(`| **mean x${rs.length}** | ${coldRs.length ? coldRs[0].promptTokens : ''} | ${fmt(mean(coldRs.map(x => x.promptTps)))} | ${rs[0]?.genTokens ?? ''} | ${fmt(mGen)}${gens.length > 1 ? ` (±${((Math.max(...gens) - Math.min(...gens)) / 2).toFixed(1)})` : ''} | ${fmt(mean(rs.map(x => x.draftAcceptRate)) * 100, 0)}% | ${fmt(mean(rs.map(x => x.wallTime)))} |`);
                 noteLines.push('[sweep] done');
                 // Capture notable startup lines on SUCCESS too. Previously only
                 // failures snapshotted the log, so a run that succeeded but did
@@ -6230,6 +6335,7 @@ async function runSweep(onlyRow) {
     abStatus(onlyRow ? `done: ${onlyRow.label}` : 'sweep complete -- server stopped');
 }
 document.getElementById('ab-run-btn').addEventListener('click', () => runSweep(null));
+document.getElementById('ab-collapse-reps')?.addEventListener('change', abRenderResults);
 document.getElementById('ab-clear-btn').addEventListener('click', () => {
     if (abRunning) return;
     abRows = []; abPersist(); abRenderRows(); abRenderResults();
