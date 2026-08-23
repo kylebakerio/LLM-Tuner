@@ -1523,10 +1523,84 @@ async function migrateCsvHeader() {
     }
 }
 
+// --- SHARED LAUNCH PROFILES ---
+// The single source of truth for saved launch configs, shared by the browser
+// UI (which kept them in per-browser localStorage) and llama-cli (which kept
+// them in ~/.llama-cli/profiles.json) -- a profile saved in either shows up
+// in both. Lives in LOGS_DIR next to the benchmark CSV: user data, not code.
+//
+// Schema (v3):
+//   { "version": 3, "profiles": { "<name>": {
+//       "config": { ...launchConfig fields... },
+//       "savedAt": <ms>, "lastLoadedAt": <ms|null> } } }
+// `config` holds the SAME keys the dashboard launch form / buildLlamaArgs
+// understand (modelPath, ctx, ngl, fa, cacheK/V, spec*, sampling, jinja,
+// argString, ...) so both clients apply it without translation.
+const PROFILES_FILE = path.join(LOGS_DIR, 'profiles.json');
+// Pre-shared-store location of the CLI's profiles -- imported once at
+// bootstrap so nothing the user saved is lost.
+const CLI_PROFILES_FILE = path.join(os.homedir(), '.llama-cli', 'profiles.json');
+
+function normalizeProfileConfig(cfg) {
+    if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return {};
+    // A client may send a whole entry ({name, config, savedAt, ...}) instead
+    // of the bare config object -- unwrap it either way.
+    const unwrapped = (cfg.config && typeof cfg.config === 'object') ? cfg.config : cfg;
+    const { name, savedAt, lastLoadedAt, config: _c, ...rest } = unwrapped;
+    return rest;
+}
+
+async function initProfilesStore() {
+    try {
+        const exists = await fs.access(PROFILES_FILE).then(() => true, () => false);
+        if (exists) return; // already bootstrapped -- never clobber
+        const doc = { version: 3, profiles: {} };
+        let importedFrom = null;
+        try {
+            const raw = JSON.parse(await fs.readFile(CLI_PROFILES_FILE, 'utf-8'));
+            if (raw && raw.version === 2 && raw.profiles && typeof raw.profiles === 'object') {
+                for (const [name, cfg] of Object.entries(raw.profiles)) {
+                    doc.profiles[name] = { config: normalizeProfileConfig(cfg), savedAt: Date.now(), lastLoadedAt: null };
+                }
+                importedFrom = CLI_PROFILES_FILE;
+            } else if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+                // Legacy llama-cli v1: { "<name>": { model, args } }
+                for (const [name, p] of Object.entries(raw)) {
+                    if (p && typeof p === 'object' && !Array.isArray(p)) {
+                        doc.profiles[name] = {
+                            config: { modelPath: p.model || '', argString: p.args || '' },
+                            savedAt: Date.now(), lastLoadedAt: null,
+                        };
+                    }
+                }
+                importedFrom = CLI_PROFILES_FILE;
+            }
+        } catch { /* no CLI profiles to import */ }
+        await fs.writeFile(PROFILES_FILE, JSON.stringify(doc, null, 2));
+        const n = Object.keys(doc.profiles).length;
+        console.log(`Profiles store ready at ${PROFILES_FILE} (${n} profile(s)${importedFrom ? ` imported from ${importedFrom}` : ''})`);
+    } catch (err) {
+        console.warn('Profiles store init failed:', err.message);
+    }
+}
+
+async function loadProfilesDoc() {
+    try {
+        const doc = JSON.parse(await fs.readFile(PROFILES_FILE, 'utf-8'));
+        if (doc && typeof doc.profiles === 'object' && doc.profiles) return doc;
+    } catch { /* missing/corrupt -> empty */ }
+    return { version: 3, profiles: {} };
+}
+
+async function saveProfilesDoc(doc) {
+    await fs.mkdir(LOGS_DIR, { recursive: true });
+    await fs.writeFile(PROFILES_FILE, JSON.stringify(doc, null, 2));
+}
+
 // --- HTTP SERVER ---
 const server = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     if (req.method === 'OPTIONS') { res.writeHead(200); return res.end(); }
 
     try {
@@ -1969,6 +2043,57 @@ const server = http.createServer(async (req, res) => {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ ok: true, ms: telemetryPollMs }));
         }
+
+        // --- SHARED LAUNCH PROFILES (see initProfilesStore) ---
+        else if (req.url === '/api/profiles' && req.method === 'GET') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify(await loadProfilesDoc()));
+        }
+        else if (req.url === '/api/profiles' && req.method === 'POST') {
+            let body;
+            try { body = JSON.parse(await parseBody(req)); } catch (e) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Invalid JSON' })); }
+            const name = String(body.name || '').trim();
+            if (!name || name.length > 80) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Profile name must be 1-80 characters' })); }
+            const doc = await loadProfilesDoc();
+            const existing = doc.profiles[name];
+            const config = normalizeProfileConfig(body.config ?? body.profile);
+            const lastLoadedAt = toFiniteNumber(body.lastLoadedAt) ?? toFiniteNumber(body.profile && body.profile.lastLoadedAt);
+            if (Object.keys(config).length === 0) {
+                // Load-mark only ({name, lastLoadedAt}): touch the usage
+                // timestamp without resaving the config -- and without
+                // re-validating a model path that may since have moved.
+                if (!existing) { res.writeHead(404); return res.end(JSON.stringify({ error: `Profile "${name}" not found` })); }
+                doc.profiles[name] = {
+                    ...existing,
+                    lastLoadedAt: lastLoadedAt ?? existing.lastLoadedAt ?? null,
+                };
+            } else {
+                // The model path is only meaningful on the machine that runs
+                // llama-server -- validate it here, where the file actually
+                // lives (a remote CLI client cannot check it locally).
+                if (config.modelPath) {
+                    try { await fs.access(config.modelPath); }
+                    catch { res.writeHead(400); return res.end(JSON.stringify({ error: `Model path not found: ${config.modelPath}` })); }
+                }
+                doc.profiles[name] = {
+                    config,
+                    savedAt: Date.now(),
+                    lastLoadedAt: lastLoadedAt ?? existing?.lastLoadedAt ?? null,
+                };
+            }
+            await saveProfilesDoc(doc);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ ok: true, name }));
+        }
+        else if (req.url.startsWith('/api/profiles/') && req.method === 'DELETE') {
+            const name = decodeURIComponent(req.url.slice('/api/profiles/'.length).split('?')[0]);
+            const doc = await loadProfilesDoc();
+            if (!name || !doc.profiles[name]) { res.writeHead(404); return res.end(JSON.stringify({ error: `Profile "${name}" not found` })); }
+            delete doc.profiles[name];
+            await saveProfilesDoc(doc);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ ok: true, name }));
+        }
         else if (req.url === '/api/bench/note' && req.method === 'POST') {
             // Client-composed result blocks (e.g. Launch Sweep tables) appended
             // into the same transcript/accordion/history file as bench runs.
@@ -2292,6 +2417,9 @@ const server = http.createServer(async (req, res) => {
 async function initServer() {
     await loadDashboardConfig();
     await initLogsDir();
+    // Bootstrap the shared profiles store from the CLI's legacy file (if the
+    // store doesn't exist yet) BEFORE any client can read it.
+    await initProfilesStore();
     // Clean BOTH the model-server port and the monitor port -- an orphaned
     // llama-server from a previous dashboard crash would otherwise keep 8080
     // and make the next launch fail with EADDRINUSE.

@@ -72,8 +72,9 @@ re-implements everything server-side.
 Rewrite the CLI as a btop-style TUI that talks to `server4.js`.
 
 - Entails: a new ink/React TUI with five modes; a small HTTP+SSE client
-  module; profile storage (kept at `~/.llama-cli/profiles.json`, schema
-  upgraded); a client-side prompt-sweep loop for benchmark lines; the
+  module; profile storage (server-side, shared with the web UI via
+  `/api/profiles` — decided 2026-08-22, superseding the per-client file
+  locations); a client-side prompt-sweep loop for benchmark lines; the
   §7 backend additions (auth, `/api/logs/runs`, heartbeat, API doc).
 - Cost: **moderate.** The TUI is new work, but each of the six required
   features is a thin wrapper over an endpoint that already exists plus a
@@ -94,6 +95,56 @@ are organized accordingly: Phase 1 = M0–M2 (backend basics, TUI shell +
 Monitor, Launch flow with minimal config + profiles). Chat, Bench, and
 History ship in later phases without any rework in Phase 1 — the mode
 router, SSE client, and store are built to be mode-agnostic from day one.
+
+### Phase 1 status (built 2026-08-22)
+
+- **M0 done** — SSE heartbeat in `server4.js` (15s `: ping`, verified
+  live), `dashboard/API.md` contract doc written.
+- **M1 done** — new ink-based TUI (no JSX/build step; `h =
+  React.createElement`), mode router + status bar + help + input gating,
+  self-healing SSE client (backoff + idle watchdog), full Monitor screen
+  verified against the live dashboard (GPU/VRAM/power/temp/throttle
+  badges, live prefill/gen, context, completions backfilled from CSV +
+  live `COMPLETION` events, system, log tail). 16 unit tests green
+  (`npm test`), including ink render snapshots.
+- **M2 done (one acceptance check deferred)** — Launch mode: model/build/
+  device selectors (fuzzy), ctx/ngl/port/tensor-split/raw-args,
+  server-side command preview, profile save/load/delete with v2 schema +
+  v1 migration, launch/stop, auto-jump to Monitor. Verified through real
+  pty key injection: form prefills from the live launchConfig, preview
+  matches the running command, "already running" guard, profile round-trip
+  to disk. **Deferred:** the full stop→boot→request→restore cycle, because
+  the 27B model is in active use by a background agent — it is scripted as
+  `test/live-cycle.sh` (one command, restores the previous launch config
+  exactly) and should be run once in the morning before M2 is closed.
+- **Second pass (2026-22, post-review)** — driven by the other agent's
+  review of Phase 1:
+  - **Launch payload completed (the blocker):** the draft now carries the
+    entire `buildLlamaArgs` surface (fa, cache K/V, full spec stack,
+    sampling, jinja, reasoning-preserve, mmproj, load mode, verbosity,
+    argString) in seven field groups (core/hw/cache/spec/sample/chat/raw),
+    and prefill copies EVERY field from the live `launchConfig` — so a
+    262k q8_0-KV draft-mtp launch prefills losslessly and the preview
+    matches the running command flag-for-flag (verified live against the
+    running 27B config).
+  - **Shared profiles:** web (localStorage) + CLI (`~/.llama-cli/...`)
+    profiles unified in a server-side store (`/api/profiles`,
+    `logs/profiles.json`); both legacy sets migrate automatically; full
+    edit/delete in both front ends (web: save-overwrite + delete button;
+    CLI: `p`/`l`/`d` in Launch, `profile save/delete` subcommands).
+  - **Instantaneous prefill rate:** `PREFILL_PROGRESS` gained a 4th field
+    (server-derived); the store prefers it over llama.cpp's decaying
+    cumulative average (fallback for older servers).
+  - **Completion ranges:** completed table shows `avg(lo–hi)` from the
+    server-computed `prefillTpsMin/Max`, `genTpsMin/Max`.
+  - **Styling pass toward the btop bar:** boxed sections with on-border
+    title bars, paired half-width panels (GPU0|GPU1, Tokens|Completed,
+    System|Log), braille sparklines (2 samples/char), full-width
+    color-graded bars, right-aligned numeric columns.
+  - **Small fixes:** backfill now retries on failure; ring buffers are
+    replaced immutably in the store (no mutation inside setState); FuzzyList
+    'q' filters instead of cancelling; global `--server` flag on the TUI;
+    pasted multi-char key events can't blank the mode area.
 
 ## 3. What exists today (baseline)
 
@@ -280,31 +331,45 @@ full dashboard exposes, so the CLI can't drift from it:
   field — the dashboard popover, ported.
 - **Profiles** (TUI CRUD: save / load / duplicate / rename / delete, list
   view showing model + key knobs per row):
-  - storage stays `~/.llama-cli/profiles.json`; new `version: 2` schema:
+  - **Shared server-side store** (decided 2026-08-22): the web UI kept
+    profiles in per-browser localStorage and the CLI in
+    `~/.llama-cli/profiles.json` — two divergent sets. Both now read/write
+    one store: `GET/POST/DELETE /api/profiles` (server4.js), file
+    `logs/profiles.json` on the dashboard host. The server imports the
+    CLI's old file (v1 + v2) once at first boot; the browser migrates its
+    localStorage profiles on next page load. Both clients stamp
+    `lastLoadedAt` (load-mark) when a profile is applied, so
+    most-recently-used sorting works across front ends.
+  - `version: 3` schema — `config` holds the `launchConfig` keys (the
+    example below is a v2-era shape; the key set is the same):
 
     ```json
     {
-      "version": 2,
+      "version": 3,
       "profiles": {
         "qwen-35b-dual": {
-          "modelPath": "/home/kyle/AI/experiment-1/models/...gguf",
-          "build": "vulkan-cuda",
-          "ctx": 32768, "ngl": 99, "port": 8080,
-          "deviceA": "cuda0", "deviceB": "cuda1", "tensorSplit": 55,
-          "fa": true, "cacheK": "q8_0", "cacheV": "q8_0",
-          "specType": "draft-mtp", "specDraftNMax": 2,
-          "temp": 0.2, "topK": 40, "topP": 0.9,
-          "nCpuMoe": 10,
-          "argString": ""
+          "config": {
+            "modelPath": "/home/kyle/AI/experiment-1/models/...gguf",
+            "build": "vulkan-cuda",
+            "ctx": 32768, "ngl": 99, "port": 8080,
+            "deviceA": "cuda0", "deviceB": "cuda1", "tensorSplit": 55,
+            "fa": true, "cacheK": "q8_0", "cacheV": "q8_0",
+            "specType": "draft-mtp", "specDraftNMax": 2,
+            "temp": 0.2, "topK": 40, "topP": 0.9,
+            "nCpuMoe": 10,
+            "argString": ""
+          },
+          "savedAt": 1787386000000,
+          "lastLoadedAt": null
         }
       }
     }
     ```
-  - v1 entries (`{model, args}`) migrate on read (model→`modelPath`,
-    args→`argString`); nothing is lost.
-  - Field names deliberately match the dashboard's `launchConfig` keys —
-    a later nicety is import/export (JSON) so profiles move between the
-    browser's localStorage profiles and the CLI's file.
+  - Legacy v1 entries (`{model, args}`) migrate at import
+    (model→`modelPath`, args→`argString`); nothing is lost.
+  - Field names deliberately match the dashboard's `launchConfig` keys, so
+    a profile applies to either client without translation — the
+    import/export nicety from the v2 draft is now structural.
 - **Launch / Stop**: `[Launch]` → `POST /api/start` with the structured
   config (server validates: model exists, finite ctx/ngl, valid port and
   build — clean errors land in the TUI, not a stuck state); `[Stop]` →

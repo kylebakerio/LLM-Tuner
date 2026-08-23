@@ -1247,9 +1247,15 @@ modelsLoadedPromise.then(refreshCommandPreview);
 // via restoreLastLaunchConfig above) also does this, but only runs at all if
 // there's something saved to restore; without this, a fresh browser with
 // saved profiles but no last-launch-config would show an empty dropdown.
-renderSavedConfigs();
+// Profiles now live server-side: import this browser's legacy localStorage
+// profiles into the server store first (once), then load the shared set.
+// (The functions are hoisted; the .then callbacks run after module
+// evaluation, so the `serverProfiles` mirror is initialized by then.)
+migrateLocalStorageProfiles()
+    .then(fetchProfiles)
+    .then(renderSavedConfigs);
 
-// --- Launch Profiles (localStorage) ---
+// --- Launch Profiles (server-side, shared with llama-cli) ---
 // Saves the ENTIRE launch setup (model, launch mode, devices, every field,
 // the raw command) as a named profile -- not just the extra-args box, which
 // is what the old per-model "arg_configs" version did (and which required a
@@ -1257,11 +1263,83 @@ renderSavedConfigs();
 // model+ctx+mode setup with no extra flags was simply impossible). Profiles
 // are global (not nested per-model) since the model choice is itself part of
 // what a profile restores.
-const LAUNCH_PROFILES_KEY = 'launch_profiles';
-function getLaunchProfiles() {
-    try { return JSON.parse(localStorage.getItem(LAUNCH_PROFILES_KEY) || '[]'); } catch { return []; }
+//
+// Storage moved from per-browser localStorage to the dashboard server
+// (GET/POST/DELETE /api/profiles, file: <data dir>/logs/profiles.json) so
+// the browser and the llama-cli TUI share ONE set of saved configs. This
+// file keeps an in-memory mirror (`serverProfiles`) populated by
+// fetchProfiles(); the sync getLaunchProfiles() below lets the existing
+// render/sort code stay unchanged.
+const LAUNCH_PROFILES_KEY = 'launch_profiles'; // legacy key -- migration source only
+let serverProfiles = {}; // name -> { config, savedAt, lastLoadedAt }
+
+async function fetchProfiles() {
+    try {
+        const doc = await (await fetch('/api/profiles')).json();
+        serverProfiles = (doc && doc.profiles) || {};
+    } catch (e) { /* server unreachable -- keep the last-known mirror */ }
+    return serverProfiles;
 }
-function saveLaunchProfiles(profiles) { localStorage.setItem(LAUNCH_PROFILES_KEY, JSON.stringify(profiles)); }
+
+function getLaunchProfiles() {
+    // Same shape the old localStorage version returned: [{name, config, savedAt, lastLoadedAt}]
+    return Object.entries(serverProfiles).map(([name, e]) => ({
+        name,
+        config: (e && e.config) || e || {},
+        savedAt: e && e.savedAt,
+        lastLoadedAt: e && e.lastLoadedAt,
+    }));
+}
+
+// Upsert one profile on the server, then refresh the local mirror (the
+// server stamps savedAt). Throws with the server's message on failure.
+async function pushProfile(name, config, lastLoadedAt) {
+    const res = await fetch('/api/profiles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, config, lastLoadedAt }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    await fetchProfiles();
+    return data;
+}
+
+async function removeProfile(name) {
+    const res = await fetch('/api/profiles/' + encodeURIComponent(name), { method: 'DELETE' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    await fetchProfiles();
+    return data;
+}
+
+// One-time migration: profiles saved by older dashboard versions live in
+// THIS browser's localStorage. Import the ones the server doesn't have yet,
+// then drop the local copy -- the server store is the single source of truth.
+// If the server is unreachable, the local copy stays and retries next load;
+// entries the server rejects (e.g. model file since deleted) are kept for
+// the next attempt rather than silently lost.
+async function migrateLocalStorageProfiles() {
+    let local = [];
+    try { local = JSON.parse(localStorage.getItem(LAUNCH_PROFILES_KEY) || '[]'); } catch { return; }
+    if (!Array.isArray(local) || local.length === 0) return;
+    try {
+        const doc = await (await fetch('/api/profiles')).json();
+        const have = (doc && doc.profiles) || {};
+        const failed = [];
+        for (const entry of local) {
+            if (!entry || !entry.name || have[entry.name]) continue;
+            const res = await fetch('/api/profiles', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: entry.name, config: entry.config || {} }),
+            });
+            if (!res.ok) failed.push(entry);
+        }
+        if (failed.length === 0) localStorage.removeItem(LAUNCH_PROFILES_KEY);
+        else localStorage.setItem(LAUNCH_PROFILES_KEY, JSON.stringify(failed));
+    } catch (e) { /* keep the local copy; retry next load */ }
+}
 
 // Name of the profile most recently loaded (or saved) THIS session -- Save
 // Profile defaults to overwriting it, since "tweak a setting, re-save the
@@ -1269,7 +1347,7 @@ function saveLaunchProfiles(profiles) { localStorage.setItem(LAUNCH_PROFILES_KEY
 // this session, the default is a fresh name derived from the model instead.
 let sessionActiveProfileName = null;
 
-function saveCurrentConfig() {
+async function saveCurrentConfig() {
     const modelLabel = document.getElementById('model-select').selectedOptions[0]?.textContent.replace(/\s*\(.*/, '') || 'profile';
     const defaultName = sessionActiveProfileName || modelLabel;
     const promptMsg = sessionActiveProfileName
@@ -1277,29 +1355,31 @@ function saveCurrentConfig() {
         : 'Profile name:';
     const name = prompt(promptMsg, defaultName);
     if (!name) return;
-    sessionActiveProfileName = name;
     const config = buildConfigFromUI();
     config.rawCommand = document.getElementById('raw-launch-command').value.trim();
-    const profiles = getLaunchProfiles();
-    const existingIdx = profiles.findIndex(p => p.name === name);
-    const entry = { name, config, savedAt: Date.now() };
-    if (existingIdx >= 0) profiles[existingIdx] = entry; else profiles.push(entry);
-    saveLaunchProfiles(profiles);
-    renderSavedConfigs();
-    document.getElementById('load-profile-select').value = name;
+    try {
+        await pushProfile(name.trim(), config);
+        sessionActiveProfileName = name.trim();
+        renderSavedConfigs();
+        document.getElementById('load-profile-select').value = name.trim();
+    } catch (e) {
+        alert(`Failed to save profile "${name}": ${e.message}`);
+    }
 }
 
-function loadLaunchProfile(name) {
+async function loadLaunchProfile(name) {
     const profiles = getLaunchProfiles();
     const entry = profiles.find(p => p.name === name);
     if (!entry) return;
     // Track separately from savedAt -- the dropdown sorts by most-recently-USED,
     // not most-recently-saved (a profile you saved once ages ago but load every
     // day should stay near the top, not sink below one you tweaked-and-saved
-    // yesterday but haven't actually used since).
-    entry.lastLoadedAt = Date.now();
+    // yesterday but haven't actually used since). A load-mark sends NO config
+    // (the server keeps the stored one -- and skips model-path revalidation
+    // for a profile whose model file has since moved). Best-effort either way:
+    // the config applies from the local mirror regardless.
+    pushProfile(name, null, Date.now()).catch(e => console.warn('Failed to record profile load:', e));
     sessionActiveProfileName = name;
-    saveLaunchProfiles(profiles);
     // Reuse snapToLastUsedConfig's reentrancy guard: applyConfigToUI sets
     // model-select's value and dispatches a 'change' event on it (to drive
     // downstream listeners), which is the SAME event snapToLastUsedConfig is
@@ -1384,20 +1464,24 @@ document.getElementById('btn-paste-profile').addEventListener('click', async () 
         modelPath: parsed.modelPath,
         model: parsed.modelPath.split('/').pop(),
     };
-    const profiles = getLaunchProfiles();
-    const existingIdx = profiles.findIndex(pr => pr.name === name);
-    const entry = { name, config, savedAt: Date.now() };
-    if (existingIdx >= 0) profiles[existingIdx] = entry; else profiles.push(entry);
-    saveLaunchProfiles(profiles);
-    renderSavedConfigs();
-    document.getElementById('load-profile-select').value = name;
-    sessionActiveProfileName = name;
+    try {
+        await pushProfile(name, config);
+        renderSavedConfigs();
+        document.getElementById('load-profile-select').value = name;
+        sessionActiveProfileName = name;
+    } catch (e) {
+        alert(`Failed to save profile "${name}": ${e.message}`);
+    }
 });
 
-function deleteLaunchProfile(name) {
-    saveLaunchProfiles(getLaunchProfiles().filter(p => p.name !== name));
-    if (sessionActiveProfileName === name) sessionActiveProfileName = null;
-    renderSavedConfigs();
+async function deleteLaunchProfile(name) {
+    try {
+        await removeProfile(name);
+        if (sessionActiveProfileName === name) sessionActiveProfileName = null;
+        renderSavedConfigs();
+    } catch (e) {
+        alert(`Failed to delete profile "${name}": ${e.message}`);
+    }
 }
 
 // Renders into #load-profile-select (a dropdown at the top of the panel --

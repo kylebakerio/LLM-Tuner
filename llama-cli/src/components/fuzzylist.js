@@ -1,22 +1,29 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
+import { h } from '../h.js';
 
-// Subsequence fuzzy match: returns the end index of the first match (lower is
-// better), or null. Case-insensitive.
+// Subsequence fuzzy match: returns a sort score (lower is better) or null.
+// Case-insensitive.
 function fuzzyScore(query, text) {
   const q = query.toLowerCase();
   const t = text.toLowerCase();
+  if (!q) return 0;
   let qi = 0;
-  for (let ti = 0; ti < t.length && qi < q.length; ti++) {
-    if (t[ti] === q[qi]) qi++;
+  let end = -1;
+  for (let ti = 0; ti < t.length; ti++) {
+    if (t[ti] === q[qi]) {
+      qi++;
+      end = ti;
+      if (qi === q.length) break;
+    }
   }
-  return qi === q.length ? qi - q.length + (q.length ? t.lastIndexOf(q[0]) : 0) : null;
+  return qi === q.length ? end : null;
 }
 
 // Selectable, type-to-filter list. `items` is [{ label, hint?, value }].
 // Keys: up/down (or j/k) move, Enter selects, Esc/q cancels, printable keys
 // filter, Backspace edits the filter.
-export function FuzzyList({ title, items, height = 10, onSelect, onCancel }) {
+export function FuzzyList({ title, items, height = 12, onSelect, onCancel }) {
   const [query, setQuery] = useState('');
   const [sel, setSel] = useState(0);
 
@@ -24,8 +31,7 @@ export function FuzzyList({ title, items, height = 10, onSelect, onCancel }) {
     if (!query.trim()) return items.map((it, i) => ({ it, i, score: 0 }));
     return items
       .map((it, i) => {
-        const hay = `${it.label} ${it.hint || ''}`;
-        const score = fuzzyScore(query, hay);
+        const score = fuzzyScore(query, `${it.label} ${it.hint || ''}`);
         return score == null ? null : { it, i, score };
       })
       .filter(Boolean)
@@ -39,11 +45,10 @@ export function FuzzyList({ title, items, height = 10, onSelect, onCancel }) {
   useInput((input, key) => {
     const n = Math.max(filtered.length, 1);
     if (key.escape) return onCancel();
-    if (input === 'q' && !key.ctrl && !key.meta) return onCancel();
-    if (key.up) return setSel((s) => (s - 1 + n) % n);
-    if (key.down) return setSel((s) => (s + 1) % n);
-    if (input === 'k' && !key.ctrl && !key.meta) return setSel((s) => (s - 1 + n) % n);
-    if (input === 'j' && !key.ctrl && !key.meta) return setSel((s) => (s + 1) % n);
+    // Note: 'q' deliberately does NOT cancel here -- it's a filter character
+    // (the model list is full of Qwen* names). Esc cancels.
+    if (key.up || (input === 'k' && !key.ctrl)) return setSel((s) => (s - 1 + n) % n);
+    if (key.down || (input === 'j' && !key.ctrl)) return setSel((s) => (s + 1) % n);
     if (key.return) {
       const f = filtered[sel];
       return f ? onSelect(f.it) : null;
@@ -55,27 +60,23 @@ export function FuzzyList({ title, items, height = 10, onSelect, onCancel }) {
   });
 
   const visible = Math.min(height, filtered.length);
-  const top = Math.max(0, Math.min(sel - Math.floor(visible / 2), filtered.length - visible));
+  const top = Math.max(0, Math.min(sel - Math.floor(visible / 2), Math.max(filtered.length - visible, 0)));
 
-  return (
-    <Box flexDirection="column">
-      <Text bold>{title}</Text>
-      <Text dimColor>  filter: {query || '(none)'}  ·  {filtered.length} match{filtered.length === 1 ? '' : 'es'}</Text>
-      {filtered.length === 0 ? (
-        <Text color="yellow">  no matches</Text>
-      ) : (
-        filtered.slice(top, top + visible).map((f, row) => {
-          const idx = top + row;
-          const selected = idx === sel;
-          return (
-            <Text key={f.i} bold={selected} color={selected ? 'green' : undefined}>
-              {'  '}{selected ? '\u276F ' : '  '}{f.it.label}
-              {f.it.hint ? <Text dimColor>  {f.it.hint}</Text> : null}
-            </Text>
-          );
-        })
-      )}
-      <Text dimColor>  ↑/↓ move · Enter select · Esc cancel · type to filter</Text>
-    </Box>
+  const rows = filtered.slice(top, top + visible).map((f, row) => {
+    const idx = top + row;
+    const selected = idx === sel;
+    return h(Text, { key: f.i, bold: selected, color: selected ? 'green' : undefined },
+      `  ${selected ? '\u276F ' : '  '}${f.it.label}`,
+      f.it.hint ? h(Text, { dimColor: true }, `  ${f.it.hint}`) : null,
+    );
+  });
+
+  return h(Box, { flexDirection: 'column' },
+    h(Text, { bold: true }, title),
+    h(Text, { dimColor: true }, `  filter: ${query || '(none)'}  \u00B7  ${filtered.length} match${filtered.length === 1 ? '' : 'es'}`),
+    filtered.length === 0
+      ? h(Text, { color: 'yellow' }, '  no matches')
+      : rows,
+    h(Text, { dimColor: true }, '  \u2191/\u2193 move \u00B7 Enter select \u00B7 Esc cancel \u00B7 type to filter'),
   );
 }

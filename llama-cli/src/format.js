@@ -45,6 +45,12 @@ export function fmtUptime(ms) {
   return `${p(h)}:${p(m)}:${p(ss)}`;
 }
 
+// HH:MM:SS (24h) for fixed-width time columns.
+export function fmtTime(ts) {
+  const d = ts ? new Date(ts) : new Date();
+  return d.toTimeString().slice(0, 8);
+}
+
 // Parse the model's actual port out of a formatted launch command
 // ("... --port 8080 ..."), defaulting to 8080.
 export function portFromCommand(command, fallback = 8080) {

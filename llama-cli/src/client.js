@@ -24,6 +24,7 @@ export class McClient {
     this._aborts = new Set();
     this._closed = false;
     this._attempts = 0;
+    this._everLive = false;
     this._reconnectTimer = null;
     this._watchdog = null;
     this._lastByte = 0;
@@ -53,10 +54,28 @@ export class McClient {
     return data;
   }
 
+  async deleteJson(p, { timeoutMs = 10000 } = {}) {
+    const res = await this._fetch(this.baseUrl + p, {
+      method: 'DELETE',
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { error: text || `HTTP ${res.status}` }; }
+    if (!res.ok) {
+      const err = new Error(data.error || `HTTP ${res.status}`);
+      err.data = data;
+      throw err;
+    }
+    return data;
+  }
+
   connect() {
     if (this._closed || this._reconnectTimer) return;
     this._attempts += 1;
-    this.onConnState(this._attempts === 1 ? 'connecting' : 'reconnecting');
+    // First attempt before ever being live is "connecting"; anything after
+    // (including a dropped-then-retrying stream) is "reconnecting".
+    this.onConnState(this._attempts === 1 && !this._everLive ? 'connecting' : 'reconnecting');
 
     const ac = new AbortController();
     this._aborts.add(ac);
@@ -68,7 +87,8 @@ export class McClient {
     })
       .then(async (res) => {
         if (!res.ok || !res.body) throw new Error(`SSE HTTP ${res.status}`);
-        this._attempts = 0;
+        this._everLive = true;
+        this._attempts = 1; // a drop after a stable connection fast-reconnects (1s)
         this.onConnState('live');
         this._watchdog = setInterval(() => {
           if (Date.now() - this._lastByte > IDLE_TIMEOUT_MS) ac.abort();

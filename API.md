@@ -42,7 +42,7 @@ Some are tagged events; clients should branch on the prefix:
 
 | Tag | Format | Meaning |
 |---|---|---|
-| `PREFILL_PROGRESS` | `PREFILL_PROGRESS:<progress 0-1>:<tps>:<n_tokens>` | live prefill rate |
+| `PREFILL_PROGRESS` | `PREFILL_PROGRESS:<progress 0-1>:<cumulativeTps>:<n_tokens>:<instantTps\|empty>` | live prefill rate. Field 2 is llama.cpp's CUMULATIVE rate (n/elapsed — a running average that decays across a long prefill); field 4 is the server-derived INSTANTANEOUS rate (delta between progress lines), empty on the first point. Prefer field 4 when present. |
 | `GEN_PROGRESS` | `GEN_PROGRESS:<avgTps>:<instTps>:<n_decoded>` | live generation rate |
 | `CTX_LIVE` | `CTX_LIVE:<n_prompt_tokens>:<n_ctx>:<is_processing 0/1>` | live context usage from the `/slots` poll |
 | `COMPLETION` | `COMPLETION:<json>` | a request finished (any client); json below |
@@ -61,12 +61,17 @@ Some are tagged events; clients should branch on the prefix:
   "wallTime": 12.1,
   "draftAcceptRate": null, "draftAccepted": null, "draftGenerated": null, "draftMeanLen": null,
   "aborted": false,
+  "prefillTpsMin": 332.1, "prefillTpsMax": 664.0, "genTpsMin": 18.9, "genTpsMax": 24.2,
   "metrics": [ { "t": 0, "gpuUtil": 98, "gpuPwr": 287, "gpuTemp": 68, "vram": 21400, "cpuUtil": 40, "netMbps": 0.4 } ],
   "detail": { "modelPath": "...", "ctx": 32768, "ngl": 99, "rpc": "no", "launchCommand": "...", "config": {} }
 }
 ```
 
 `runId` is unique **per request**, not per launch session.
+`prefillTpsMin/Max`, `genTpsMin/Max` are the per-request peak/low computed
+server-side from the request's own sample series (null on rows logged
+before the range columns existed); the CSV carries them as the trailing
+`Prefill Tps Min/Max`, `Gen Tps Min/Max` columns.
 
 ## Launch control
 
@@ -107,6 +112,55 @@ can hang on a bad eGPU link; fall back to manual entry).
 ### GET /api/flags?build=<id>
 `200 { "flags": [ { "flags": "-c, --ctx-size N", "description": "...", "section": "general", "insertText": "--ctx-size ", "primaryFlag": "--ctx-size" } ] }`
 (parsed from the build's `--help`, cached per build).
+
+## Launch profiles (shared by web UI + llama-cli)
+
+The single source of truth for saved launch configs, stored in
+`logs/profiles.json` (next to the benchmark CSV). The browser UI migrated
+its former per-browser localStorage profiles here; `llama-cli` migrated its
+former `~/.llama-cli/profiles.json` here (the server imports that file once
+at first boot). Both clients read/write through these endpoints.
+
+Document shape (schema v3):
+
+```json
+{
+  "version": 3,
+  "profiles": {
+    "qwen-27b-dual": {
+      "config": { "modelPath": "...", "build": "vulkan-cuda", "ctx": 262144, "ngl": 999, "port": 8080, "deviceA": "CUDA0", "deviceB": "Vulkan2", "tensorSplit": 40, "fa": true, "cacheK": "q8_0", "cacheV": "q8_0", "specType": "draft-mtp,ngram-map-k4v", "specDraftNMax": 2, "temp": 1, "topK": 20, "topP": 0.95, "jinja": true, "reasoningPreserve": true, "verbosity": 3, "argString": "--spec-draft-device CUDA0 -fitt 256" },
+      "savedAt": 1787386000000,
+      "lastLoadedAt": 1787386916000
+    }
+  }
+}
+```
+
+`config` holds the same keys as `launchConfig`/`buildLlamaArgs` (see
+`POST /api/start`), so a profile applies to either client without
+translation. `lastLoadedAt` drives the web dropdown's most-recently-used
+sort; both clients stamp it (load-mark) when a profile is applied.
+
+### GET /api/profiles
+`200` the document above (empty `{ "version": 3, "profiles": {} }` if none).
+
+### POST /api/profiles
+Body `{ "name", "config"?, "lastLoadedAt"? }`:
+
+- with `config`: upsert the profile. `savedAt` is stamped server-side.
+  `config.modelPath` (when present) is validated against the filesystem —
+  `400 { "error": "Model path not found: ..." }` otherwise.
+- without `config` (a **load-mark**, `{ "name", "lastLoadedAt" }`): updates
+  only `lastLoadedAt` on the existing profile, keeping its stored config
+  and skipping model-path revalidation (the model file may have moved).
+  `404` if the profile doesn't exist.
+
+`200 { "ok": true, "name" }` · `400` bad name (1-80 chars) / empty config /
+missing model file.
+
+### DELETE /api/profiles/<name>
+`200 { "ok": true, "name" }` · `404 { "error": "Profile ... not found" }`.
+Name is URL-encoded (it may contain spaces or `/`).
 
 ## Telemetry
 

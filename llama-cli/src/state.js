@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from 'react';
+import { fmtTime } from './format.js';
 
 // Minimal external store (subscribe/getState/setState) so the TUI can render
 // from data pushed by the SSE stream + telemetry poller without prop-drilling.
@@ -26,9 +27,14 @@ const LOG_CAP = 200;
 // stream (one per decoded batch) doesn't smear the sparklines.
 const LIVE_PUSH_MIN_GAP_MS = 200;
 
+// Returns a NEW ring (never mutates the one in the store): the pushers run
+// inside setState callbacks, and in-place mutation there is the kind of thing
+// that breaks the moment the store gains memoization or a subscriber caches
+// the previous state.
 function pushRing(arr, v) {
-  arr.push(v);
-  if (arr.length > BUFFER_SIZE) arr.shift();
+  const next = arr.length >= BUFFER_SIZE ? arr.slice(1) : arr.slice();
+  next.push(v);
+  return next;
 }
 
 export function createAppStore() {
@@ -49,7 +55,7 @@ export function createAppStore() {
     netMbps: 0,
     buffers: {
       mUtil: [], mVram: [], mPwr: [], mTemp: [],
-      wUtil: [], wVram: [],
+      wUtil: [], wVram: [], wPwr: [],
       net: [], promptTps: [], genTps: [],
     },
     live: { promptTps: null, genTps: null, genInst: null, ctxUsed: 0, ctxTotal: 0, active: false },
@@ -68,14 +74,16 @@ export function createAppStore() {
       seenRunIds.add(row.runId);
     }
     store.setState((s) => {
-      const b = s.buffers;
-      if (row.promptTps != null) pushRing(b.promptTps, row.promptTps);
-      if (row.genTps != null) pushRing(b.genTps, row.genTps);
       const entry = {
         ...row,
-        time: row.timestamp ? new Date(row.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString(),
+        time: row.timestamp ? fmtTime(row.timestamp) : fmtTime(),
       };
-      return { completions: [...s.completions, entry].slice(-COMPLETION_CAP) };
+      const buffers = {
+        ...s.buffers,
+        promptTps: row.promptTps != null ? pushRing(s.buffers.promptTps, row.promptTps) : s.buffers.promptTps,
+        genTps: row.genTps != null ? pushRing(s.buffers.genTps, row.genTps) : s.buffers.genTps,
+      };
+      return { completions: [...s.completions, entry].slice(-COMPLETION_CAP), buffers };
     });
   }
 
@@ -104,7 +112,13 @@ export function createAppStore() {
         },
       };
       // 'ready' is the running state (see server4.js state machine).
-      if (evt.state === 'ready' && prev !== 'ready') patch.modelUpSince = Date.now();
+      // Only start the uptime clock when we actually OBSERVE the transition
+      // (starting/loading -> ready); if the first event already says ready,
+      // the model has been up longer than this session and we don't know when
+      // it started (the SSE carries no start timestamp for that case).
+      if (evt.state === 'ready' && prev !== 'ready') {
+        patch.modelUpSince = (prev === 'starting' || prev === 'loading') ? Date.now() : null;
+      }
       if (evt.state && evt.state !== 'ready') patch.modelUpSince = null;
       store.setState(patch);
 
@@ -113,14 +127,19 @@ export function createAppStore() {
 
       if (log.startsWith('PREFILL_PROGRESS:')) {
         const parts = log.split(':');
-        const tps = parseFloat(parts[2]);
+        // parts[2] is llama.cpp's CUMULATIVE rate (n/elapsed -- it decays
+        // across a long prefill and looks like a rate but is a running
+        // average). parts[4] is the server-derived INSTANTANEOUS rate; older
+        // servers omit it, so fall back to the cumulative one.
+        const inst = parseFloat(parts[4]);
+        const tps = Number.isFinite(inst) ? inst : parseFloat(parts[2]);
         store.setState((st) => ({
           live: { ...st.live, promptTps: Number.isFinite(tps) ? tps : st.live.promptTps, active: true },
         }));
         const now = Date.now();
         if (Number.isFinite(tps) && now - lastLivePush.promptTps > LIVE_PUSH_MIN_GAP_MS) {
           lastLivePush.promptTps = now;
-          store.setState((st) => { pushRing(st.buffers.promptTps, tps); return {}; });
+          store.setState((st) => ({ buffers: { ...st.buffers, promptTps: pushRing(st.buffers.promptTps, tps) } }));
         }
       } else if (log.startsWith('GEN_PROGRESS:')) {
         const parts = log.split(':');
@@ -137,7 +156,7 @@ export function createAppStore() {
         const now = Date.now();
         if (Number.isFinite(avg) && now - lastLivePush.genTps > LIVE_PUSH_MIN_GAP_MS) {
           lastLivePush.genTps = now;
-          store.setState((st) => { pushRing(st.buffers.genTps, avg); return {}; });
+          store.setState((st) => ({ buffers: { ...st.buffers, genTps: pushRing(st.buffers.genTps, avg) } }));
         }
       } else if (log.startsWith('CTX_LIVE:')) {
         const parts = log.split(':');
@@ -182,21 +201,26 @@ export function createAppStore() {
         const dt = (now - lastNet.ts) / 1000;
         if (dt > 0.2) net = Math.max(0, (totalBytes - lastNet.bytes) / dt / (1024 * 1024));
       }
-      lastNet = { bytes: totalBytes, ts: now };
+      lastNet.bytes = totalBytes;
+      lastNet.ts = now;
 
-      store.setState((s) => {
-        const b = s.buffers;
-        pushRing(b.mUtil, m.gpu_util || 0);
-        pushRing(b.mVram, m.vram_used || 0);
-        pushRing(b.mPwr, m.gpu_pwr || 0);
-        pushRing(b.mTemp, m.gpu_temp || 0);
-        if (w && w.gpu_name && w.gpu_name !== 'Offline') {
-          pushRing(b.wUtil, w.gpu_util || 0);
-          pushRing(b.wVram, w.vram_used || 0);
-        }
-        pushRing(b.net, net);
-        return { telemetry: stats, netMbps: net };
-      });
+      // Build the next ring set OUTSIDE the setState callback (pushRing
+      // returns new arrays), so the callback is a pure state transformation.
+      const s = store.getState();
+      const b = s.buffers;
+      const buffers = {
+        mUtil: pushRing(b.mUtil, m.gpu_util || 0),
+        mVram: pushRing(b.mVram, m.vram_used || 0),
+        mPwr: pushRing(b.mPwr, m.gpu_pwr || 0),
+        mTemp: pushRing(b.mTemp, m.gpu_temp || 0),
+        wUtil: w && w.gpu_name && w.gpu_name !== 'Offline' ? pushRing(b.wUtil, w.gpu_util || 0) : b.wUtil,
+        wVram: w && w.gpu_name && w.gpu_name !== 'Offline' ? pushRing(b.wVram, w.vram_used || 0) : b.wVram,
+        wPwr: w && w.gpu_name && w.gpu_name !== 'Offline' ? pushRing(b.wPwr, w.gpu_pwr || 0) : b.wPwr,
+        net: pushRing(b.net, net),
+        promptTps: b.promptTps,
+        genTps: b.genTps,
+      };
+      store.setState({ telemetry: stats, netMbps: net, buffers });
     },
 
     // Backfill from GET /api/logs/recent on first connect. Deduped against
