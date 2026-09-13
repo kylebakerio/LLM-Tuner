@@ -2,5 +2,12 @@
   "llamaServerBuilds": [
     { "id": "vulkan", "label": "Vulkan Only", "path": "/path/to/llama.cpp/build/bin/llama-server" },
     { "id": "vulkan-cuda", "label": "Vulkan + CUDA", "path": "/path/to/llama.cpp/build-cuda-vulkan/bin/llama-server" }
-  ]
+  ],
+  "rpcWorker": {
+    "ssh": "user@worker-host",
+    "port": 50052,
+    "binary": "~/llama-rpc/ggml-rpc-server",
+    "devices": "Vulkan0",
+    "logFile": "~/llama-rpc/rpc-server.log"
+  }
 }

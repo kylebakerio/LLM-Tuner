@@ -5,7 +5,7 @@ import { h } from '../h.js';
 import { Sparkline, Bar } from '../components/sparkline.js';
 import { KeymapBar } from '../components/statusbar.js';
 import { useAppStore } from '../state.js';
-import { fmt, toGB, pad, throttleBadges, portFromCommand } from '../format.js';
+import { fmt, toGB, pad, throttleBadges, portFromCommand, gpuOnline, gpuTitles } from '../format.js';
 
 // Boxed section with the title embedded IN the top border line (btop-style):
 // the Box draws left/right/bottom borders; the first child draws the top
@@ -32,50 +32,67 @@ function fitBar(inner, prefixLen) {
   return { barW, sparkW: sparkW < 6 ? 0 : sparkW };
 }
 
-function GpuBox({ idx, gpu, buffers, width, color, tag }) {
+// FIXED 4-LINE HEIGHT (util/vram/pow/throttle) in every state -- including
+// offline/waiting -- so a badge appearing or telemetry dropping can never
+// change the box height and push the panels below it (layout thrash).
+// Vendor-neutral: the master may be the AMD card (amdgpu_top) and the worker
+// the NVIDIA one (nvidia-smi); gpuOnline checks both error flags.
+function GpuBox({ title, gpu, buffers, width, color }) {
   const inner = width - 2;
-  if (!gpu || gpu.gpu_name === 'Offline') {
-    return h(Section, { title: `GPU ${idx}${tag ? ` ${tag}` : ''}`, color, width },
-      h(Text, { dimColor: true }, gpu ? '  offline' : '  waiting for telemetry (monitor.py)...'),
-    );
-  }
-  const name = (gpu.gpu_name || 'GPU').replace(/^NVIDIA GeForce /, '').replace(/^AMD /, '');
-  const procVram = gpu.process_vram || 0;
-  const otherVram = Math.max(0, (gpu.vram_used || 0) - procVram);
+  const up = gpuOnline(gpu);
+  const g = up ? gpu : null;
+  const offline = !up && !!gpu; // monitor.py says the card is offline / its query failed
+  const name = g ? (g.gpu_name || 'GPU').replace(/^NVIDIA GeForce /, '').replace(/^AMD /, '') : null;
+  const procVram = g ? g.process_vram || 0 : 0;
+  const otherVram = g ? Math.max(0, (g.vram_used || 0) - procVram) : 0;
   // Power bars auto-scale to the session max (floor 100W): a laptop 4090
   // is capped well under the 350W of a desktop card, so a fixed max left
   // the bar a sliver even under load.
-  const pwrMax = Math.max(100, ...(buffers.pwr || [0]));
-  const badges = throttleBadges(gpu.throttle_reasons);
+  const pwrMax = g ? Math.max(100, ...(buffers.pwr || [0])) : 100;
+  // '  throttle: ' prefix is 12 columns; leave that much out of the badge budget.
+  const badges = g ? throttleBadges(g, inner - 12) : { segments: [] };
 
-  const utilVal = `${fmt(gpu.gpu_util, '%', 0).padStart(4)}`;
+  const utilVal = g ? fmt(g.gpu_util, '%', 0).padStart(4) : '--';
   const u = fitBar(inner, 1 + 4 + 1 + utilVal.length + 1);
-  const vramVal = `${toGB(gpu.vram_used)}/${toGB(gpu.vram_total)}`;
+  const vramVal = g ? `${toGB(g.vram_used)}/${toGB(g.vram_total)}` : '--/--';
   const v = fitBar(inner, 1 + 4 + 1 + vramVal.length + 1);
-  const pwrVal = `${fmt(gpu.gpu_pwr, 'W', 0).padStart(4)}`;
-  const trail = ` ${fmt(gpu.gpu_temp, '\u00B0C', 0)} \u00B7 m ${toGB(procVram)}G` + (otherVram > 0 ? ` \u00B7 o ${toGB(otherVram)}G` : '');
+  const pwrVal = g ? fmt(g.gpu_pwr, 'W', 0).padStart(4) : '--';
+  const trail = g
+    ? ` ${fmt(g.gpu_temp, '\u00B0C', 0)} \u00B7 m ${toGB(procVram)}G` + (otherVram > 0 ? ` \u00B7 o ${toGB(otherVram)}G` : '')
+    : ` ${offline ? 'offline' : 'waiting for telemetry...'}`;
   const p = fitBar(inner, 1 + 4 + 1 + pwrVal.length + 1 + trail.length);
 
-  return h(Section, { title: `GPU ${idx}${tag ? ` ${tag}` : ''} \u00B7 ${name}`, color, width },
-    h(Text, null,
+  return h(Section, { title: `${title}${name ? ` \u00B7 ${name}` : ''}`, color, width },
+    h(Text, { dimColor: !up },
       ` ${pad('util', 4)} ${utilVal} `,
-      h(Bar, { value: gpu.gpu_util, max: 100, width: u.barW }),
+      g ? h(Bar, { value: g.gpu_util, max: 100, width: u.barW }) : null,
       // NOTE: the sparkline goes in its own Text -- a component element
       // string-concatenated into a sibling (' ' + h(...)) becomes
       // "[object Object]" in the rendered output.
-      u.sparkW ? h(Text, null, ' ', h(Sparkline, { data: buffers.util, width: u.sparkW, color })) : null,
+      g && u.sparkW ? h(Text, null, ' ', h(Sparkline, { data: buffers.util, width: u.sparkW, color })) : null,
     ),
-    h(Text, null,
+    h(Text, { dimColor: !up },
       ` ${pad('vram', 4)} ${vramVal} `,
-      h(Bar, { value: gpu.vram_used, max: gpu.vram_total, width: v.barW }),
-      v.sparkW ? h(Text, null, ' ', h(Sparkline, { data: buffers.vram, max: gpu.vram_total, width: v.sparkW, color })) : null,
+      g ? h(Bar, { value: g.vram_used, max: g.vram_total, width: v.barW }) : null,
+      g && v.sparkW ? h(Text, null, ' ', h(Sparkline, { data: buffers.vram, max: g.vram_total, width: v.sparkW, color })) : null,
     ),
-    h(Text, null,
+    h(Text, { dimColor: !up },
       ` ${pad('pow', 4)} ${pwrVal} `,
-      h(Bar, { value: gpu.gpu_pwr, max: pwrMax, width: p.barW }),
+      g ? h(Bar, { value: g.gpu_pwr, max: pwrMax, width: p.barW }) : null,
       h(Text, { dimColor: true }, trail),
     ),
-    badges ? h(Text, { color: 'red', bold: true }, `  throttle: ${badges}`) : null,
+    h(Text, null,
+      '  ',
+      h(Text, { dimColor: true }, 'throttle: '),
+      badges.segments.length > 0
+        ? badges.segments.map((b, i) => h(Text, {
+          key: i,
+          color: b.level === 'real' ? 'red' : b.level === 'warn' ? 'yellow' : undefined,
+          bold: b.level === 'real',
+          dimColor: b.level === 'info',
+        }, b.label))
+        : h(Text, { dimColor: true }, 'none'),
+    ),
   );
 }
 
@@ -194,7 +211,8 @@ export function Monitor({ appStore, client, serverUrl, modeGateRef, onLaunchMode
   // ---- COMPLETED panel (half-width: time, prefill, gen, wall -- ranges from
   // the server-computed per-request min/max). Columns sum to EXACTLY the
   // inner width (no leading space): any overflow wraps the wall column onto
-  // its own line.
+  // its own line. FIXED HEADER + 3 ROWS so the panel never changes height
+  // when the first request lands or the table drains.
   const cInner = half2 - 2;
   const cTime = 8, cWall = 6;
   const cRest = Math.max(12, cInner - cTime - cWall);
@@ -205,82 +223,125 @@ export function Monitor({ appStore, client, serverUrl, modeGateRef, onLaunchMode
   // style) so the decimal points line up across rows.
   const cell = (s, w) => (s.length > w ? s.slice(0, w) : s);
   const ra = (s, w) => (s.length >= w ? s : ' '.repeat(w - s.length) + s);
+  const completedRows = [];
+  for (let i = 0; i < 3; i++) {
+    const r = recent[i];
+    if (!r) {
+      // A space, not '': ink collapses an empty Text to zero height, which
+      // would shrink the panel (layout thrash).
+      completedRows.push(h(Text, { key: `pad-${i}`, dimColor: true },
+        i === 0 && recent.length === 0 ? '  (none yet this session)' : ' '));
+      continue;
+    }
+    // ABORTED rows reserve the suffix inside the row budget (shrinking the
+    // P/G cells) so the row can never wrap onto an extra line.
+    const suffix = r.aborted ? ' ABORTED' : '';
+    const rest = cRest - suffix.length;
+    const pW = Math.max(4, Math.ceil(rest / 2));
+    const gW = Math.max(4, rest - pW);
+    const p = cell(tpsCell(r.promptTps, r.prefillTpsMin, r.prefillTpsMax), pW);
+    const g = cell(tpsCell(r.genTps, r.genTpsMin, r.genTpsMax), gW);
+    const wall = cell(fmt(r.wallTime, 's', r.wallTime >= 10 ? 0 : 1), cWall);
+    completedRows.push(h(Text, { key: r.runId || `${r.time}-${r.wallTime}` },
+      `${ra(r.time, cTime)}${ra(p, pW)}${ra(g, gW)}${ra(wall, cWall)}`,
+      r.aborted ? h(Text, { color: 'red' }, suffix) : null,
+    ));
+  }
   const completedBox = h(Section, { title: 'COMPLETED REQUESTS', color: 'yellow', width: half2 },
-    recent.length > 0
-      ? h(Box, { flexDirection: 'column' },
-          h(Text, { dimColor: true },
-            `${pad('time', cTime)}${pad(cell('P t/s', cP), cP)}${pad(cell('G t/s', cG), cG)}wall`),
-          recent.map((r) => {
-            const p = cell(tpsCell(r.promptTps, r.prefillTpsMin, r.prefillTpsMax), cP);
-            const g = cell(tpsCell(r.genTps, r.genTpsMin, r.genTpsMax), cG);
-            const wall = cell(fmt(r.wallTime, 's', r.wallTime >= 10 ? 0 : 1), cWall);
-            return h(Text, { key: r.runId || `${r.time}-${r.wallTime}` },
-              `${ra(r.time, cTime)}${ra(p, cP)}${ra(g, cG)}${ra(wall, cWall)}`,
-              r.aborted ? h(Text, { color: 'red' }, ' ABORTED') : null,
-            );
-          }),
-        )
-      : h(Text, { dimColor: true }, '  (none yet this session)'),
+    h(Box, { flexDirection: 'column' },
+      h(Text, { dimColor: true },
+        `${pad('time', cTime)}${pad(cell('P t/s', cP), cP)}${pad(cell('G t/s', cG), cG)}wall`),
+      ...completedRows,
+    ),
   );
 
-  // ---- SYSTEM panel ----
+  // ---- SYSTEM panel (fixed 4 lines: local cpu, local ram, worker, net;
+  // dim placeholders before the first telemetry sample / with no worker so
+  // the panel height never changes) ----
   const sInner = half1 - 2;
+  // The worker row is the RPC laptop's own CPU/RAM (separate host). The
+  // offline fallback dict says cpu_name 'Offline' and ram_total 1.
+  const wSys = !!(w && w.cpu_name !== 'Offline' && Number(w.ram_total) > 1);
+  const wText = wSys
+    ? `${fmt(w.cpu_util, '%', 0).padStart(4)} ${fmt(w.cpu_temp, '°C', 0)} · ram ${toGB(w.ram_used)}/${toGB(w.ram_total)}G `
+    : (s.server.isRpc ? 'worker telemetry offline' : '(no rpc worker)');
+  const syW = fitBar(sInner, 1 + 4 + 1 + wText.length);
   const cpuTrail = m ? ` ${fmt(m.cpu_temp, '\u00B0C', 0)}` : '';
-  const sy1 = fitBar(sInner, 1 + 4 + 1 + 6 + 1 + cpuTrail.length);
+  const sy1 = fitBar(sInner, 1 + 4 + 1 + 6 + 1 + Math.max(cpuTrail.length, ' no telemetry yet'.length));
   const ramVal = m ? `${toGB(m.ram_used)}/${toGB(m.ram_total)}` : '';
   const sy2 = fitBar(sInner, 1 + 4 + 1 + Math.max(ramVal.length, 7) + 1);
   const sy3 = fitBar(sInner, 1 + 4 + 1 + 9 + 1);
   const systemBox = h(Section, { title: 'SYSTEM', color: 'green', width: half1 },
-    m
-      ? h(Box, { flexDirection: 'column' },
-          h(Text, null,
-            ` ${pad('cpu', 4)} ${fmt(m.cpu_util, '%', 1).padStart(6)} `,
-            h(Bar, { value: m.cpu_util, max: 100, width: sy1.barW }),
-            h(Text, { dimColor: true }, cpuTrail),
-          ),
-          h(Text, null,
-            ` ${pad('ram', 4)} ${ramVal} `,
-            h(Bar, { value: m.ram_used, max: m.ram_total, width: sy2.barW }),
-          ),
-          h(Text, null,
-            ` ${pad('net', 4)} ${s.netMbps.toFixed(2)} MB/s `,
-            h(Sparkline, { data: s.buffers.net, width: sy3.sparkW || sy3.barW, color: 'green' }),
-          ),
-        )
-      : h(Text, { dimColor: true }, '  waiting for telemetry...'),
+    h(Box, { flexDirection: 'column' },
+      h(Text, { dimColor: !m },
+        ` ${pad('cpu', 4)} ${m ? fmt(m.cpu_util, '%', 1).padStart(6) : '  --'} `,
+        m ? h(Bar, { value: m.cpu_util, max: 100, width: sy1.barW }) : null,
+        h(Text, { dimColor: true }, m ? cpuTrail : ' no telemetry yet'),
+      ),
+      h(Text, { dimColor: !m },
+        ` ${pad('ram', 4)} ${ramVal || '    --'} `,
+        m ? h(Bar, { value: m.ram_used, max: m.ram_total, width: sy2.barW }) : null,
+      ),
+      h(Text, { dimColor: !wSys },
+        ` ${pad('wrk', 4)} `,
+        h(Text, { color: wSys ? 'magenta' : undefined }, wText),
+        wSys ? h(Bar, { value: w.ram_used, max: w.ram_total, width: Math.max(0, syW.barW) }) : null,
+      ),
+      h(Text, null,
+        ` ${pad('net', 4)} ${s.netMbps.toFixed(2)} MB/s `,
+        h(Sparkline, { data: s.buffers.net, width: sy3.sparkW || sy3.barW, color: 'green' }),
+      ),
+    ),
   );
 
-  // ---- LOG panel ----
+  // ---- LOG panel (fixed 4 lines, matching SYSTEM; dim padding keeps the
+  // height constant) ----
   const lInner = half2 - 2;
+  const logLines = s.logTail.slice(-4);
   const logBox = h(Section, { title: 'LOG', color: 'gray', width: half2 },
-    s.logTail.length > 0
-      ? h(Box, { flexDirection: 'column' },
-          s.logTail.slice(-3).map((line, i) => {
-            const max = Math.max(10, lInner - 2);
-            return h(Text, { key: i, dimColor: true },
-              `  ${line.length > max ? line.slice(0, max - 1) + '\u2026' : line}`);
-          }),
-        )
-      : h(Text, { dimColor: true }, '  (quiet)'),
+    h(Box, { flexDirection: 'column' },
+      [0, 1, 2, 3].map((i) => {
+        const line = logLines[i];
+        const max = Math.max(10, lInner - 2);
+        return h(Text, { key: i, dimColor: true },
+          line == null
+            ? (i === 0 && logLines.length === 0 ? '  (quiet)' : ' ')
+            : `  ${line.length > max ? line.slice(0, max - 1) + '\u2026' : line}`);
+      }),
+    ),
   );
+
+  // One PERMANENT status line under the state line (stop failure > server
+  // error > stop-confirm > blank) so a message appearing or clearing never
+  // changes the screen height and shifts the panels (layout thrash).
+  let statusLine;
+  if (stopErr) {
+    statusLine = h(Text, { color: 'red' }, ` ${stopErr}`);
+  } else if (s.server.error) {
+    const err = s.server.error.length > cols - 1
+      ? s.server.error.slice(0, cols - 2) + '\u2026'
+      : s.server.error;
+    statusLine = h(Text, { color: 'red', bold: true }, ` ${err}`);
+  } else if (confirmStop) {
+    statusLine = h(Box, null,
+      h(Text, { color: 'yellow' }, ' Stop the model server? '),
+      h(Text, { bold: true }, '[y/N]'),
+    );
+  } else {
+    statusLine = h(Text, null, ' ');
+  }
 
   return h(Box, { flexDirection: 'column' },
-    s.server.error
-      ? h(Box, null, h(Text, { color: 'red', bold: true }, ` ${s.server.error}`))
-      : null,
     stateLine,
-    confirmStop
-      ? h(Box, null,
-        h(Text, { color: 'yellow' }, ' Stop the model server? '),
-        h(Text, { bold: true }, '[y/N]'),
-      )
-      : null,
-    stopErr ? h(Box, null, h(Text, { color: 'red' }, ` ${stopErr}`)) : null,
+    statusLine,
 
+    // During an RPC run the worker panel stays up even when its telemetry
+    // drops (shown as offline) -- a vanishing panel would hide exactly the
+    // failure worth seeing.
     h(Box, { flexDirection: 'row' },
-      h(GpuBox, { idx: 0, gpu: m, buffers: { util: s.buffers.mUtil, vram: s.buffers.mVram, pwr: s.buffers.mPwr }, width: half1, color: 'blue' }),
-      w && w.gpu_name && w.gpu_name !== 'Offline'
-        ? h(GpuBox, { idx: 1, tag: s.server.isRpc ? '(rpc)' : null, gpu: w, buffers: { util: s.buffers.wUtil, vram: s.buffers.wVram, pwr: s.buffers.wPwr }, width: half2, color: 'magenta' })
+      h(GpuBox, { title: gpuTitles(s.server.isRpc)[0], gpu: m, buffers: { util: s.buffers.mUtil, vram: s.buffers.mVram, pwr: s.buffers.mPwr }, width: half1, color: 'blue' }),
+      gpuOnline(w) || s.server.isRpc
+        ? h(GpuBox, { title: gpuTitles(s.server.isRpc)[1], gpu: w, buffers: { util: s.buffers.wUtil, vram: s.buffers.wVram, pwr: s.buffers.wPwr }, width: half2, color: 'magenta' })
         : null,
     ),
     h(Box, { flexDirection: 'row' },

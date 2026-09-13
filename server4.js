@@ -11,6 +11,11 @@ const execFileAsync = promisify(execFile);
 const ROOT_DIR = path.join(__dirname, '..');
 const PORT = 3000;
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB payload limit to prevent OOM
+// /api/chat alone gets a much higher ceiling: llama.cpp's native input_video/
+// input_audio content types (see the CHAT PROXY handler) carry a whole media
+// file as raw base64 (~1.33x its original size) inside the same JSON body as
+// the rest of the conversation. Every other route stays at the 10MB default.
+const MAX_CHAT_BODY_SIZE = 100 * 1024 * 1024; // 100MB
 
 // --- STATE ---
 let llamaProcess = null;
@@ -18,6 +23,7 @@ let pythonProcess = null;
 let serverState = 'stopped';
 let currentModel = '';
 let isRpc = false;
+let launchPending = false; // /api/start is awaiting the RPC worker
 let clients = [];
 let loadStartTime = 0;
 let finalLoadTime = 0;
@@ -170,8 +176,30 @@ function benchLog(line) {
 const DEFAULT_LLAMA_SERVER_BUILDS = [
     { id: 'default', label: 'Default', path: '/home/kyle/AI/llama-official/llama.cpp/build/bin/llama-server' }
 ];
+// RPC worker: a bare `ggml-rpc-server` binary on the remote host, started and
+// stopped over SSH (no Docker on the worker). Overridable per-field via
+// dashboard.config.json's `rpcWorker` block.
+const DEFAULT_RPC_WORKER = {
+    ssh: '',                                   // user@host; seeds the GUI's worker field
+    port: 50052,
+    binary: '~/llama-rpc/ggml-rpc-server',
+    devices: '',                               // rpc-server -d list; empty = all non-CPU devices
+    logFile: '~/llama-rpc/rpc-server.log',
+    // rpc-server -c: the worker keeps every tensor over 10 MB in its own
+    // ~/.cache/llama.cpp/rpc, and later loads of the same model send only
+    // hashes -- a warm cache means weights never cross the network again.
+    cache: true,
+    // How llama-server reaches the worker. 'ssh': rpc-server listens only on
+    // the worker's 127.0.0.1 and RPC rides an `ssh -L` forward the dashboard
+    // manages, so the unauthenticated RPC port is never on a network, and it
+    // works over any path `ssh <target>` does (LAN, Tailscale, a Cloudflare
+    // ProxyCommand). 'direct': rpc-server listens on 0.0.0.0 and --rpc dials
+    // host:port -- trusted LAN only, no SSH encryption overhead.
+    link: 'ssh',
+    localPort: 50052,                          // this machine's end of the ssh forward
+};
 const DASHBOARD_CONFIG_FILE = path.join(__dirname, 'dashboard.config.json');
-let dashboardConfig = { llamaServerBuilds: DEFAULT_LLAMA_SERVER_BUILDS };
+let dashboardConfig = { llamaServerBuilds: DEFAULT_LLAMA_SERVER_BUILDS, rpcWorker: { ...DEFAULT_RPC_WORKER } };
 
 // A build entry is usable only if it carries a non-empty binary path --
 // dashboard.config.json is user-editable, and a half-deleted entry must not
@@ -195,6 +223,12 @@ async function loadDashboardConfig() {
         if (builds && builds.length > 0) {
             dashboardConfig.llamaServerBuilds = builds;
         }
+        if (parsed.rpcWorker && typeof parsed.rpcWorker === 'object') {
+            dashboardConfig.rpcWorker = { ...DEFAULT_RPC_WORKER, ...parsed.rpcWorker };
+        }
+        if (parsed.remoteAccess && typeof parsed.remoteAccess === 'object') {
+            dashboardConfig.remoteAccess = parsed.remoteAccess;
+        }
     } catch {
         // missing/invalid config file -- keep the default
     }
@@ -202,6 +236,165 @@ async function loadDashboardConfig() {
 
 function getLlamaServerBuilds() {
     return dashboardConfig.llamaServerBuilds;
+}
+
+// The worker's binary/log paths and device list are interpolated into a shell
+// line run on the worker over SSH, so they're restricted to plain path/name
+// characters (a leading ~ is allowed and expands remotely).
+function getRpcWorkerConfig() {
+    const w = dashboardConfig.rpcWorker;
+    const safePath = /^[A-Za-z0-9_.\/~-]+$/;
+    if (!safePath.test(String(w.binary)) || !safePath.test(String(w.logFile))) {
+        throw new Error('rpcWorker.binary and rpcWorker.logFile must be plain paths');
+    }
+    const port = toFiniteNumber(w.port);
+    if (port === undefined || !Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error('rpcWorker.port must be an integer between 1 and 65535');
+    }
+    const devices = toNonEmptyString(w.devices) || '';
+    if (devices && !/^[A-Za-z0-9_,-]+$/.test(devices)) {
+        throw new Error('rpcWorker.devices must be a comma-separated device list');
+    }
+    const link = w.link === 'direct' ? 'direct' : 'ssh';
+    const localPort = toFiniteNumber(w.localPort);
+    if (localPort === undefined || !Number.isInteger(localPort) || localPort < 1 || localPort > 65535) {
+        throw new Error('rpcWorker.localPort must be an integer between 1 and 65535');
+    }
+    // pgrep -x matches the kernel's 15-char process name.
+    const procName = String(w.binary).split('/').pop().slice(0, 15);
+    return {
+        ssh: toNonEmptyString(w.ssh) || '', port, binary: w.binary, devices, logFile: w.logFile, procName,
+        cache: w.cache !== false, link, localPort, bindHost: link === 'ssh' ? '127.0.0.1' : '0.0.0.0',
+    };
+}
+
+// What --rpc dials: this machine's end of the ssh forward, or the worker itself.
+function rpcEndpointFor(sshTarget) {
+    const w = getRpcWorkerConfig();
+    return w.link === 'ssh' ? `127.0.0.1:${w.localPort}` : `${hostFromRpcTarget(sshTarget)}:${w.port}`;
+}
+
+// --- RPC WORKER CONTROL (over SSH) ---
+// Shared by the /api/worker/* endpoints and /api/start's auto-start.
+async function startRpcWorker(sshTarget) {
+    // setsid+nohup with every fd redirected detaches the server so the SSH
+    // session can return. The `&` must background ONLY that command:
+    // `mkdir && setsid ... &` backgrounds the whole list in a subshell that
+    // keeps SSH's stdout open, and SSH never exits. The short wait catches a
+    // binary that dies on startup (bad -d device, port in use) and reports its
+    // log tail as the error.
+    const w = getRpcWorkerConfig();
+    const devArg = w.devices ? ` -d ${w.devices}` : '';
+    const cacheArg = w.cache ? ' -c' : '';
+    // A worker already listening on the wrong address (link mode changed) is
+    // restarted rather than reported as running.
+    const cmd = `pgrep -a -x ${w.procName} | grep -q -- "-H ${w.bindHost} " && { echo "already running"; exit 0; }; ` +
+        `pkill -x ${w.procName} && sleep 1; ` +
+        `mkdir -p "$(dirname ${w.logFile})" || exit 1; ` +
+        `setsid nohup ${w.binary} -H ${w.bindHost} -p ${w.port}${devArg}${cacheArg} </dev/null >${w.logFile} 2>&1 & ` +
+        `sleep 3; pgrep -x ${w.procName} >/dev/null || { echo "rpc-server exited on startup:" >&2; tail -n 20 ${w.logFile} >&2; exit 1; }`;
+    return runSSHCommand(sshTarget, cmd);
+}
+
+async function stopRpcWorker(sshTarget) {
+    const w = getRpcWorkerConfig();
+    const cmd = `pkill -x ${w.procName}; for i in 1 2 3 4 5 6; do pgrep -x ${w.procName} >/dev/null || exit 0; sleep 0.5; done; ` +
+        `pkill -9 -x ${w.procName}; exit 0`;
+    return runSSHCommand(sshTarget, cmd);
+}
+
+// 'offline' means SSH itself failed (host down, off the network, bad key).
+async function getRpcWorkerStatus(sshTarget) {
+    try {
+        const w = getRpcWorkerConfig();
+        const { stdout } = await runSSHCommand(sshTarget, `pgrep -x ${w.procName} >/dev/null && echo running || echo stopped`);
+        return { status: stdout.trim() === 'running' ? 'running' : 'stopped' };
+    } catch (err) {
+        return { status: 'offline', error: err.message };
+    }
+}
+
+async function getRpcWorkerLogs(sshTarget) {
+    const w = getRpcWorkerConfig();
+    const { stdout, stderr } = await runSSHCommand(sshTarget, `tail -n 50 ${w.logFile} 2>/dev/null || echo "no rpc-server log yet (${w.logFile})"`);
+    return stdout || stderr || 'No logs available.';
+}
+
+function probeTcp(host, port, timeoutMs) {
+    return new Promise((resolve) => {
+        const sock = require('net').connect({ host, port });
+        const done = (ok) => { sock.destroy(); resolve(ok); };
+        sock.setTimeout(timeoutMs, () => done(false));
+        sock.once('connect', () => done(true));
+        sock.once('error', () => done(false));
+    });
+}
+
+// The `ssh -L` forward for link 'ssh' -- one at a time, owned by the dashboard.
+let rpcTunnel = null; // { target, proc }
+
+function closeRpcTunnel() {
+    if (!rpcTunnel) return;
+    try { rpcTunnel.proc.kill('SIGTERM'); } catch { /* already gone */ }
+    rpcTunnel = null;
+}
+process.on('exit', closeRpcTunnel);
+
+async function ensureRpcTunnel(sshTarget) {
+    if (rpcTunnel && rpcTunnel.target === sshTarget && rpcTunnel.proc.exitCode === null) return;
+    closeRpcTunnel();
+    if (!isValidSSHHost(sshTarget)) throw new Error('Invalid SSH host format');
+    const w = getRpcWorkerConfig();
+    // ExitOnForwardFailure: a local port that's already taken must fail the
+    // tunnel, not leave llama-server dialing whatever else holds it.
+    const proc = spawn('ssh', ['-N', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+        '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=3',
+        '-L', `127.0.0.1:${w.localPort}:127.0.0.1:${w.port}`, sshTarget], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d; });
+    proc.on('error', () => { /* surfaced through exitCode below */ });
+    proc.on('exit', (code) => {
+        if (rpcTunnel && rpcTunnel.proc === proc) rpcTunnel = null;
+        console.log(`RPC ssh tunnel to ${sshTarget} closed (code ${code})${stderr.trim() ? ': ' + stderr.trim() : ''}`);
+    });
+    rpcTunnel = { target: sshTarget, proc };
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+        if (proc.exitCode !== null) break;
+        if (await probeTcp('127.0.0.1', w.localPort, 1000)) {
+            // Give ExitOnForwardFailure a moment to fire on a taken port.
+            await new Promise((r) => setTimeout(r, 300));
+            if (proc.exitCode === null) return;
+            break;
+        }
+        await new Promise((r) => setTimeout(r, 300));
+    }
+    closeRpcTunnel();
+    throw new Error(`ssh tunnel to ${sshTarget} failed${stderr.trim() ? ': ' + stderr.trim() : ' (timed out)'}`);
+}
+
+// Make sure the worker is serving before llama-server dials it, so booting an
+// RPC config (or profile) is one click. For link 'direct', reachability is
+// probed (over Wi-Fi the process can be up while the port isn't reachable);
+// for link 'ssh', a live forward plus a running worker is the check.
+async function ensureRpcWorker(sshTarget, onStatus) {
+    const w = getRpcWorkerConfig();
+    if (w.link === 'ssh') {
+        onStatus(`RPC worker: checking ggml-rpc-server on ${sshTarget}`);
+        await startRpcWorker(sshTarget);
+        await ensureRpcTunnel(sshTarget);
+        return;
+    }
+    const host = hostFromRpcTarget(sshTarget);
+    if (await probeTcp(host, w.port, 3000)) return;
+    onStatus(`RPC worker: starting ggml-rpc-server on ${sshTarget}`);
+    await startRpcWorker(sshTarget);
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+        if (await probeTcp(host, w.port, 3000)) return;
+        await new Promise((r) => setTimeout(r, 500));
+    }
+    throw new Error(`RPC worker started on ${sshTarget}, but ${host}:${w.port} is not reachable from this machine`);
 }
 
 // Resolves a build id to its binary path, falling back to the first
@@ -259,14 +452,223 @@ setInterval(() => {
     if (deadClients.length > 0) clients = clients.filter(c => !deadClients.includes(c));
 }, 15000).unref();
 
+// --- REMOTE ACCESS: Cloudflare tunnel + hard password gate ---
+// `cloudflared tunnel --url http://127.0.0.1:PORT` (trycloudflare, no
+// account) publishes this dashboard to a random https://xxx.trycloudflare.com.
+// With dashboard.config.json `remoteAccess.tunnelConfig` set, a NAMED tunnel
+// (`cloudflared tunnel --config <file> run`) publishes it at a fixed hostname
+// instead (`remoteAccess.url`, e.g. https://ai.kylebaker.io) -- same gate.
+// Because cloudflared forwards from localhost, tunnel traffic and local
+// traffic are indistinguishable by IP -- so the gate is GLOBAL while the
+// tunnel is up: EVERY request (static files, REST, SSE) must authenticate
+// before any dashboard bytes are served. The only unauthenticated response is
+// the gate page itself (it has to be, in order to collect the password).
+// Stopping the tunnel drops the gate; local use is exactly as before.
+//
+// Credentials: the password is PBKDF2-HMAC-SHA256 (200k iters) against a
+// random per-boot salt (never persisted -- a restart revokes everything).
+// Two auth paths, both checked per request:
+//   - Authorization: Bearer <password>  (CLI on another machine; TLS via the
+//     tunnel edge, and the gate means the password only ever crosses a link
+//     the operator just unlocked)
+//   - mc_session=<random token> cookie  (browsers, after /api/tunnel/login;
+//     tokens live in memory and die with the process)
+const crypto = require('crypto');
+let tunnelProcess = null;
+let tunnelUrl = null;
+let tunnelSalt = null;
+let tunnelPasswordHash = null;
+let tunnelStarting = false;
+const tunnelSessions = new Set();
+
+function tunnelGateActive() {
+    return tunnelProcess !== null || tunnelStarting;
+}
+
+function hashTunnelPassword(password, salt) {
+    return crypto.pbkdf2Sync(String(password), salt, 200000, 64, 'sha256');
+}
+
+function verifyTunnelPassword(password) {
+    if (!tunnelPasswordHash || !tunnelSalt) return false;
+    const candidate = hashTunnelPassword(password, tunnelSalt);
+    return crypto.timingSafeEqual(candidate, tunnelPasswordHash);
+}
+
+function tunnelAuthenticated(req) {
+    const bearer = req.headers['authorization'];
+    if (typeof bearer === 'string' && bearer.startsWith('Bearer ') && bearer.trim().length > 7) {
+        if (verifyTunnelPassword(bearer.slice(7).trim())) return true;
+    }
+    const cookie = req.headers['cookie'];
+    if (typeof cookie === 'string') {
+        for (const part of cookie.split(';')) {
+            const eq = part.indexOf('=');
+            if (eq === -1) continue;
+            const name = part.slice(0, eq).trim();
+            const value = part.slice(eq + 1).trim();
+            if (name === 'mc_session' && tunnelSessions.has(value)) return true;
+        }
+    }
+    return false;
+}
+
+const TUNNEL_GATE_PAGE = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mission Control — locked</title>
+<style>
+  body { background: #0a0a0f; color: #d4d4d8; font-family: system-ui, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+  .card { background: #18181b; border: 1px solid #27272a; border-radius: 12px; padding: 2.5rem 2rem; width: min(22rem, 90vw); text-align: center; }
+  h1 { font-size: 1.1rem; margin: 0 0 .25rem; color: #818cf8; }
+  p.sub { font-size: .8rem; color: #71717a; margin: 0 0 1.5rem; }
+  input { width: 100%; box-sizing: border-box; background: #09090b; border: 1px solid #3f3f46; border-radius: 8px; color: #e4e4e7; padding: .6rem .75rem; font-size: .9rem; }
+  button { width: 100%; box-sizing: border-box; margin-top: .75rem; background: #4f46e5; border: 0; border-radius: 8px; color: #fff; padding: .6rem; font-size: .9rem; font-weight: 600; cursor: pointer; }
+  button:disabled { background: #3f3f46; cursor: default; }
+  .err { color: #f87171; font-size: .8rem; min-height: 1.2em; margin: .75rem 0 0; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Mission Control</h1>
+  <p class="sub">Remote access is password-protected. This dashboard is exposed through a Cloudflare tunnel.</p>
+  <form id="f" autocomplete="off">
+    <input type="password" id="pw" placeholder="password" autofocus>
+    <button id="go" type="submit">Unlock</button>
+  </form>
+  <p class="err" id="err"></p>
+</div>
+<script>
+document.getElementById('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const go = document.getElementById('go');
+  const err = document.getElementById('err');
+  go.disabled = true; err.textContent = '';
+  try {
+    const r = await fetch('/api/tunnel/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: document.getElementById('pw').value })
+    });
+    if (r.ok) { location.reload(); }
+    else { const j = await r.json().catch(() => ({})); err.textContent = j.error || 'Unlock failed'; }
+  } catch (ex) { err.textContent = 'Unlock failed: ' + ex.message; }
+  go.disabled = false;
+});
+</script>
+</body>
+</html>`;
+
+function tunnelGateResponse(req, res) {
+    // Browsers hitting a page get the gate form; API/SSE clients get 401 JSON
+    // (the CLI turns it into a password prompt). No dashboard bytes either way.
+    const wantsHtml = req.method === 'GET' && /html/i.test(String(req.headers['accept'] || ''));
+    if (wantsHtml) {
+        res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        return res.end(TUNNEL_GATE_PAGE);
+    }
+    res.writeHead(401, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify({ error: 'authentication required (tunnel gate active)' }));
+}
+
+function getRemoteAccessConfig() {
+    const r = dashboardConfig.remoteAccess || {};
+    const tunnelConfig = toNonEmptyString(r.tunnelConfig);
+    return {
+        binary: toNonEmptyString(r.cloudflared) || 'cloudflared',
+        tunnelConfig: tunnelConfig ? tunnelConfig.replace(/^~(?=\/)/, os.homedir()) : null,
+        url: toNonEmptyString(r.url) || null,
+    };
+}
+
+function stopTunnel() {
+    if (tunnelProcess) {
+        try { tunnelProcess.kill('SIGTERM'); } catch { /* already gone */ }
+        tunnelProcess = null;
+    }
+    tunnelUrl = null;
+    tunnelSalt = null;
+    tunnelPasswordHash = null;
+    tunnelSessions.clear();
+    tunnelStarting = false;
+}
+
+// Start a trycloudflare quick tunnel to this dashboard and wait (up to 30 s)
+// for the URL to appear in cloudflared's logs. The PASSWORD is required up
+// front -- the gate arms as soon as this returns, so there is no window where
+// the tunnel is public but unguarded.
+function startTunnel(password) {
+    return new Promise((resolve, reject) => {
+        if (tunnelGateActive()) return reject(new Error('tunnel already running'));
+        if (typeof password !== 'string' || password.length < 4) {
+            return reject(new Error('password required (min 4 characters)'));
+        }
+        const ra = getRemoteAccessConfig();
+        const args = ra.tunnelConfig
+            ? ['tunnel', '--no-autoupdate', '--config', ra.tunnelConfig, 'run']
+            : ['tunnel', '--url', `http://127.0.0.1:${PORT}`, '--no-autoupdate'];
+        let proc;
+        try {
+            proc = spawn(ra.binary, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        } catch (err) {
+            return reject(new Error('failed to start cloudflared: ' + err.message));
+        }
+        let settled = false;
+        const fail = (msg) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            try { proc.kill('SIGTERM'); } catch { /* ignore */ }
+            // A failed start must NOT leave the gate armed with no usable
+            // password -- that would lock the operator out of their own
+            // dashboard. Clear every bit of tunnel state.
+            if (tunnelProcess === proc) tunnelProcess = null;
+            tunnelStarting = false;
+            tunnelUrl = null;
+            tunnelSalt = null;
+            tunnelPasswordHash = null;
+            reject(new Error(msg));
+        };
+        // A quick tunnel is up once it prints its random URL; a named tunnel
+        // once it registers an edge connection (its URL is fixed, from config).
+        const upRe = ra.tunnelConfig ? /Registered tunnel connection/i : /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
+        const onOutput = (data) => {
+            const m = String(data).match(upRe);
+            if (m && !settled) {
+                settled = true;
+                clearTimeout(timer);
+                tunnelUrl = ra.tunnelConfig ? (ra.url || 'named tunnel') : m[0];
+                tunnelStarting = false; // success: no longer "starting" (the status endpoint and the UI badge depend on this flipping)
+                tunnelSalt = crypto.randomBytes(32);
+                tunnelPasswordHash = hashTunnelPassword(password, tunnelSalt);
+                resolve(tunnelUrl);
+            }
+        };
+        proc.stdout.on('data', onOutput);
+        proc.stderr.on('data', onOutput);
+        proc.on('error', (err) => fail(err.code === 'ENOENT' ? 'cloudflared not found on this host' : 'cloudflared error: ' + err.message));
+        proc.on('exit', (code) => {
+            if (!settled) return fail(`cloudflared exited before the tunnel came up (code ${code})`);
+            // Unexpected death after a successful start -- clear state so the
+            // UI/CLI don't believe a dead tunnel is still public.
+            stopTunnel();
+        });
+        tunnelStarting = true;
+        tunnelProcess = proc;
+        const timer = setTimeout(() => fail('cloudflared tunnel did not come up within 30 s'), 30000);
+    });
+}
+
 // --- SAFE REQUEST BODY PARSER ---
-function parseBody(req) {
+function parseBody(req, maxSize = MAX_BODY_SIZE) {
     return new Promise((resolve, reject) => {
         let body = '';
         let size = 0;
         req.on('data', chunk => {
             size += chunk.length;
-            if (size > MAX_BODY_SIZE) {
+            if (size > maxSize) {
                 req.destroy();
                 return reject(new Error('Payload too large'));
             }
@@ -301,8 +703,10 @@ async function scanDirForGgufs(dir) {
 }
 
 // --- SSH EXECUTION (SECURE & CORRECTED) ---
+// "user@host" or a bare ~/.ssh/config alias ("laptop"). No leading '-', so a
+// target can never be read by ssh as an option.
 function isValidSSHHost(host) {
-    return /^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+$/.test(host);
+    return /^([a-zA-Z0-9._-]+@)?[a-zA-Z0-9][a-zA-Z0-9.-]*$/.test(String(host || ''));
 }
 
 async function runSSHCommand(host, command) {
@@ -310,6 +714,10 @@ async function runSSHCommand(host, command) {
     return new Promise((resolve, reject) => {
         // Pass command as a single trailing argument so SSH sends it verbatim to the remote shell
         const ssh = spawn('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', host, command]);
+        // A remote command that never closes its output (e.g. a badly detached
+        // background process) would otherwise hang the HTTP request forever.
+        const timer = setTimeout(() => ssh.kill('SIGKILL'), 30000);
+        ssh.on('exit', () => clearTimeout(timer));
         let stdout = '', stderr = '';
         ssh.stdout.on('data', d => stdout += d);
         ssh.stderr.on('data', d => stderr += d);
@@ -387,6 +795,17 @@ function parseHelpFlags(helpText) {
         e.primaryFlag = longForm;
     }
     return entries;
+}
+
+// True when the build's parsed --help reference lists the flag. The cache is
+// warmed at boot (initServer) and lazily filled by /api/flags; a build with
+// NO cached reference yet is assumed modern (every current build has had
+// these flags for a long time, and a genuinely old build would reject an
+// unknown flag loudly at launch -- visible in the log, not a silent misfire).
+function buildSupportsFlag(buildId, flag) {
+    const flags = cachedFlagReferenceByBuild.get(buildId);
+    if (!flags || flags.length === 0) return true;
+    return flags.some((f) => (f.flags || '').includes(flag));
 }
 
 // Coerce a UI/API value to a finite number, or undefined when it's missing,
@@ -504,7 +923,18 @@ function buildLlamaArgs(config, { mapModelPath, deviceArgs }) {
     if (config.jinja || chatTemplateFile) args.push('--jinja');
     if (chatTemplateFile) args.push('--chat-template-file', chatTemplateFile);
     const mmprojPath = toNonEmptyString(config.mmprojPath);
-    if (config.mmprojEnabled && mmprojPath) args.push('--mmproj', mmprojPath);
+    if (config.mmprojEnabled && mmprojPath) {
+        args.push('--mmproj', mmprojPath);
+        // Keep the projector in system RAM instead of VRAM (frees ~0.9 GB for
+        // the F16 Qwen3.8 mmproj; the vision encoder only runs when an image
+        // is actually embedded). llama.cpp's own default is GPU offload, so
+        // the flag is only emitted when the user explicitly opts out -- and
+        // only for builds that know the flag (older llama.cpp dies on unknown
+        // options).
+        if (config.mmprojOffload === false && buildSupportsFlag(config.build, '--mmproj-offload')) {
+            args.push('--no-mmproj-offload');
+        }
+    }
     const loadMode = toNonEmptyString(config.loadMode);
     if (loadMode) args.push('-lm', loadMode);
     const verbosity = toFiniteNumber(config.verbosity);
@@ -557,7 +987,18 @@ function resolveLaunchCommand(config) {
     if (localSplit || rpcTarget) {
         deviceArgs.push('--split-mode', 'layer');
         if (localSplit) deviceArgs.push('-dev', `${config.deviceA},${config.deviceB}`);
-        if (rpcTarget) deviceArgs.push('--rpc', `${hostFromRpcTarget(rpcTarget)}:50052`);
+        if (rpcTarget) {
+            const endpoint = rpcEndpointFor(rpcTarget);
+            deviceArgs.push('--rpc', endpoint);
+            // Pin the device list so -ts's two values map to exactly [GPU A,
+            // worker] instead of whatever auto-detection finds. RPC devices are
+            // named RPC<n>, numbered across all --rpc servers (ggml-rpc.cpp;
+            // the [host:port] form is only the backend name), and there's one
+            // server serving a single device (rpcWorker.devices), so it's RPC0.
+            // --rpc must precede -dev: the RPC devices only exist once --rpc
+            // has been parsed.
+            if (config.deviceA && !localSplit) deviceArgs.push('-dev', `${config.deviceA},RPC0`);
+        }
         // A tensor split of 0..99 is a 2-way ratio; negative/NaN values would
         // emit a nonsensical `-ts` pair, so validate before emitting.
         const tensorSplit = toFiniteNumber(config.tensorSplit);
@@ -570,13 +1011,24 @@ function resolveLaunchCommand(config) {
     return { command, args };
 }
 
-// Extract the bare hostname from an RPC/SSH target like "user@host:22" --
-// the RPC port (50052) is appended separately, so a user-supplied :port must
-// not survive ("host:22:50052" is not a valid RPC endpoint).
+// The host --rpc dials for an SSH target ("laptop", "user@laptop",
+// "user@192.168.1.125"). `ssh -G` applies ~/.ssh/config, so a Host alias's
+// HostName -- the LAN IP at home, a Tailscale address away -- is the single
+// place to repoint the worker. Falls back to the literal host, minus any
+// user@ and :port (the RPC port, rpcWorker.port, is appended separately).
 function hostFromRpcTarget(target) {
     const s = String(target || '').trim();
-    const withoutUser = s.split('@').pop() || s;
-    return withoutUser.split(':')[0];
+    const literal = (s.split('@').pop() || s).split(':')[0];
+    if (!isValidSSHHost(s)) return literal;
+    try {
+        const out = require('child_process').execFileSync('ssh', ['-G', s],
+            { encoding: 'utf-8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] });
+        const m = out.match(/^hostname\s+(\S+)$/m);
+        // An IPv6 HostName can't be written as host:port for --rpc.
+        return m && !m[1].includes(':') ? m[1] : literal;
+    } catch {
+        return literal;
+    }
 }
 
 // Shell-safe quoting for the displayed/copied launch command. JSON.stringify
@@ -1598,10 +2050,41 @@ async function saveProfilesDoc(doc) {
 }
 
 // --- HTTP SERVER ---
+// Model-server port from the live launch command (--port N), defaulting to
+// the documented 8080. Used by the /api/chat and /api/slots proxies so a
+// custom-port launch is followed by the proxies automatically.
+function portFromLaunchCommand() {
+    const m = String(currentLaunchCommand || '').match(/--port[ =](\d+)/);
+    return m ? parseInt(m[1], 10) : 8080;
+}
+
 const server = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     if (req.method === 'OPTIONS') { res.writeHead(200); return res.end(); }
+
+    // --- TUNNEL GATE (when a tunnel is up, nothing else is reachable) ---
+    // Login is the single unauthenticated entry point; everything else must
+    // already carry a valid Bearer password or session cookie.
+    if (tunnelGateActive()) {
+        if (req.url === '/api/tunnel/login' && req.method === 'POST') {
+            let body;
+            try { body = JSON.parse(await parseBody(req)); } catch { body = {}; }
+            if (verifyTunnelPassword(body.password)) {
+                const token = crypto.randomBytes(32).toString('hex');
+                tunnelSessions.add(token);
+                res.writeHead(200, {
+                    'Content-Type': 'application/json',
+                    'Set-Cookie': `mc_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400`,
+                });
+                return res.end(JSON.stringify({ ok: true }));
+            }
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: 'invalid password' }));
+        }
+        if (!tunnelAuthenticated(req)) return tunnelGateResponse(req, res);
+    }
 
     try {
         // --- UI ---
@@ -1771,10 +2254,18 @@ const server = http.createServer(async (req, res) => {
             try {
                 const queryParams = new URLSearchParams(req.url.includes('?') ? req.url.slice(req.url.indexOf('?') + 1) : '');
                 const limit = Math.max(1, Math.min(parseInt(queryParams.get('limit'), 10) || 50, 500));
+                // offset counts back from the newest row -- offset=0 is the most
+                // recent `limit` rows (unchanged default), offset=200 skips those
+                // and returns the next `limit` older ones. Lets History page
+                // backward through the full CSV instead of only ever seeing the
+                // newest window of it.
+                const offset = Math.max(0, parseInt(queryParams.get('offset'), 10) || 0);
 
                 const csv = await fs.readFile(CSV_FILE, 'utf-8');
                 const lines = csv.trim().split('\n').slice(1).filter(l => l.trim());
-                const recentLines = lines.slice(-limit);
+                const end = Math.max(0, lines.length - offset);
+                const start = Math.max(0, end - limit);
+                const recentLines = lines.slice(start, end);
 
                 const rows = [];
                 for (const line of recentLines) {
@@ -1805,7 +2296,11 @@ const server = http.createServer(async (req, res) => {
                         prefillTpsMax: cols.length > 39 ? parseNumOrNull(cols[39]) : null,
                         genTpsMin: cols.length > 40 ? parseNumOrNull(cols[40]) : null,
                         genTpsMax: cols.length > 41 ? parseNumOrNull(cols[41]) : null,
-                        // Full row detail for the expanded row view
+                        // Full row detail for the expanded row view. Indices match
+                        // CSV_HEADERS exactly -- this drifted out of sync with the
+                        // header (every field from promptLatency on was reading
+                        // 2-4 columns to the right of its real value, e.g. gpuTemp
+                        // was actually reading Master VRAM) until this fix.
                         detail: {
                             modelPath: cols[3] || null,
                             ctx: parseNumOrNull(cols[4]),
@@ -1813,36 +2308,37 @@ const server = http.createServer(async (req, res) => {
                             rpc: cols[6] || null,
                             argString: cols[8] || null,
                             launchCommand: cols[9] || null,
-                            promptLatency: parseNumOrNull(cols[15]),
-                            reasonTokens: parseNumOrNull(cols[16]),
+                            promptLatency: parseNumOrNull(cols[12]),
+                            reasonTokens: parseNumOrNull(cols[29]),
                             loadTime: parseNumOrNull(cols[31]),
                             // Hardware stats at completion (master)
-                            gpuUtil: parseNumOrNull(cols[17]),
-                            gpuPwr: parseNumOrNull(cols[18]),
-                            gpuTemp: parseNumOrNull(cols[19]),
-                            cpuUtil: parseNumOrNull(cols[20]),
-                            cpuTemp: parseNumOrNull(cols[21]),
-                            vram: parseNumOrNull(cols[22]),
-                            ram: parseNumOrNull(cols[23]),
-                            // Hardware stats at completion (worker)
-                            wGpuUtil: cols.length > 24 ? parseNumOrNull(cols[24]) : null,
-                            wGpuPwr: cols.length > 25 ? parseNumOrNull(cols[25]) : null,
-                            wGpuTemp: cols.length > 26 ? parseNumOrNull(cols[26]) : null,
-                            wCpuUtil: cols.length > 27 ? parseNumOrNull(cols[27]) : null,
-                            wCpuTemp: cols.length > 28 ? parseNumOrNull(cols[28]) : null,
-                            wVram: cols.length > 29 ? parseNumOrNull(cols[29]) : null,
-                            wRam: cols.length > 30 ? parseNumOrNull(cols[30]) : null,
-                            netThroughput: cols.length > 31 ? parseNumOrNull(cols[31]) : null,
+                            gpuUtil: parseNumOrNull(cols[14]),
+                            gpuPwr: parseNumOrNull(cols[15]),
+                            gpuTemp: parseNumOrNull(cols[16]),
+                            cpuUtil: parseNumOrNull(cols[17]),
+                            cpuTemp: parseNumOrNull(cols[18]),
+                            vram: parseNumOrNull(cols[19]),
+                            ram: parseNumOrNull(cols[20]),
+                            // Hardware stats at completion (worker) -- no
+                            // "Worker CPU Util" column exists in the CSV, only GPU
+                            // util/pwr/temp + CPU temp + VRAM/RAM.
+                            wGpuUtil: cols.length > 21 ? parseNumOrNull(cols[21]) : null,
+                            wGpuPwr: cols.length > 22 ? parseNumOrNull(cols[22]) : null,
+                            wGpuTemp: cols.length > 23 ? parseNumOrNull(cols[23]) : null,
+                            wCpuTemp: cols.length > 24 ? parseNumOrNull(cols[24]) : null,
+                            wVram: cols.length > 25 ? parseNumOrNull(cols[25]) : null,
+                            wRam: cols.length > 26 ? parseNumOrNull(cols[26]) : null,
+                            netThroughput: cols.length > 27 ? parseNumOrNull(cols[27]) : null,
                             // Parsed launch config (structured JSON, if available)
                             config: cols.length > 32 && cols[32] ? (() => { try { return JSON.parse(cols[32]); } catch (e) { return null; } })() : null,
                         }
                     });
                 }
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                return res.end(JSON.stringify({ rows }));
+                return res.end(JSON.stringify({ rows, total: lines.length, hasMore: start > 0 }));
             } catch {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                return res.end(JSON.stringify({ rows: [] }));
+                return res.end(JSON.stringify({ rows: [], total: 0, hasMore: false }));
             }
         }
 
@@ -1987,6 +2483,158 @@ const server = http.createServer(async (req, res) => {
         else if (req.url === '/api/builds' && req.method === 'GET') {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ builds: getLlamaServerBuilds() }));
+        }
+
+        else if (req.url === '/api/worker/config' && req.method === 'GET') {
+            try {
+                const { ssh, port, devices, cache, link } = getRpcWorkerConfig();
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ ssh, port, devices, cache, link }));
+            } catch (err) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: err.message }));
+            }
+        }
+
+        // --- REMOTE ACCESS TUNNEL (Cloudflare quick tunnel + password gate) ---
+        // GET: status (url only while running). POST: {action:'start', password}
+        // arms the gate and starts cloudflared, or {action:'stop'} tears it
+        // down and drops the gate. Both clients (web sidebar, remote CLI) use
+        // these; the CLI's `tunnel stop` subcommand is how you unlock a
+        // dashboard you can no longer reach locally.
+        else if (req.url === '/api/tunnel' && req.method === 'GET') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({
+                active: tunnelProcess !== null && !tunnelStarting,
+                starting: tunnelStarting,
+                url: tunnelUrl || null,
+            }));
+        }
+        else if (req.url === '/api/tunnel' && req.method === 'POST') {
+            let body;
+            try { body = JSON.parse(await parseBody(req)); } catch { body = {}; }
+            if (body.action === 'stop') {
+                const was = tunnelGateActive();
+                stopTunnel();
+                broadcastState('', was ? 'tunnel stopped' : '');
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ active: false }));
+            }
+            if (body.action !== 'start') {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: "action must be 'start' or 'stop'" }));
+            }
+            try {
+                const url = await startTunnel(body.password);
+                broadcastState('', `tunnel up: ${url}`);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ active: true, url }));
+            } catch (err) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: err.message }));
+            }
+        }
+
+        // --- CHAT PROXY (streaming pass-through to the model server) ---
+        // Remote clients (CLI behind the tunnel, browser on the tunnel URL)
+        // reach the model through the SAME tunnel as the dashboard: the body
+        // (messages/tools/chat_template_kwargs/images) passes through verbatim
+        // and the SSE stream is piped straight back. The server's client-
+        // agnostic capture still records every request to CSV + COMPLETION
+        // from llama-server's own stdout, so chat stats work for any client.
+        else if (req.url === '/api/chat' && req.method === 'POST') {
+            if (serverState !== 'ready') {
+                res.writeHead(409, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'no model running' }));
+            }
+            const port = portFromLaunchCommand() || 8080;
+            const body = await parseBody(req, MAX_CHAT_BODY_SIZE);
+            const upstream = http.request({
+                host: '127.0.0.1', port, path: '/v1/chat/completions', method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+            }, (up) => {
+                const headers = { 'Content-Type': up.headers['content-type'] || 'application/json' };
+                if (up.headers['content-type'] && /event-stream/.test(up.headers['content-type'])) {
+                    headers['Cache-Control'] = 'no-cache';
+                    headers['Connection'] = 'keep-alive';
+                }
+                res.writeHead(up.statusCode || 502, headers);
+                up.pipe(res);
+            });
+            upstream.on('error', (err) => {
+                if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'model server unreachable: ' + err.message }));
+            });
+            req.on('close', () => { try { upstream.destroy(); } catch { /* already gone */ } });
+            upstream.end(body);
+            return;
+        }
+
+        // --- SLOTS PROXY (prefill-progress poll; remote-safe twin of :8080/slots) ---
+        else if (req.url === '/api/slots' && req.method === 'GET') {
+            const port = portFromLaunchCommand() || 8080;
+            const req2 = http.request({ host: '127.0.0.1', port, path: '/slots', method: 'GET' }, (up) => {
+                res.writeHead(up.statusCode || 502, { 'Content-Type': up.headers['content-type'] || 'application/json' });
+                up.pipe(res);
+            });
+            req2.on('error', () => {
+                if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify([]));
+            });
+            req2.end();
+            return;
+        }
+
+        // --- KEYLESS WEB SEARCH (harness backing for the web_search tool) ---
+        // DuckDuckGo's HTML endpoint: no API key, no account. Both clients
+        // (CLI chat, web Interactive tab) call this when the model emits a
+        // web_search tool call, so the search implementation lives in one
+        // place. Results are title/url/snippet triples the model can cite.
+        else if (req.url === '/api/web-search' && req.method === 'POST') {
+            let body;
+            try { body = JSON.parse(await parseBody(req)); } catch { body = {}; }
+            const query = String(body.query || '').trim();
+            const num = Math.max(1, Math.min(8, parseInt(body.num || 5, 10) || 5));
+            if (!query) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'query is required' }));
+            }
+            try {
+                const upstream = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
+                    headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0' },
+                    signal: AbortSignal.timeout(15000),
+                });
+                if (!upstream.ok) throw new Error(`search endpoint HTTP ${upstream.status}`);
+                const html = await upstream.text();
+                const clean = (s) => s.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+                // Title and snippet are pulled as two separate flat passes and
+                // zipped by index, rather than one regex spanning both --
+                // DDG puts other markup between a result's title and its
+                // snippet anchor, and a single pattern with a lazy `[\s\S]*?`
+                // gap followed by an OPTIONAL snippet group never backtracks
+                // to find it: the engine satisfies the (?:...)? by matching
+                // it empty at the first position it tries (right after the
+                // title), so the snippet capture was silently empty on every
+                // result. Title and snippet anchors appear once per result in
+                // the same order, so a straight zip lines them up correctly.
+                const titleRe = /<a rel="nofollow" class="result__a" href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+                const snippetRe = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+                const titles = [...html.matchAll(titleRe)];
+                const snippets = [...html.matchAll(snippetRe)].map((s) => clean(s[1]));
+                const results = [];
+                for (const t of titles) {
+                    if (results.length >= num) break;
+                    let url = t[1];
+                    const uddg = url.match(/[?&]uddg=([^&]+)/);
+                    if (uddg) url = decodeURIComponent(uddg[1]);
+                    results.push({ title: clean(t[2]), url, snippet: snippets[results.length] || '' });
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ query, count: results.length, results }));
+            } catch (err) {
+                res.writeHead(502, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'web search failed: ' + err.message }));
+            }
         }
 
         // --- BENCH: run llama-bench from a configured build (Bench tab) ---
@@ -2218,7 +2866,7 @@ const server = http.createServer(async (req, res) => {
             let body;
             try { body = JSON.parse(await parseBody(req)); } catch (e) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Invalid JSON' })); }
 
-            if (llamaProcess) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Running' })); }
+            if (llamaProcess || launchPending) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Running' })); }
 
             let config = body;
             let command, args;
@@ -2256,6 +2904,21 @@ const server = http.createServer(async (req, res) => {
                 }
             } catch (err) {
                 return res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: err.message }));
+            }
+
+            // RPC: start the worker if it isn't serving yet, so an RPC config or
+            // profile boots in one click. An rpcTarget synced from a raw
+            // `--rpc host:port` isn't an SSH target, so that case is skipped.
+            // launchPending blocks a second /api/start while this awaits.
+            if (config.rpcTarget && isValidSSHHost(config.rpcTarget)) {
+                launchPending = true;
+                try {
+                    await ensureRpcWorker(config.rpcTarget, (msg) => { console.log(msg); broadcastState(msg); });
+                } catch (err) {
+                    return res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: `RPC worker: ${err.message}` }));
+                } finally {
+                    launchPending = false;
+                }
             }
 
             currentModel = config.model || config.modelPath || '';
@@ -2319,6 +2982,9 @@ const server = http.createServer(async (req, res) => {
             isRpc = false;
             currentLaunchConfig = null;
             broadcastState();
+            // Drop the RPC forward once llama-server is gone -- unless a new
+            // boot has claimed it in the meantime.
+            setTimeout(() => { if (!llamaProcess && !launchPending) closeRpcTunnel(); }, 4000).unref();
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ status: 'stopped' }));
         }
@@ -2330,7 +2996,7 @@ const server = http.createServer(async (req, res) => {
             const { worker_ssh } = body;
             if (!worker_ssh) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Missing worker_ssh' })); }
             try {
-                const { stdout, stderr } = await runSSHCommand(worker_ssh, 'cd ~/AI/experiment-1 && docker compose -f docker-compose.worker.yml up -d');
+                const { stdout, stderr } = await startRpcWorker(worker_ssh);
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 return res.end(JSON.stringify({ success: true, stdout, stderr }));
             } catch (err) {
@@ -2346,7 +3012,8 @@ const server = http.createServer(async (req, res) => {
             const { worker_ssh } = body;
             if (!worker_ssh) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Missing worker_ssh' })); }
             try {
-                const { stdout, stderr } = await runSSHCommand(worker_ssh, 'cd ~/AI/experiment-1 && docker compose -f docker-compose.worker.yml down');
+                closeRpcTunnel();
+                const { stdout, stderr } = await stopRpcWorker(worker_ssh);
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 return res.end(JSON.stringify({ success: true, stdout, stderr }));
             } catch (err) {
@@ -2361,14 +3028,8 @@ const server = http.createServer(async (req, res) => {
             try { body = JSON.parse(await parseBody(req)); } catch (e) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Invalid JSON' })); }
             const { worker_ssh } = body;
             if (!worker_ssh) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Missing worker_ssh' })); }
-            try {
-                const { stdout } = await runSSHCommand(worker_ssh, 'cd ~/AI/experiment-1 && docker compose -f docker-compose.worker.yml ps --filter status=running -q');
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                return res.end(JSON.stringify({ status: stdout.trim().length > 0 ? 'running' : 'stopped' }));
-            } catch (err) {
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                return res.end(JSON.stringify({ status: 'offline', error: err.message }));
-            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify(await getRpcWorkerStatus(worker_ssh)));
         }
 
         // --- WORKER LOGS ---
@@ -2378,9 +3039,9 @@ const server = http.createServer(async (req, res) => {
             const { worker_ssh } = body;
             if (!worker_ssh) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Missing worker_ssh' })); }
             try {
-                const { stdout, stderr } = await runSSHCommand(worker_ssh, 'cd ~/AI/experiment-1 && docker compose -f docker-compose.worker.yml logs --tail=50');
+                const logs = await getRpcWorkerLogs(worker_ssh);
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                return res.end(JSON.stringify({ logs: stdout || stderr || 'No logs available.' }));
+                return res.end(JSON.stringify({ logs }));
             } catch (err) {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 return res.end(JSON.stringify({ logs: `Failed to fetch logs: ${err.message}` }));
@@ -2420,6 +3081,18 @@ async function initServer() {
     // Bootstrap the shared profiles store from the CLI's legacy file (if the
     // store doesn't exist yet) BEFORE any client can read it.
     await initProfilesStore();
+    // Warm the per-build --help flag cache so buildSupportsFlag (mmproj
+    // offload gating) and the first /api/flags call (CLI flag overlay, web
+    // popover) don't pay for a shellout on the critical path. Fire-and-forget:
+    // a slow/hanging binary just leaves the cache empty, and both callers
+    // degrade gracefully.
+    for (const b of getLlamaServerBuilds()) {
+        if (!cachedFlagReferenceByBuild.has(b.id)) {
+            execFileAsync(b.path, ['--help'], { timeout: 8000, maxBuffer: 1024 * 1024 })
+                .then(({ stdout }) => { cachedFlagReferenceByBuild.set(b.id, parseHelpFlags(stdout)); })
+                .catch(() => { });
+        }
+    }
     // Clean BOTH the model-server port and the monitor port -- an orphaned
     // llama-server from a previous dashboard crash would otherwise keep 8080
     // and make the next launch fail with EADDRINUSE.
@@ -2469,6 +3142,9 @@ async function initServer() {
         }
         if (pythonProcess) {
             try { pythonProcess.kill(); } catch { }
+        }
+        if (tunnelProcess) {
+            try { tunnelProcess.kill(); } catch { }
         }
         process.exit(0);
     };

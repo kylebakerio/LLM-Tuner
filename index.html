@@ -13,6 +13,8 @@
         ::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
         .prose pre { background-color: #111827 !important; padding: 1rem; border-radius: 0.5rem; border: 1px solid #374151; }
         .fade-bottom { mask-image: linear-gradient(to bottom, black 40%, transparent 100%); -webkit-mask-image: linear-gradient(to top, black 40%, transparent 100%); }
+        /* "show thinking" toggle: hide the reasoning blocks transcript-wide */
+        .hide-thinking .reasoning-container { display: none !important; }
 
         /* Horizontal scroll for code/output blocks instead of overflow */
             .output-block, .code-block, #center-output, #right-telemetry {
@@ -146,8 +148,8 @@
                      server4.js). The master always launches natively now (no Docker;
                      see server4.js resolveLaunchCommand) -- RPC is an optional add-on
                      below, off by default, not a separate mode. RPC needs a local
-                     build compiled with GGML_RPC=ON (today's builds aren't -- see
-                     README) and still assumes Docker for the worker side. -->
+                     build compiled with GGML_RPC=ON and a ggml-rpc-server binary
+                     on the worker (dashboard.config.json rpcWorker; see README). -->
                 <div class="p-3 bg-gray-800/50 border border-gray-700/50 rounded-lg space-y-3">
                     <div>
                         <label class="block text-[10px] text-gray-400 mb-0.5">Build <span class="text-indigo-400 cursor-help" title="Which compiled llama-server binary to launch (configured in dashboard.config.json). Different builds can expose different backends/devices for the same physical GPUs -- e.g. a CUDA+Vulkan build shows an extra native CUDA0 device for an NVIDIA card that a Vulkan-only build can only reach through Vulkan. Switching this re-runs device detection automatically.">?</span></label>
@@ -191,9 +193,9 @@
                     <div class="space-y-2 border-t border-gray-700/50 pt-2">
                         <label class="flex items-center gap-2 text-xs font-semibold text-indigo-400">
                             <input type="checkbox" id="rpc-toggle" class="accent-indigo-500 rounded">
-                            Enable RPC Worker <span class="text-indigo-400 cursor-help" title="Adds a remote llama.cpp RPC worker as a second compute target alongside (not instead of) this machine's GPU(s). Requires a local build compiled with GGML_RPC=ON -- see README -- and the worker's own rpc-server/Docker container running.">?</span>
+                            Enable RPC Worker <span class="text-indigo-400 cursor-help" title="Adds a remote llama.cpp RPC worker as a second compute target alongside (not instead of) this machine's GPU(s). Requires a local build compiled with GGML_RPC=ON -- see README -- and ggml-rpc-server running on the worker (Start Worker launches it over SSH).">?</span>
                         </label>
-                        <input type="text" id="worker-ssh" value="kyle4090@169.254.61.173" class="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-xs text-gray-200">
+                        <input type="text" id="worker-ssh" placeholder="user@worker-host" class="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-xs text-gray-200">
 
                         <div id="worker-ssh-controls" class="space-y-2 border-t border-gray-700/50 pt-2 opacity-50">
                             <div class="flex items-center gap-2 mb-2">
@@ -201,6 +203,7 @@
                                 <select id="transport-type" disabled class="flex-1 bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-xs text-gray-200">
                                     <option value="WiFi">Wi-Fi / LAN</option>
                                     <option value="TB4">Thunderbolt 4</option>
+                                    <option value="WAN">Internet (away from home)</option>
                                 </select>
                             </div>
                             <div class="flex justify-between items-center text-[10px]">
@@ -211,6 +214,43 @@
                                 <button id="btn-worker-start" disabled class="flex-1 px-2 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-[10px] font-medium transition-colors">Start Worker</button>
                                 <button id="btn-worker-stop" disabled class="flex-1 px-2 py-1 bg-red-900/30 hover:bg-red-900/50 text-red-400 rounded text-[10px] font-medium transition-colors">Stop</button>
                             </div>
+                        </div>
+                    </div>
+
+                    <!-- Remote access: Cloudflare quick tunnel + hard password
+                         gate. Checking the box reveals a password field; Start
+                         spins cloudflared (spinner until the URL is up) and
+                         ARMS THE GATE ON ALL TRAFFIC (local + tunnel) -- the
+                         only unauthenticated response is the login page itself.
+                         While up: a browser can open this live dash at the
+                         tunnel URL, and a remote CLI can connect to the backend
+                         (llama-cli -s <tunnel-url> --token <pw>). Stop drops
+                         the gate and restores normal local access. -->
+                    <div class="space-y-2 border-t border-gray-700/50 pt-2">
+                        <label class="flex items-center gap-2 text-xs font-semibold text-indigo-400">
+                            <input type="checkbox" id="tunnel-toggle" class="accent-indigo-500 rounded">
+                            Remote access (Cloudflare tunnel)
+                            <span class="text-indigo-400 cursor-help" title="Starts a Cloudflare quick tunnel (trycloudflare.com, no account) to this dashboard and arms a hard password gate on ALL traffic. While up: a browser can open the live web dash at the tunnel URL, and a remote CLI can connect to the local backend. Your local dashboard also asks for the password after a refresh. Stop drops the gate.">?</span>
+                        </label>
+                        <div id="tunnel-controls" class="hidden space-y-2 border-t border-gray-700/50 pt-2">
+                            <div class="flex gap-2">
+                                <input type="password" id="tunnel-password" placeholder="password (min 4 chars)" class="flex-1 bg-gray-900 border border-gray-700 rounded-md px-3 py-1.5 text-xs text-gray-200" autocomplete="new-password">
+                                <button id="btn-tunnel-start" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-[10px] font-medium transition-colors">Start</button>
+                            </div>
+                            <div id="tunnel-status-row" class="hidden flex justify-between items-center text-[10px]">
+                                <span class="text-gray-400">Tunnel Status:</span>
+                                <span id="tunnel-status-badge" class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-gray-850 text-gray-500">DOWN</span>
+                            </div>
+                            <div id="tunnel-url-row" class="hidden">
+                                <label class="block text-[9px] text-gray-500 mb-0.5">Tunnel URL (share this)</label>
+                                <div class="flex gap-1">
+                                    <input type="text" id="tunnel-url" readonly class="flex-1 bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-[10px] text-cyan-300 font-mono">
+                                    <button id="btn-tunnel-copy" class="px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded text-[10px]">Copy</button>
+                                </div>
+                            </div>
+                            <div id="tunnel-busy" class="hidden text-[10px] text-indigo-400 animate-pulse">starting cloudflared… (waits for the URL, up to 30 s)</div>
+                            <div id="tunnel-error" class="hidden text-[10px] text-red-400"></div>
+                            <button id="btn-tunnel-stop" disabled class="w-full px-2 py-1 bg-red-900/30 hover:bg-red-900/50 text-red-400 rounded text-[10px] font-medium transition-colors">Stop tunnel</button>
                         </div>
                     </div>
 
@@ -373,6 +413,10 @@
                         <label class="block text-[10px] text-gray-400 mb-1">mmproj File Path</label>
                         <input type="text" id="server-mmproj-path" placeholder="/path/to/mmproj-F16.gguf" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-[11px] font-mono">
                     </div>
+                    <label class="flex items-center gap-2 text-[11px] text-gray-300">
+                        <input type="checkbox" id="mmproj-offload-toggle" class="accent-indigo-500 rounded">
+                        Keep mmproj in system RAM (don't offload to GPU) <span class="text-indigo-400 cursor-help" title="--no-mmproj-offload -- where the CLIP projector lives. Unchecked (default): the projector is loaded into VRAM alongside the model, same as llama.cpp's own default. Checked: the projector stays in system RAM/CPU, freeing ~0.9 GB of VRAM for the F16 Qwen3.8 mmproj -- the vision encoder only runs while an image is being embedded, so CPU execution only costs you on the image-embed step, not on text generation. Only sent to the server when checked (newer llama.cpp builds only; older builds ignore the option).">?</span>
+                    </label>
                 </div>
                 <div class="pt-2 border-t border-gray-700/40">
                     <label class="block text-[10px] text-gray-400 mb-1">Load Mode <span class="text-indigo-400 cursor-help" title="-lm/--load-mode MODE (default: mmap). none: no special loading mode. mmap: memory-map the model file. mlock: force the model to stay resident in RAM, never swapped/compressed. mmap+mlock: both. dio: use DirectIO if available.">?</span></label>
@@ -566,6 +610,7 @@
                                 <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Gen t/s</th>
                                 <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900" title="Speculative draft acceptance: accepted / generated draft tokens for this request. Blank when speculative decoding was off or nothing was drafted.">Draft acc</th>
                                 <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Wall (s)</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900" title="Peak GPU temp seen during this request (Master/Worker). Orange = a real thermal throttle was seen (hw_thermal_slowdown, or sw_thermal_slowdown corroborated by a hot reading -- see isRealThermal).">Thermal</th>
                             </tr>
                         </thead>
                         <tbody id="monitor-requests-body" class="text-gray-300"></tbody>
@@ -601,11 +646,20 @@
                                 <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Gen t/s</th>
                                 <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900" title="Speculative draft acceptance: accepted / generated draft tokens for this request. Blank when speculative decoding was off or nothing was drafted.">Draft acc</th>
                                 <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Wall (s)</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900" title="Peak GPU temp seen during this request (Master/Worker). Orange = a real thermal throttle was seen (hw_thermal_slowdown, or sw_thermal_slowdown corroborated by a hot reading -- see isRealThermal).">Thermal</th>
                             </tr>
                         </thead>
                         <tbody id="history-requests-body" class="text-gray-300"></tbody>
                     </table>
                     <div id="history-requests-empty" class="hidden text-center text-gray-600 text-sm py-8">No requests logged yet.</div>
+                </div>
+                <!-- History only ever shows a fetched window of the CSV (never the
+                     whole thing at once -- it can grow into the thousands of rows).
+                     This bar makes that window visible and gives a way past it,
+                     instead of older requests silently being unreachable. -->
+                <div class="shrink-0 flex items-center justify-between gap-3 px-4 py-2 border-t border-gray-800 text-[11px] text-gray-500">
+                    <span id="history-load-status">Loading…</span>
+                    <button id="history-load-older" type="button" class="hidden px-2.5 py-1 rounded border border-gray-700 text-gray-300 hover:bg-gray-800 hover:border-gray-600">Load 100 older</button>
                 </div>
             </div>
         </div>
@@ -855,21 +909,31 @@
                     <span class="text-xs text-gray-500">System Prompt:</span>
                     <input type="text" id="system-prompt" class="flex-1 ml-2 bg-transparent border-b border-gray-700 focus:border-indigo-500 text-xs text-gray-300 px-1 py-0.5 focus:outline-none">
                     <span class="text-xs text-gray-500 ml-3">Thinking:</span>
-                    <select id="chat-thinking" title="Sent per-request as chat_template_kwargs.enable_thinking (needs --jinja; template must support it)" class="ml-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-300 px-1 py-0.5">
+                    <select id="chat-thinking" title="Sent per-request as chat_template_kwargs (needs --jinja; template must support it). Levels map to reasoning_effort for templates that read it (e.g. Qwen3.8)." class="ml-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-300 px-1 py-0.5">
                         <option value="">template default</option>
-                        <option value="on">on</option>
+                        <option value="xhigh" selected>on (xhigh)</option>
+                        <option value="medium">on (medium)</option>
+                        <option value="low">on (low)</option>
                         <option value="off">off</option>
                     </select>
+                    <label class="flex items-center gap-1 text-xs text-gray-500 ml-3 cursor-pointer" title="Show or hide the thinking/reasoning blocks in the transcript (the model still thinks either way)">
+                        <input type="checkbox" id="chat-show-thinking" checked class="accent-indigo-500 rounded">
+                        show thinking
+                    </label>
+                    <label class="flex items-center gap-1 text-xs text-gray-500 ml-3 cursor-pointer" title="Expose a web_search tool to the model. When it calls one, the dashboard performs a keyless web search and feeds the results back; the model may call it up to 2 times per answer.">
+                        <input type="checkbox" id="chat-web-search" class="accent-indigo-500 rounded">
+                        allow web search
+                    </label>
                     <input type="text" id="chat-kwargs" placeholder='extra kwargs JSON, e.g. {"thinking_level":"high"}' title="Merged into chat_template_kwargs per request. Model/template specific." class="w-56 ml-2 bg-transparent border-b border-gray-700 focus:border-indigo-500 text-[11px] font-mono text-gray-300 px-1 py-0.5 focus:outline-none">
                 </div>
                 <textarea id="user-prompt" rows="3" disabled class="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-gray-100 disabled:opacity-50 resize-none shadow-sm placeholder-gray-500" placeholder="Waiting for server..."></textarea>
                 <div class="flex justify-between items-center">
                     <div class="flex items-center gap-2">
                         <span id="input-token-count" class="text-xs text-gray-500">~0 tokens</span>
-                        <button type="button" id="attach-image-btn" class="text-gray-500 hover:text-gray-300 transition-colors p-1 rounded hover:bg-gray-800" title="Attach image(s) for multimodal models" disabled>
+                        <button type="button" id="attach-image-btn" class="text-gray-500 hover:text-gray-300 transition-colors p-1 rounded hover:bg-gray-800" title="Attach image(s), a video, or audio for multimodal models -- video/audio go in via llama.cpp's native input_video/input_audio support (server-side ffmpeg frame sampling + a built-in audio decoder), so this only works if the loaded model/mmproj actually supports it" disabled>
                             <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
                         </button>
-                        <input type="file" id="image-file-input" accept="image/*" multiple class="hidden">
+                        <input type="file" id="image-file-input" accept="image/*,video/*,audio/*" multiple class="hidden">
                     </div>
                     <div class="flex-1 flex justify-center">
                         <span id="status-indicator" class="text-xs text-indigo-400 hidden animate-pulse">Generating...</span>

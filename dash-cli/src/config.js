@@ -11,6 +11,7 @@ export function configDir() {
 const DEFAULTS = {
   server: 'http://localhost:3000',
   telemetryMs: 1000,
+  token: null, // optional tunnel-gate password (prefer --token / MC_TOKEN)
 };
 
 export async function loadConfig() {

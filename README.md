@@ -37,7 +37,11 @@ directory) or from the local Hugging Face cache
 
 ## UI tabs
 
-- **Interactive** — the dashboard's own chat client against the launched model.
+- **Interactive** — the dashboard's own chat client against the launched
+  model: image attach (paths or file picker), a per-request thinking level
+  (`template default` / `on` xhigh/medium/low / `off`, via
+  `chat_template_kwargs`), a show/hide-thinking display toggle, and an
+  "allow web search" tool (keyless DuckDuckGo, run server-side).
 - **Monitor** — per-request telemetry, session-only. Capture is
   *client-agnostic*: the server parses `llama-server`'s own `print_timing`
   lines, so a request from any client gets a row (prompt/gen tokens + tps,
@@ -79,34 +83,52 @@ RPC Worker is a separate, optional toggle (off by default) that adds a remote
 Enabling it forces GPU B back to "None" -- the split is always exactly 2-way
 (this machine vs. the worker), not a 3-way local+local+remote split.
 
-**RPC needs a local build compiled with `-DGGML_RPC=ON`.** The
-`build-cuda-vulkan` build in `../llama-official/llama.cpp/build-cuda-vulkan`
-was compiled without it (`GGML_RPC:BOOL=OFF` in its `CMakeCache.txt`), so
-using RPC with that build will fail until it's rebuilt with RPC enabled, e.g.:
+**RPC needs a local build compiled with `-DGGML_RPC=ON`** (the Vulkan
+`build/` has it as of 2026-09-13; `build-cuda-vulkan` does not):
 
 ```bash
-cmake -B build-cuda-vulkan -DGGML_CUDA=ON -DGGML_VULKAN=ON -DGGML_RPC=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build-cuda-vulkan --config Release -j$(nproc)
+cmake -B build -DGGML_RPC=ON
+cmake --build build --config Release -j$(nproc) --target llama-server ggml-rpc-server llama-bench
 ```
 
-The worker side is still assumed to run via Docker (`docker-compose.worker.yml`,
-started/stopped over SSH by the RPC Worker box's Start/Stop buttons) --
-unchanged by this. Whether the worker actually needs Docker either is an open
-question, just not one this covers.
+**The worker runs a bare `ggml-rpc-server` binary -- no Docker.** It's
+configured by the `rpcWorker` block in `dashboard.config.json` (`ssh`,
+`port`, `binary`, `devices`, `logFile`; see the example file). The RPC Worker
+box's Start/Stop/Status/Logs buttons (and dash-cli's `w`) SSH to the worker
+and run `setsid nohup <binary> -H 0.0.0.0 -p <port> -d <devices>`,
+`pkill -x`, `pgrep -x`, and `tail` on the log file. SSH must work
+non-interactively (`BatchMode=yes`) for the `user@host` in the worker field.
 
-**Known gap: RPC doesn't currently pin the local device list.** When RPC is
-on, `resolveLaunchCommand` (server4.js) passes `--rpc host:port --split-mode
-layer -ts N,M` but no `-dev` flag, relying on llama-server's own device
-auto-detection to land on exactly 2 devices (the one local GPU + the RPC
-worker). That's only actually 2 devices when there's just one local GPU
-available. With the eGPU reconnected, auto-detection would see both local
-GPUs *and* the RPC device -- 3 devices against a 2-value `-ts` -- so RPC +
-local dual-GPU is untested and likely broken until this is fixed. The GUI
-forces GPU B to "None" whenever RPC is on specifically to dodge this in the
-common case; it doesn't fix the underlying command. Verify `--list-devices`
-output on the rebuilt binary and figure out the right explicit `-dev` list
-(does it need the RPC device named in it too, and if so what's its id?)
-before trusting RPC together with a second local GPU.
+The worker binary must speak the same RPC protocol major version (and a
+minor version no newer) as the master -- build it from the **same llama.cpp
+commit**. The worker laptop has no build toolchain, so it's built here as a
+portable binary (ggml linked statically; still needs the system libstdc++,
+libgomp and libvulkan) and copied over:
+
+```bash
+cmake -B build-rpc-worker -DGGML_VULKAN=ON -DGGML_RPC=ON -DBUILD_SHARED_LIBS=OFF \
+  -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release \
+  -DVulkan_GLSLC_EXECUTABLE=/home/kyle/Downloads/1.4.357.0/x86_64/bin/glslc
+cmake --build build-rpc-worker -j$(nproc) --target ggml-rpc-server
+scp build-rpc-worker/bin/ggml-rpc-server laptop:llama-rpc/
+```
+
+(`GGML_NATIVE=OFF` because the worker's CPU differs from this one; the
+explicit `glslc` because miniconda's older `glslc` on PATH can't compile the
+coopmat2 shaders.) The worker needs only the Vulkan loader and the GPU
+driver's ICD. Keep `rpcWorker.devices` pinned to one device: by default
+`rpc-server` serves *every* non-CPU device, which would add extra RPC
+devices and break the 2-way `-ts`.
+
+**Device list is pinned when RPC is on.** With GPU A set, `resolveLaunchCommand`
+emits `--rpc host:port ... -dev <GPU A>,RPC0` (RPC devices are named `RPC<n>`
+by ggml-rpc, numbered across all `--rpc` servers; `--rpc` must come before
+`-dev`), so `-ts N,M` always maps N to the local GPU and M to the worker.
+`llama-server --rpc host:port --list-devices` shows the names. RPC together with a local GPU B (3-way split) is still
+unsupported -- the GUI forces GPU B to "None" when RPC is on.
+
+`ggml-rpc-server` has no authentication; it listens on the LAN while running.
+Stop it when you're done.
 
 ## What stops a running model server
 
@@ -128,13 +150,46 @@ otherwise block the next launch with EADDRINUSE. The flip side: restarting
 the dashboard while a model is *deliberately* running kills it too, so
 expect to hit "Boot Cluster" again after any restart (pm2 or manual).
 
+## Remote access (Cloudflare tunnel + password gate)
+
+The sidebar's **Remote access (Cloudflare tunnel)** toggle (or
+`POST /api/tunnel`) publishes the dashboard to a random
+`https://xxx.trycloudflare.com` via a Cloudflare quick tunnel
+(`cloudflared tunnel`, no account) and arms a **hard password gate on all
+traffic** at the same time. While it's up:
+
+- a **browser** can open the live web dash at the tunnel URL — it lands on a
+  login page, and the password sets an `mc_session` cookie;
+- a **remote CLI** can reach the local backend:
+  `llama-cli -s https://xxx.trycloudflare.com --token <password>`
+  (the CLI probes the gate and prompts for the password, or takes
+  `--token`/`MC_TOKEN`).
+
+The gate is **global**, not just for tunnel traffic: cloudflared forwards
+from localhost, so tunnel and local requests are indistinguishable — while
+the tunnel is up, *every* request (including your own local browser after a
+refresh) must carry `Authorization: Bearer <password>` or the session
+cookie. The only unauthenticated response is the gate page itself. Stopping
+the tunnel (sidebar, `llama-cli tunnel stop`, or restarting the dashboard)
+drops the gate and local access returns to normal.
+
+Security notes: the password is held in server memory only (PBKDF2 + a
+random per-boot salt) — **a dashboard restart revokes the tunnel, the gate,
+and every session**, and the URL changes on every start. A failed tunnel
+start clears all gate state, so it can never leave you locked out.
+`cloudflared` must be on the host's `PATH`; the dashboard's shutdown handler
+kills the cloudflared child on SIGINT/SIGTERM. See `API.md`
+("Remote access (tunnel gate)") for the exact endpoints.
+
 ## Offline / no external dependencies
 
 The frontend used to load Tailwind, Chart.js, and marked from public CDNs, so
 the dashboard wouldn't render without internet access. Those are now vendored
 locally under `vendor/` (`vendor/chart.js`, `vendor/marked.min.js`,
 `vendor/tailwind.css`) and referenced from `index.html` via relative paths, so
-the site works fully offline once served by `server4.js`.
+the site works fully offline once served by `server4.js`. (The one
+internet-reachable feature is the tunnel's keyless DuckDuckGo web search,
+used only when a chat enables the web-search tool.)
 
 `vendor/tailwind.css` is a pre-built, purged stylesheet (via the Tailwind CLI,
 config in `tailwind.config.js`) rather than the Tailwind CDN's in-browser JIT

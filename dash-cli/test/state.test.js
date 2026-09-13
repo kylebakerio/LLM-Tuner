@@ -74,6 +74,16 @@ test('telemetry fills buffers and computes net rate', () => {
   assert.equal(s.telemetry.master.gpu_util, 60);
 });
 
+test('worker buffers skip monitor.py error-fallback samples (either vendor flag)', () => {
+  const appStore = createAppStore();
+  const master = { gpu_name: 'AMD Radeon RX 7900 XTX', gpu_util: 50, amdgpu_top_error: false };
+  appStore.onTelemetry({ t: 1000, stats: { master, worker: { gpu_name: 'Unknown', gpu_util: 0, nvidia_smi_error: true } } });
+  appStore.onTelemetry({ t: 2000, stats: { master, worker: { gpu_name: 'X', gpu_util: 0, amdgpu_top_error: true } } });
+  assert.equal(appStore.store.getState().buffers.wUtil.length, 0);
+  appStore.onTelemetry({ t: 3000, stats: { master, worker: { gpu_name: 'NVIDIA GeForce RTX 4090 Laptop GPU', gpu_util: 70, nvidia_smi_error: false } } });
+  assert.deepEqual(appStore.store.getState().buffers.wUtil, [70]);
+});
+
 test('backfill dedupes against live completions', () => {
   const appStore = createAppStore();
   appStore.backfillCompletions([

@@ -6,8 +6,12 @@ the terminal UI (`llama-cli/`). This document is the source of truth when
 adding a third client or changing a payload — update it in the same change.
 
 Base URL: `http://localhost:3000` (the server binds all interfaces).
-Auth: none (localhost tooling). A token scheme is planned for LAN use —
-see `llama-cli/PLAN.md` §7.1.
+Auth: none by default (localhost tooling). The one exception is the
+**tunnel gate**: while the Cloudflare quick tunnel is running, *every*
+request (local or remote) must carry `Authorization: Bearer <password>`
+or a valid `mc_session` cookie — see **Remote access (tunnel gate)**
+below. The gate is armed/disarmed together with the tunnel and never
+persisted.
 
 ## GET /api/status — SSE state stream
 
@@ -81,7 +85,12 @@ Optional `rawCommand` field: when non-empty it is the source of truth —
 it is tokenized (quote-aware) and run verbatim, and `-m`/`--port`/`--rpc`
 are synced back into the structured config. Without it, the command is
 resolved from the structured fields (modelPath, build, ctx, ngl, port
-required; devices/tensorSplit/rpcTarget/spec/sampling/argString optional).
+required; devices/tensorSplit/rpcTarget/mmproj/mmprojOffload/spec/sampling/
+argString optional). `mmprojEnabled` + `mmprojPath` emit `--mmproj PATH`;
+`mmprojOffload: false` additionally emits `--no-mmproj-offload` (keep the
+projector in system RAM instead of VRAM) — only for builds whose `--help`
+reference lists the flag (checked via the boot-warmed cache behind
+`GET /api/flags`).
 
 - `200 { "status": "launching" }`
 - `400 { "error": "..." }` — already running, or invalid config
@@ -222,5 +231,109 @@ server holds VRAM.
 
 ## Worker (RPC over SSH)
 
+### GET /api/worker/config
+`200 { "ssh", "port", "devices" }` from `dashboard.config.json`'s `rpcWorker`
+block (used to seed the GUI's worker field).
+
 ### POST /api/worker/start `{worker_ssh}` · /api/worker/stop · /api/worker/status · /api/worker/logs
-Manage the remote RPC worker container via SSH + docker compose.
+Manage the remote `ggml-rpc-server` process over SSH (no Docker): start runs
+it detached with `-H 0.0.0.0 -p <port> [-d <devices>]` and fails with the log
+tail if it exits within 3 s; stop is `pkill -x` (SIGKILL after 3 s); status
+returns `{ "status": "running" | "stopped" | "offline" }` (`offline` = SSH
+failed); logs returns `{ "logs" }`, the last 50 lines of `rpcWorker.logFile`.
+
+## Remote access (tunnel gate)
+
+A Cloudflare **quick tunnel** (`cloudflared tunnel --url http://127.0.0.1:3000`,
+trycloudflare.com — no account) can publish this dashboard to a random
+`https://xxx.trycloudflare.com`. Because cloudflared forwards from localhost,
+tunnel and local traffic are indistinguishable, so starting the tunnel **arms
+a global password gate**: while it is up, every request (static files, REST,
+SSE — local or remote) must authenticate. The only unauthenticated response
+is the gate itself. Stopping the tunnel drops the gate; local use is exactly
+as before.
+
+The gate is checked before any route. Two credential forms are accepted,
+checked per request:
+
+- `Authorization: Bearer <password>` — for CLIs and scripts (e.g.
+  `llama-cli -s https://xxx.trycloudflare.com --token <pw>`).
+- `mc_session=<token>` cookie — for browsers, set by the login route below
+  (HttpOnly, SameSite=Lax, 24 h). Tokens live in memory and die on restart.
+
+The password is stored as PBKDF2-HMAC-SHA256 (200k iterations) against a
+**random per-boot salt**; nothing is persisted, so restarting the dashboard
+revokes the tunnel, the gate, and every session. A failed tunnel start clears
+all gate state (it can never leave the dashboard locked with no working
+password).
+
+### GET /api/tunnel
+`200 { "active": <bool>, "starting": <bool>, "url": "<https://…|null>" }`
+`active` is true only once cloudflared has produced a URL.
+
+### POST /api/tunnel
+Body `{ "action": "start", "password": "…" }` (password min 4 chars) or
+`{ "action": "stop" }`.
+
+- start: `200 { "active": true, "url": "https://xxx.trycloudflare.com" }` —
+  blocks until the URL appears (≤ 30 s). `400 { "error": "…" }` if the
+  password is too short, cloudflared is missing/failed, or a tunnel is
+  already running.
+- stop: `200 { "active": false }`.
+
+While the gate is armed, a request without credentials gets:
+- `401` + the gate HTML page, when `Accept` includes `html` (browsers);
+- `401 { "error": "authentication required (tunnel gate active)" }` otherwise
+  (API/SSE clients — the CLI turns this into a password prompt).
+
+### POST /api/tunnel/login
+The **only** route reachable while the gate is armed. Body `{ "password" }`.
+- `200 { "ok": true }` + `Set-Cookie: mc_session=…` (correct password).
+- `401 { "error": "invalid password" }`.
+
+Requires `cloudflared` on the dashboard host's `PATH`. The dashboard's
+`shutdownHandler` (SIGINT/SIGTERM) kills the cloudflared child, so the
+tunnel dies with the process.
+
+## Chat (streaming pass-through to the model server)
+
+### POST /api/chat
+A thin streaming proxy to the running `llama-server`'s
+`/v1/chat/completions`. The request body (messages, `tools`,
+`chat_template_kwargs` — e.g. `{ "enable_thinking": false,
+"reasoning_effort": "low" }` — `max_tokens`, `stream`, `image_url` content
+parts) passes through **verbatim**, and the upstream response (SSE or JSON)
+is piped straight back, so both the web UI and the CLI can share one
+implementation and stream identically.
+
+- The model port is derived from the current launch command
+  (`portFromLaunchCommand()`, default 8080).
+- `409 { "error": "no model running" }` when the server state isn't `ready`.
+- `502` when the model server is unreachable.
+- Client abort destroys the upstream request.
+
+This is how the CLI's Chat mode and the web UI talk to the model; it is the
+tunnel-safe twin of hitting `:8080` directly. The server's client-agnostic
+capture (CSV + `COMPLETION`) still records every request, from any client.
+
+### GET /api/slots
+A GET proxy to the model server's `/slots` (same port derivation as
+`/api/chat`). Used by the sidebar's prefill/progress poll so it works
+through a tunnel instead of hardcoding `localhost:8080`. `409` with no model
+running, `502` if unreachable.
+
+## Web search (keyless, server-side)
+
+### POST /api/web-search
+Keyless DuckDuckGo HTML search, run **server-side** so no client needs an
+API key and the same code serves the web UI and the CLI. Body
+`{ "query", "num"? }` (`num` clamped to 1–8, default 5).
+
+- `200 { "query", "count", "results": [ { "title", "url", "snippet" } ] }`
+  (DDG redirect wrappers are decoded to the real URL).
+- `400 { "error": "query is required" }` · `502 { "error": "web search failed: …" }`
+  (15 s upstream timeout).
+
+Used as the `web_search` tool in the chat modes: the model emits a tool call,
+the client executes it here, and feeds the JSON result back as a `tool`
+message.

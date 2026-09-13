@@ -47,15 +47,23 @@ export function FuzzyList({ title, items, height = 12, onSelect, onCancel }) {
     if (key.escape) return onCancel();
     // Note: 'q' deliberately does NOT cancel here -- it's a filter character
     // (the model list is full of Qwen* names). Esc cancels.
-    if (key.up || (input === 'k' && !key.ctrl)) return setSel((s) => (s - 1 + n) % n);
-    if (key.down || (input === 'j' && !key.ctrl)) return setSel((s) => (s + 1) % n);
+    // ink 5 names the arrow flags upArrow/downArrow (ink <=4: up/down).
+    if (key.upArrow || (input === 'k' && !key.ctrl)) return setSel((s) => (s - 1 + n) % n);
+    if (key.downArrow || (input === 'j' && !key.ctrl)) return setSel((s) => (s + 1) % n);
     if (key.return) {
       const f = filtered[sel];
       return f ? onSelect(f.it) : null;
     }
     if (key.backspace) return setQuery((q) => q.slice(0, -1));
-    if (input && input.length === 1 && !key.ctrl && !key.meta && !key.up && !key.down && input !== ' ') {
-      return setQuery((q) => (q + input).slice(0, 80));
+    if (input && !key.ctrl && !key.meta && !key.upArrow && !key.downArrow) {
+      // A middle-click / clipboard paste arrives as ONE multi-char event;
+      // append it whole (control chars stripped, same rule as Chat's prompt
+      // input) instead of dropping everything over one character. A bare
+      // space is still noise -- a typed space changes nothing a subsequence
+      // match would find, and pastes keep their INNER spaces.
+      if (input === ' ') return;
+      const clean = input.replace(/[\u0000-\u001f\u007f]/g, '');
+      if (clean) return setQuery((q) => (q + clean).slice(0, 80));
     }
   });
 

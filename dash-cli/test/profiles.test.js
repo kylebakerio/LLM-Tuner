@@ -69,6 +69,31 @@ test('profiles: web-shaped entries (config wrapper) unwrap to config', async () 
   assert.equal(list.webprof.fa, true);
 });
 
+test('profiles: saveProfile never persists rawCommand (duplicating a web profile included)', async () => {
+  const { saveProfile, listProfiles } = await import('../src/profiles.js');
+  const client = mockClient({
+    webprof: { config: { modelPath: '/w/m.gguf', rawCommand: '/x/llama-server -m /w/other.gguf', rpcTarget: 'laptop', transport: 'TB4' }, savedAt: 1 },
+  });
+  const cfg = (await listProfiles(client)).webprof;
+  await saveProfile(client, 'copy', cfg);
+  const stored = client.state.profiles.copy.config;
+  assert.equal('rawCommand' in stored, false);
+  assert.equal(stored.rpcTarget, 'laptop', 'RPC fields round-trip with the web');
+  assert.equal(stored.transport, 'TB4');
+});
+
+test('profiles: listProfileEntries sorts by lastLoadedAt/savedAt, newest first', async () => {
+  const { listProfileEntries } = await import('../src/profiles.js');
+  const client = mockClient({
+    a: { config: { modelPath: '/a' }, savedAt: 10, lastLoadedAt: null },
+    b: { config: { modelPath: '/b', rpcTarget: 'laptop' }, savedAt: 5, lastLoadedAt: 30 },
+    c: { config: { modelPath: '/c' }, savedAt: 20, lastLoadedAt: null },
+  });
+  const entries = await listProfileEntries(client);
+  assert.deepEqual(entries.map((e) => e.name), ['b', 'c', 'a']);
+  assert.equal(entries[0].config.rpcTarget, 'laptop');
+});
+
 test('profiles: client-side validation and server errors surface cleanly', async () => {
   const { saveProfile, deleteProfile } = await import('../src/profiles.js');
   const client = mockClient();

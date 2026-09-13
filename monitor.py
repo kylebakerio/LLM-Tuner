@@ -217,9 +217,22 @@ class HardwareMonitorHandler(http.server.SimpleHTTPRequestHandler):
             req = json.loads(post_data.decode('utf-8'))
 
             stats = {"master": self.get_stats()}
+            # A master host with no NVIDIA GPU (the desktop with only the 7900
+            # XTX) gets its GPU fields from amdgpu_top instead; CPU/RAM/net stay
+            # from get_stats(). That AMD card is then the master, so it must not
+            # also be reported as a local second GPU below.
+            master_is_amd = False
+            if stats["master"].get("nvidia_smi_error"):
+                amd = self.get_amd_stats()
+                if not amd.get("amdgpu_top_error"):
+                    for key in ("gpu_name", "gpu_throttle", "throttle_reasons", "vram_used",
+                                "vram_total", "process_vram", "gpu_pwr", "gpu_temp", "gpu_util"):
+                        stats["master"][key] = amd[key]
+                    stats["master"]["nvidia_smi_error"] = False
+                    master_is_amd = True
             worker_ssh = req.get('worker_ssh', '').strip()
             local_second_gpu = req.get('local_second_gpu', '').strip()
-            if local_second_gpu == 'amd':
+            if local_second_gpu == 'amd' and not master_is_amd:
                 # Local-multi-gpu launch mode: "worker" slot is the second GPU on
                 # THIS machine (the AMD eGPU), not a remote SSH host.
                 stats['worker'] = self.get_amd_stats()

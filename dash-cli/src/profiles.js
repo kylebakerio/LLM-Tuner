@@ -12,6 +12,8 @@
 // ~/.llama-cli/profiles.json was imported by the server at first boot; it is
 // no longer written.)
 
+import { sortProfileEntries } from './launchconfig.js';
+
 function unwrap(client, err) {
   // fetch rejects with an opaque TypeError when the server is unreachable --
   // say what's actually wrong, since profiles now live on the dashboard.
@@ -45,9 +47,13 @@ export function loadProfiles(client) {
 export async function saveProfile(client, name, cfg) {
   if (!name || !String(name).trim()) throw new Error('Profile name is required');
   if (!cfg || typeof cfg !== 'object') throw new Error('Nothing to save');
+  // Never persist the web's rawCommand from the CLI: /api/start runs a
+  // non-empty rawCommand VERBATIM, so a stale one would silently override
+  // every structured field the user edited here.
+  const { rawCommand, ...config } = cfg;
   return call(client, async () => {
-    await client.postJson('/api/profiles', { name: String(name).trim(), config: cfg });
-    return cfg;
+    await client.postJson('/api/profiles', { name: String(name).trim(), config });
+    return config;
   });
 }
 
@@ -65,6 +71,12 @@ export function listProfiles(client) {
       Object.entries(doc.profiles).map(([n, e]) => [n, e && e.config ? e.config : e]),
     );
   });
+}
+
+// [{ name, config, savedAt, lastLoadedAt }], most-recently-used first (the
+// Launch picker and `profile list` order, same as the web dropdown).
+export function listProfileEntries(client) {
+  return call(client, async () => sortProfileEntries((await loadProfiles(client)).profiles));
 }
 
 // Record "used now" so the shared profile list (web + CLI) can sort by

@@ -141,10 +141,53 @@ router, SSE client, and store are built to be mode-agnostic from day one.
     title bars, paired half-width panels (GPU0|GPU1, Tokens|Completed,
     System|Log), braille sparklines (2 samples/char), full-width
     color-graded bars, right-aligned numeric columns.
-  - **Small fixes:** backfill now retries on failure; ring buffers are
-    replaced immutably in the store (no mutation inside setState); FuzzyList
-    'q' filters instead of cancelling; global `--server` flag on the TUI;
-    pasted multi-char key events can't blank the mode area.
+   - **Small fixes:** backfill now retries on failure; ring buffers are
+     replaced immutably in the store (no mutation inside setState); FuzzyList
+     'q' filters instead of cancelling; global `--server` flag on the TUI;
+     pasted multi-char key events can't blank the mode area.
+
+### Phase 2 status (M3, built 2026-08-24)
+
+- **Arrow-key bug (blocked usability):** ink 5 renamed the keypress flags
+  from `key.up/down/left/right` to `key.upArrow/downArrow/leftArrow/
+  rightArrow`; the TUI was written against the ink <=4 names, so the arrow
+  keys (and `←` group-switch / `→` enter-edit) were silently dead. Fixed in
+  launch.js + fuzzylist.js; verified by pty key injection (CSI *and* SS3
+  encodings).
+- **Monitor: no layout thrashing.** Every panel is now a FIXED height in
+  every state: GPU boxes always 4 lines (util/vram/pow/throttle) including
+  offline/waiting; COMPLETED always header + 3 rows (dim padding, ABORTED
+  rows reserve the suffix in the row budget so they can't wrap); SYSTEM
+  always 3 lines; LOG always 3 lines; one permanent status line under the
+  state line (stop-failure > server error > stop-confirm > blank). ink
+  collapses empty-`Text` to zero height, so pads are spaces, not `''`.
+  Covered by `test/layout.test.js` (9 states, equal frame height).
+- **Throttle badges made accurate** (same rules as server4.js
+  `isRealThermal`, DEPTH-TESTING §4.5): `hw_thermal` authoritative;
+  `sw_thermal` trusted only at ≥75 C (it asserts at idle/low clocks on this
+  card); `sw_power_cap` is the permanent 80 W firmware cap -- shown dim as
+  reference, never an alarm; `hw_power_brake` yellow. The permanent throttle
+  line is what killed the vertical bounce (it appeared/disappeared with
+  every telemetry sample).
+- **mmproj CPU offload option** (all three layers): `mmprojOffload` launch
+  key -- `false` emits `--no-mmproj-offload` (projector stays in system
+  RAM, frees ~0.9 GB VRAM on the F16 Qwen3.8 mmproj), default on =
+  llama.cpp's own GPU default so nothing changes for existing configs.
+  Server gates the flag on the build's `--help` reference (boot-warmed
+  `cachedFlagReferenceByBuild`; unknown build assumed modern); web checkbox
+  "Offload mmproj to GPU"; CLI toggle in the chat group. Contract-tested
+  against the real `buildLlamaArgs` (7 checks, `buildLlamaArgs` loaded from
+  a boot-stubbed copy of server4.js).
+- **M3 surface completed:** flag-reference overlay (`/` opens a
+  fuzzy-filterable `/api/flags` list for the selected build, Enter inserts
+  the flag into raw args and jumps to the raw group); profile rename (`r`,
+  save-then-delete so a failed delete can never lose the config) and
+  duplicate (`c`, copies the SAVED profile, not a dirty draft); RPC worker
+  toggle (`w`, status/start/stop over the existing `/api/worker/*` SSH
+  endpoints, rpcTarget doubles as the worker host exactly like the web's
+  single worker-ssh field). Keymap bar is width-responsive (the old one
+  wrapped at 80 cols -- thrash by another route); `?` overlay documents
+  all of it.
 
 ## 3. What exists today (baseline)
 

@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react';
-import { fmtTime } from './format.js';
+import { fmtTime, gpuOnline } from './format.js';
 
 // Minimal external store (subscribe/getState/setState) so the TUI can render
 // from data pushed by the SSE stream + telemetry poller without prop-drilling.
@@ -208,14 +208,15 @@ export function createAppStore() {
       // returns new arrays), so the callback is a pure state transformation.
       const s = store.getState();
       const b = s.buffers;
+      const wUp = gpuOnline(w);
       const buffers = {
         mUtil: pushRing(b.mUtil, m.gpu_util || 0),
         mVram: pushRing(b.mVram, m.vram_used || 0),
         mPwr: pushRing(b.mPwr, m.gpu_pwr || 0),
         mTemp: pushRing(b.mTemp, m.gpu_temp || 0),
-        wUtil: w && w.gpu_name && w.gpu_name !== 'Offline' ? pushRing(b.wUtil, w.gpu_util || 0) : b.wUtil,
-        wVram: w && w.gpu_name && w.gpu_name !== 'Offline' ? pushRing(b.wVram, w.vram_used || 0) : b.wVram,
-        wPwr: w && w.gpu_name && w.gpu_name !== 'Offline' ? pushRing(b.wPwr, w.gpu_pwr || 0) : b.wPwr,
+        wUtil: wUp ? pushRing(b.wUtil, w.gpu_util || 0) : b.wUtil,
+        wVram: wUp ? pushRing(b.wVram, w.vram_used || 0) : b.wVram,
+        wPwr: wUp ? pushRing(b.wPwr, w.gpu_pwr || 0) : b.wPwr,
         net: pushRing(b.net, net),
         promptTps: b.promptTps,
         genTps: b.genTps,

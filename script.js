@@ -957,6 +957,11 @@ async function applyConfigToUI(config) {
     // cleared.
     document.getElementById('mmproj-toggle').checked = !!config.mmprojEnabled;
     document.getElementById('server-mmproj-path').value = config.mmprojPath ?? DEFAULT_MMPROJ_PATH;
+    // The checkbox reads "keep in system RAM", the inverse of the stored
+    // mmprojOffload flag (true/undefined = GPU, llama.cpp's own default).
+    // Checked only when a run explicitly opted out with mmprojOffload:false;
+    // legacy configs without the field default to unchecked (GPU).
+    document.getElementById('mmproj-offload-toggle').checked = config.mmprojOffload === false;
 
     // Restore load mode
     document.getElementById('server-load-mode').value = config.loadMode || '';
@@ -1065,6 +1070,9 @@ function buildConfigFromUI() {
         chatTemplateFile: document.getElementById('server-chat-template-file').value.trim() || null,
         mmprojEnabled: document.getElementById('mmproj-toggle').checked,
         mmprojPath: document.getElementById('server-mmproj-path').value.trim() || null,
+        // Checkbox is "keep in RAM" (checked); the stored flag is the GPU-
+        // offload flag server4.js reads, so it's the inverse.
+        mmprojOffload: !document.getElementById('mmproj-offload-toggle').checked,
         loadMode: document.getElementById('server-load-mode').value || null,
         verbosity: numFieldOrNull('server-verbosity', parseInt),
         argString: document.getElementById('extra-args').value.trim() || null
@@ -1226,7 +1234,7 @@ document.getElementById('btn-start-server').addEventListener('click', () => {
  'device-manual-a', 'device-manual-b',
  'server-temp', 'server-top-k', 'server-top-p', 'server-min-p',
  'server-presence-penalty', 'server-repeat-penalty', 'server-n-cpu-moe',
- 'jinja-toggle', 'server-chat-template-file', 'mmproj-toggle', 'server-mmproj-path', 'server-load-mode'
+ 'jinja-toggle', 'server-chat-template-file', 'mmproj-toggle', 'server-mmproj-path', 'mmproj-offload-toggle', 'server-load-mode'
 ].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.addEventListener(el.tagName === 'SELECT' || el.type === 'checkbox' ? 'change' : 'input', refreshCommandPreview);
@@ -1650,6 +1658,22 @@ let currentVramSnapshot = 0;
 let chatContext = []; // Stores conversation history for the API
 // isColdStart removed - all prompts now logged to CSV
 
+// Web-search tool (mirrors the CLI chat mode; the search itself runs
+// server-side in /api/web-search so both clients share one implementation).
+const WEB_SEARCH_TOOL_DEF = {
+    type: 'function',
+    function: {
+        name: 'web_search',
+        description: 'Search the web for current information. Returns a list of results, each with title, url, and snippet. Use it for current events, recent releases, prices, live data, or any fact you are not confident about.',
+        parameters: {
+            type: 'object',
+            properties: { query: { type: 'string', description: 'A concise search query (a few words)' } },
+            required: ['query'],
+        },
+    },
+};
+const WEB_SEARCH_SYSTEM_PROMPT = 'You have access to a web_search tool that returns current web results. When the user asks about current events, recent information, or anything you are not confident about, call web_search with a concise query. You may call it up to 2 times per answer. In your answer, cite results as [1], [2] (matching result order) and end with a "Sources:" list of the urls you used.';
+
 // --- Prefill sparkline (replaces the old flat prefill/think/answer bar) ---
 // `points` is an array of {progress, tps} samples captured live from the
 // server's PREFILL_PROGRESS broadcasts during the current generation.
@@ -1883,26 +1907,48 @@ async function submitPrompt() {
     inputEl.value = '';
 
     const timestamp = new Date().toLocaleTimeString();
-    chatContext.push({ role: 'user', content: text, timestamp, images: attachedImages.length > 0 ? attachedImages.map(img => img.dataUrl) : null });
+    chatContext.push({
+        role: 'user', content: text, timestamp,
+        media: attachedMedia.length > 0 ? attachedMedia.map(({ kind, dataUrl, dataB64, name }) => ({ kind, dataUrl, dataB64, name })) : null,
+    });
 
-    // Always pass full chat context so the server can reuse KV-cache
-    // Build API messages: when a user message has attached images, format as
-    // OpenAI multimodal content array ([{type:"text",...}, {type:"image_url",...}])
-    // so llama.cpp's mtmd multimodal backend can process them.
+    // Always pass full chat context so the server can reuse KV-cache.
+    // Build API messages: when a user message has attached media, format as
+    // an OpenAI-style multimodal content array. Images use `image_url`
+    // (llama.cpp's long-standing path); video/audio use the NATIVE
+    // `input_video`/`input_audio` types llama.cpp's mtmd layer added -- see
+    // dash-cli/src/modes/chat.js's header comment for the full trace of why
+    // this isn't client-side frame sampling.
+    const mediaContentPart = (item) => item.kind === 'image'
+        ? { type: 'image_url', image_url: { url: item.dataUrl } }
+        : item.kind === 'video'
+            ? { type: 'input_video', input_video: { data: item.dataB64 } }
+            : { type: 'input_audio', input_audio: { data: item.dataB64 } };
     const apiMessages = chatContext.map(m => {
-        if (m.images && m.images.length > 0) {
+        if (m.media && m.media.length > 0) {
             return {
                 role: m.role,
                 content: [
                     { type: 'text', text: m.content },
-                    ...m.images.map(url => ({ type: 'image_url', image_url: { url } }))
+                    ...m.media.map(mediaContentPart)
                 ]
             };
         }
-        return { role: m.role, content: m.content };
+        const out = { role: m.role, content: m.content };
+        // Replay web-search tool exchanges verbatim (see the tool loop in
+        // submitPrompt) so citations stay grounded on the next turn.
+        if (m.tool_calls) out.tool_calls = m.tool_calls;
+        if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
+        return out;
     });
+    // "allow web search" (input bar): expose the tool + a system prompt that
+    // teaches the model when to use it. The searches run server-side.
+    const webSearchOn = !!document.getElementById('chat-web-search')?.checked;
+    const requestMessages = webSearchOn
+        ? [{ role: 'system', content: WEB_SEARCH_SYSTEM_PROMPT }, ...apiMessages]
+        : apiMessages;
     // Consume the attached images so they don't persist into the next prompt
-    attachedImages = [];
+    attachedMedia = [];
     const attachedImageContainer = document.getElementById('attached-images');
     if (attachedImageContainer) attachedImageContainer.remove();
 
@@ -1923,7 +1969,7 @@ async function submitPrompt() {
     // chart instances -- untouched.
     const chatBox = document.getElementById('chat-container');
     const latestUserMsg = [...chatContext].reverse().find(m => m.role === 'user');
-    const imgThumbs = (latestUserMsg && latestUserMsg.images) ? `<div class="flex flex-wrap gap-2 mb-2">${latestUserMsg.images.map(u => `<img src="${u}" class="h-16 w-16 object-cover rounded-lg border border-gray-600">`).join('')}</div>` : '';
+    const imgThumbs = mediaThumbsHtml(latestUserMsg && latestUserMsg.media);
     chatBox.insertAdjacentHTML('beforeend', `
         <div class="msg-wrapper p-4 rounded-xl border border-gray-700 bg-gray-800 max-w-4xl mx-auto shadow-sm w-full mb-4">
             <div class="flex justify-between items-center mb-2">
@@ -2067,7 +2113,10 @@ async function submitPrompt() {
     let slotsLoop = setInterval(async () => {
         if (timeToFirstToken > 0) return clearInterval(slotsLoop);
         try {
-            const res = await fetch('http://localhost:8080/slots');
+            // /api/slots (dashboard proxy) instead of hitting the model port
+            // directly: a browser on the tunnel URL has no route to the
+            // machine's localhost:8080 -- only the tunnel.
+            const res = await fetch('/api/slots');
             const slots = await res.json();
             if (slots && slots.length > 0) {
                 const slot = slots.find(s => s.state === 1) || slots[0];
@@ -2144,206 +2193,270 @@ async function submitPrompt() {
     }, 1000);
 
     try {
-        // Per-request chat template kwargs (thinking on/off + free-form JSON)
-        const chatBody = { model: sessionData.model, messages: apiMessages, stream: true, stream_options: { include_usage: true } };
+        // Per-request chat template kwargs (thinking on/off + level + free-form
+        // JSON). Levels map to reasoning_effort for templates that read it
+        // (Qwen3.8 accepts xhigh/medium/low); the free-form field overrides.
         const thinkSel = document.getElementById('chat-thinking')?.value;
         let templateKwargs = {};
-        if (thinkSel === 'on') templateKwargs.enable_thinking = true;
-        else if (thinkSel === 'off') templateKwargs.enable_thinking = false;
+        if (thinkSel === 'off') templateKwargs.enable_thinking = false;
+        else if (thinkSel === 'xhigh' || thinkSel === 'medium' || thinkSel === 'low') {
+            templateKwargs.enable_thinking = true;
+            templateKwargs.reasoning_effort = thinkSel;
+        }
         const kwRaw = document.getElementById('chat-kwargs')?.value.trim();
         if (kwRaw) {
             try { Object.assign(templateKwargs, JSON.parse(kwRaw)); }
             catch (e) { displayErrorInUI('extra kwargs is not valid JSON -- ignored for this request'); }
         }
-        if (Object.keys(templateKwargs).length > 0) chatBody.chat_template_kwargs = templateKwargs;
-        const response = await fetch('http://localhost:8080/v1/chat/completions', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(chatBody),
-            signal: abortController.signal
-        });
+        const buildBody = (messages) => {
+            const body = { model: sessionData.model, messages, stream: true, stream_options: { include_usage: true } };
+            if (Object.keys(templateKwargs).length > 0) body.chat_template_kwargs = templateKwargs;
+            if (webSearchOn) body.tools = [WEB_SEARCH_TOOL_DEF];
+            return body;
+        };
 
-        // Handle HTTP error responses (e.g. model doesn't support images).
-        // fetch doesn't throw on 4xx/5xx — only on network failures.
-        if (!response.ok) {
-            const errBody = await response.text();
-            let msg;
-            try { const j = JSON.parse(errBody); msg = j.error?.message || j.error || errBody; } catch { msg = errBody; }
-            throw new Error(msg);
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder("utf-8");
         let fullContent = ""; let fullReasoning = "";
+        // Web-search tool exchange (assistant tool_calls + tool results) for
+        // this turn -- persisted to chatContext after the final answer.
+        const toolExchange = [];
 
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            const chunk = decoder.decode(value, { stream: true });
-            
-            if (timeToFirstToken === 0) {
-                window.chartEvents.push({ time: Date.now(), label: 'Prefill Done', color: '#facc15', offset: 20 });
-                timeToFirstToken = (Date.now() - startTime) / 1000; // in seconds
-                sessionData.promptLatency = timeToFirstToken.toFixed(2);
-                
-                // Phase transition: prefill → think
-                currentResponsePhase = 'think';
-                // Hide the prefill loading bar now that prompt processing is done
-                hidePrefillLoadingBar();
-                
-                const promptTokensEst = estimatedPromptTokens - currentContextTokens;
-                const livePrefillAvg = (promptTokensEst / timeToFirstToken).toFixed(1);
-                prefillMetrics = { time: timeToFirstToken.toFixed(1), tokens: promptTokensEst, tps: livePrefillAvg };
-                
-                timelineEls.pLbl.innerHTML = `Prefill: <span class="val text-gray-200">${prefillMetrics.time}s | ${prefillMetrics.tokens}t | ${prefillMetrics.tps} t/s</span>`;
-                timelineEls.container.classList.remove('hidden');
+        // Up to 3 model turns per user message: the answer, or an answer that
+        // ends in web_search call(s) followed by the follow-up turn(s) with the
+        // results fed back. Every turn streams into the SAME bubble.
+        for (let round = 0; round < 3; round++) {
+            const response = await fetch('/api/chat', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(buildBody(requestMessages)),
+                signal: abortController.signal
+            });
 
-                // NOTE: deliberately NOT writing metric-prefill-avg here -- that
-                // box is the SESSION-weighted average (fed by COMPLETION events
-                // via saveMetricsToAverages); a per-prompt estimate was
-                // clobbering it (a 4-token cache-hit prompt once painted it
-                // "2.1 t/s"). Per-prompt numbers live in the bubble timeline.
-                document.getElementById('metric-prefill').innerText = `${livePrefillAvg} t/s`;
-                document.getElementById('metric-prefill-tokens').innerText = `${promptTokensEst} tokens`;
+            // Handle HTTP error responses (e.g. model doesn't support images).
+            // fetch doesn't throw on 4xx/5xx — only on network failures.
+            if (!response.ok) {
+                const errBody = await response.text();
+                let msg;
+                try { const j = JSON.parse(errBody); msg = j.error?.message || j.error || errBody; } catch { msg = errBody; }
+                throw new Error(msg);
             }
 
-            const lines = chunk.split('\n');
-            for (const line of lines) {
-                if (line.startsWith('data: ') && line !== 'data: [DONE]') {
-                    try {
-                        const data = JSON.parse(line.slice(6));
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder("utf-8");
+            let roundToolCalls = [];
+            let roundFinish = null;
+            const roundTextStart = fullContent.length;
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const chunk = decoder.decode(value, { stream: true });
+            
+                if (timeToFirstToken === 0) {
+                    window.chartEvents.push({ time: Date.now(), label: 'Prefill Done', color: '#facc15', offset: 20 });
+                    timeToFirstToken = (Date.now() - startTime) / 1000; // in seconds
+                    sessionData.promptLatency = timeToFirstToken.toFixed(2);
+                
+                    // Phase transition: prefill → think
+                    currentResponsePhase = 'think';
+                    // Hide the prefill loading bar now that prompt processing is done
+                    hidePrefillLoadingBar();
+                
+                    const promptTokensEst = estimatedPromptTokens - currentContextTokens;
+                    const livePrefillAvg = (promptTokensEst / timeToFirstToken).toFixed(1);
+                    prefillMetrics = { time: timeToFirstToken.toFixed(1), tokens: promptTokensEst, tps: livePrefillAvg };
+                
+                    timelineEls.pLbl.innerHTML = `Prefill: <span class="val text-gray-200">${prefillMetrics.time}s | ${prefillMetrics.tokens}t | ${prefillMetrics.tps} t/s</span>`;
+                    timelineEls.container.classList.remove('hidden');
 
-                        // Server returned an error mid-stream
-                        if (data.error) {
-                            throw new Error(data.error.message || data.error);
-                        }
+                    // NOTE: deliberately NOT writing metric-prefill-avg here -- that
+                    // box is the SESSION-weighted average (fed by COMPLETION events
+                    // via saveMetricsToAverages); a per-prompt estimate was
+                    // clobbering it (a 4-token cache-hit prompt once painted it
+                    // "2.1 t/s"). Per-prompt numbers live in the bubble timeline.
+                    document.getElementById('metric-prefill').innerText = `${livePrefillAvg} t/s`;
+                    document.getElementById('metric-prefill-tokens').innerText = `${promptTokensEst} tokens`;
+                }
+
+                const lines = chunk.split('\n');
+                for (const line of lines) {
+                    if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+                        try {
+                            const data = JSON.parse(line.slice(6));
+
+                            // Server returned an error mid-stream
+                            if (data.error) {
+                                throw new Error(data.error.message || data.error);
+                            }
                         
-                        // End of stream Usage metrics
-                        if (data.usage) {
-                            sessionData.genTokens = data.usage.completion_tokens;
-                            sessionData.reasonTokens = reasoningTokenCount;
-                            sessionData.promptTokens = data.usage.prompt_tokens;
+                            // End of stream Usage metrics
+                            if (data.usage) {
+                                sessionData.genTokens = data.usage.completion_tokens;
+                                sessionData.reasonTokens = reasoningTokenCount;
+                                sessionData.promptTokens = data.usage.prompt_tokens;
 
-                            // Correct the live prefill estimate with the server's real
-                            // prompt_tokens count. The live value (set when the first
-                            // token arrived, above) divides an ESTIMATED new-message
-                            // token count by timeToFirstToken -- correct only when the
-                            // whole prior context is cache-hit and skipped. Whenever it
-                            // isn't (slot switch, cache eviction, first turn), the real
-                            // prompt_tokens llama-server actually processed is far larger
-                            // than the estimate, so the estimate-based tps reads far too
-                            // low (e.g. "1.5 t/s" for a request that really ran ~400 t/s).
-                            // Recompute from ground truth now that usage is known.
-                            if (timeToFirstToken > 0) {
-                                const realPromptTps = (data.usage.prompt_tokens / timeToFirstToken).toFixed(1);
-                                prefillMetrics = { time: timeToFirstToken.toFixed(1), tokens: data.usage.prompt_tokens, tps: realPromptTps };
-                                timelineEls.pLbl.innerHTML = `Prefill: <span class="val text-gray-200">${prefillMetrics.time}s | ${prefillMetrics.tokens}t | ${prefillMetrics.tps} t/s</span>`;
-                            }
-                            sessionData.promptTps = prefillMetrics.tps;
-
-                            const finalAnsTime = ((Date.now() - startTime) / 1000) - timeToFirstToken - timeToFirstContent;
-                            answerMetrics = { time: finalAnsTime.toFixed(1), tokens: answerTokenCount, tps: (answerTokenCount/finalAnsTime).toFixed(1) };
-                            timelineEls.aLbl.innerHTML = `Answer: <span class="val text-gray-200">${answerMetrics.time}s | ${answerMetrics.tokens}t | ${answerMetrics.tps} t/s</span>`;
-                            // The draft-acceptance summary arrives ~0.5s later on the
-                            // COMPLETION broadcast -- register this bubble to receive it.
-                            pendingDraftStatsEl = timelineEls.aLbl.parentElement;
-                            pendingDraftStatsExpiry = Date.now() + 8000;
-                            
-                            // Final static render of the sparkline: proportional widths by time, real tps curve for prefill
-                            const totalTime = timeToFirstToken + timeToFirstContent + finalAnsTime;
-                            const pPct = totalTime > 0 ? (timeToFirstToken / totalTime) * 100 : 100;
-                            const tPct = totalTime > 0 ? (timeToFirstContent / totalTime) * 100 : 0;
-                            const aPct = totalTime > 0 ? (finalAnsTime / totalTime) * 100 : 0;
-                            drawPrefillSparkline(activeTimelineEls, activePrefillSamples, pPct, tPct, aPct, false);
-                            
-                            sessionData.genTps = answerMetrics.tps;
-                            sessionData.wallTime = (Date.now() - startTime) / 1000;
-
-                            // Lock in exact numbers
-                            document.getElementById('metric-prefill').innerText = `${sessionData.promptTps} t/s`;
-                            document.getElementById('metric-prefill-tokens').innerText = `${data.usage.prompt_tokens} tokens`;
-                            document.getElementById('metric-gen').innerText = `${sessionData.genTps} t/s`;
-                            document.getElementById('metric-gen-tokens').innerText = `${data.usage.completion_tokens} tokens`;
-
-                            // Running averages are now updated from the server's
-                            // client-agnostic COMPLETION broadcast (see the SSE
-                            // handler), not here -- this dashboard's own requests
-                            // trigger that same broadcast (server4.js's log-tailing
-                            // sees every request hitting llama-server, including
-                            // this one), so updating it here too would double-count.
-
-                            // Lock in exact context tokens
-                            currentContextTokens = data.usage.prompt_tokens + data.usage.completion_tokens;
-                            updateContextUI(currentContextTokens, currentContextLimit);
-
-                            // Prefill now plots live from tpsLoop's per-tick
-                            // prefillTps samples (fed by PREFILL_PROGRESS
-                            // broadcasts) -- the old "write promptTps into
-                            // data[0] here" hack fought that series and was
-                            // wiped by the next tick's rebuild anyway.
-                        }
-
-                        if (data.choices && data.choices.length > 0) {
-                            tokenCount++; totalTokensGenerated++;
-                            const delta = data.choices[0].delta;
-                            
-                            if (delta.reasoning_content) {
-                                if (reasoningTokenCount === 0) {
-                                    timelineEls.tLbl.classList.remove('hidden');
+                                // Correct the live prefill estimate with the server's real
+                                // prompt_tokens count. The live value (set when the first
+                                // token arrived, above) divides an ESTIMATED new-message
+                                // token count by timeToFirstToken -- correct only when the
+                                // whole prior context is cache-hit and skipped. Whenever it
+                                // isn't (slot switch, cache eviction, first turn), the real
+                                // prompt_tokens llama-server actually processed is far larger
+                                // than the estimate, so the estimate-based tps reads far too
+                                // low (e.g. "1.5 t/s" for a request that really ran ~400 t/s).
+                                // Recompute from ground truth now that usage is known.
+                                if (timeToFirstToken > 0) {
+                                    const realPromptTps = (data.usage.prompt_tokens / timeToFirstToken).toFixed(1);
+                                    prefillMetrics = { time: timeToFirstToken.toFixed(1), tokens: data.usage.prompt_tokens, tps: realPromptTps };
+                                    timelineEls.pLbl.innerHTML = `Prefill: <span class="val text-gray-200">${prefillMetrics.time}s | ${prefillMetrics.tokens}t | ${prefillMetrics.tps} t/s</span>`;
                                 }
-                                reasoningTokenCount++;
-                                thinkTokenCount++;
-                                
-                                const currThinkTime = ((Date.now() - startTime) / 1000) - timeToFirstToken;
-                                if (currThinkTime > 0.1) {
-                                    timelineEls.tLbl.innerHTML = `Think: <span class="val text-gray-200">${currThinkTime.toFixed(1)}s | ${reasoningTokenCount}t | ${(reasoningTokenCount/currThinkTime).toFixed(1)} t/s</span>`;
-                                }
-                                
-                                fullReasoning += delta.reasoning_content;
-                                reasoningBox.classList.remove('hidden');
-                                reasoningBody.innerText = fullReasoning;
-                                reasoningTokens.innerText = `(~${Math.ceil(fullReasoning.length/4)} tokens)`;
-                                reasoningBody.scrollTop = reasoningBody.scrollHeight;
+                                sessionData.promptTps = prefillMetrics.tps;
+
+                                const finalAnsTime = ((Date.now() - startTime) / 1000) - timeToFirstToken - timeToFirstContent;
+                                answerMetrics = { time: finalAnsTime.toFixed(1), tokens: answerTokenCount, tps: (answerTokenCount/finalAnsTime).toFixed(1) };
+                                timelineEls.aLbl.innerHTML = `Answer: <span class="val text-gray-200">${answerMetrics.time}s | ${answerMetrics.tokens}t | ${answerMetrics.tps} t/s</span>`;
+                                // The draft-acceptance summary arrives ~0.5s later on the
+                                // COMPLETION broadcast -- register this bubble to receive it.
+                                pendingDraftStatsEl = timelineEls.aLbl.parentElement;
+                                pendingDraftStatsExpiry = Date.now() + 8000;
+                            
+                                // Final static render of the sparkline: proportional widths by time, real tps curve for prefill
+                                const totalTime = timeToFirstToken + timeToFirstContent + finalAnsTime;
+                                const pPct = totalTime > 0 ? (timeToFirstToken / totalTime) * 100 : 100;
+                                const tPct = totalTime > 0 ? (timeToFirstContent / totalTime) * 100 : 0;
+                                const aPct = totalTime > 0 ? (finalAnsTime / totalTime) * 100 : 0;
+                                drawPrefillSparkline(activeTimelineEls, activePrefillSamples, pPct, tPct, aPct, false);
+                            
+                                sessionData.genTps = answerMetrics.tps;
+                                sessionData.wallTime = (Date.now() - startTime) / 1000;
+
+                                // Lock in exact numbers
+                                document.getElementById('metric-prefill').innerText = `${sessionData.promptTps} t/s`;
+                                document.getElementById('metric-prefill-tokens').innerText = `${data.usage.prompt_tokens} tokens`;
+                                document.getElementById('metric-gen').innerText = `${sessionData.genTps} t/s`;
+                                document.getElementById('metric-gen-tokens').innerText = `${data.usage.completion_tokens} tokens`;
+
+                                // Running averages are now updated from the server's
+                                // client-agnostic COMPLETION broadcast (see the SSE
+                                // handler), not here -- this dashboard's own requests
+                                // trigger that same broadcast (server4.js's log-tailing
+                                // sees every request hitting llama-server, including
+                                // this one), so updating it here too would double-count.
+
+                                // Lock in exact context tokens
+                                currentContextTokens = data.usage.prompt_tokens + data.usage.completion_tokens;
+                                updateContextUI(currentContextTokens, currentContextLimit);
+
+                                // Prefill now plots live from tpsLoop's per-tick
+                                // prefillTps samples (fed by PREFILL_PROGRESS
+                                // broadcasts) -- the old "write promptTps into
+                                // data[0] here" hack fought that series and was
+                                // wiped by the next tick's rebuild anyway.
                             }
-                            if (delta.content) {
-                                if (timeToFirstContent === 0) {
-                                    // Phase transition: think → answer
-                                    currentResponsePhase = 'answer';
-                                    timeToFirstContent = ((Date.now() - startTime) / 1000) - timeToFirstToken;
-                                    timelineEls.aLbl.classList.remove('hidden');
-                                    
-                                    if (reasoningTokenCount > 0) {
-                                        thinkMetrics = { time: timeToFirstContent.toFixed(1), tokens: reasoningTokenCount, tps: (reasoningTokenCount/timeToFirstContent).toFixed(1) };
-                                        timelineEls.tLbl.innerHTML = `Think: <span class="val text-gray-200">${thinkMetrics.time}s | ${thinkMetrics.tokens}t | ${thinkMetrics.tps} t/s</span>`;
+
+                            if (data.choices && data.choices.length > 0) {
+                                tokenCount++; totalTokensGenerated++;
+                                const delta = data.choices[0].delta;
+                            
+                                if (delta.reasoning_content) {
+                                    if (reasoningTokenCount === 0) {
+                                        timelineEls.tLbl.classList.remove('hidden');
                                     }
-                                }
-                                answerTokenCount++;
-                                contentTokenCount++;
+                                    reasoningTokenCount++;
+                                    thinkTokenCount++;
                                 
-                                const currAnsTime = ((Date.now() - startTime) / 1000) - timeToFirstToken - timeToFirstContent;
-                                if (currAnsTime > 0.1) {
-                                    timelineEls.aLbl.innerHTML = `Answer: <span class="val text-gray-200">${currAnsTime.toFixed(1)}s | ${answerTokenCount}t | ${(answerTokenCount/currAnsTime).toFixed(1)} t/s</span>`;
-                                }
+                                    const currThinkTime = ((Date.now() - startTime) / 1000) - timeToFirstToken;
+                                    if (currThinkTime > 0.1) {
+                                        timelineEls.tLbl.innerHTML = `Think: <span class="val text-gray-200">${currThinkTime.toFixed(1)}s | ${reasoningTokenCount}t | ${(reasoningTokenCount/currThinkTime).toFixed(1)} t/s</span>`;
+                                    }
                                 
-                                fullContent += delta.content;
-                                
-                                if (rawBtn.dataset.mode === 'rendered') {
-                                    contentBody.innerHTML = marked.parse(fullContent);
-                                } else {
-                                    contentBody.innerHTML = `<pre class="text-xs text-gray-300 overflow-x-auto p-3 bg-gray-950 rounded border border-gray-800">${escapeHtml(fullContent)}</pre>`;
+                                    fullReasoning += delta.reasoning_content;
+                                    reasoningBox.classList.remove('hidden');
+                                    reasoningBody.innerText = fullReasoning;
+                                    reasoningTokens.innerText = `(~${Math.ceil(fullReasoning.length/4)} tokens)`;
+                                    reasoningBody.scrollTop = reasoningBody.scrollHeight;
                                 }
-                                rawBtn.dataset.raw = fullContent;
-                                rawBtn.classList.remove('hidden');
-                            }
+                                if (delta.content) {
+                                    if (timeToFirstContent === 0) {
+                                        // Phase transition: think → answer
+                                        currentResponsePhase = 'answer';
+                                        timeToFirstContent = ((Date.now() - startTime) / 1000) - timeToFirstToken;
+                                        timelineEls.aLbl.classList.remove('hidden');
+                                    
+                                        if (reasoningTokenCount > 0) {
+                                            thinkMetrics = { time: timeToFirstContent.toFixed(1), tokens: reasoningTokenCount, tps: (reasoningTokenCount/timeToFirstContent).toFixed(1) };
+                                            timelineEls.tLbl.innerHTML = `Think: <span class="val text-gray-200">${thinkMetrics.time}s | ${thinkMetrics.tokens}t | ${thinkMetrics.tps} t/s</span>`;
+                                        }
+                                    }
+                                    answerTokenCount++;
+                                    contentTokenCount++;
+                                
+                                    const currAnsTime = ((Date.now() - startTime) / 1000) - timeToFirstToken - timeToFirstContent;
+                                    if (currAnsTime > 0.1) {
+                                        timelineEls.aLbl.innerHTML = `Answer: <span class="val text-gray-200">${currAnsTime.toFixed(1)}s | ${answerTokenCount}t | ${(answerTokenCount/currAnsTime).toFixed(1)} t/s</span>`;
+                                    }
+                                
+                                    fullContent += delta.content;
+                                
+                                    if (rawBtn.dataset.mode === 'rendered') {
+                                        contentBody.innerHTML = marked.parse(fullContent);
+                                    } else {
+                                        contentBody.innerHTML = `<pre class="text-xs text-gray-300 overflow-x-auto p-3 bg-gray-950 rounded border border-gray-800">${escapeHtml(fullContent)}</pre>`;
+                                    }
+                                    rawBtn.dataset.raw = fullContent;
+                                    rawBtn.classList.remove('hidden');
+                                }
                             
-                            // Auto scroll only if close to bottom
-                            if(chatBox.scrollHeight - chatBox.scrollTop < chatBox.clientHeight + 100) {
-                                chatBox.scrollTop = chatBox.scrollHeight;
+                                if (delta.tool_calls) {
+                                    for (const tc of delta.tool_calls) {
+                                        const ti = tc.index || 0;
+                                        if (!roundToolCalls[ti]) roundToolCalls[ti] = { id: tc.id || `call_${ti}`, type: 'function', function: { name: '', arguments: '' } };
+                                        if (tc.id) roundToolCalls[ti].id = tc.id;
+                                        if (tc.function && tc.function.name) roundToolCalls[ti].function.name += tc.function.name;
+                                        if (tc.function && tc.function.arguments) roundToolCalls[ti].function.arguments += tc.function.arguments;
+                                    }
+                                    roundToolCalls = roundToolCalls.filter(Boolean);
+                                }
+                                if (data.choices[0].finish_reason) roundFinish = data.choices[0].finish_reason;
+                                // Auto scroll only if close to bottom
+                                if(chatBox.scrollHeight - chatBox.scrollTop < chatBox.clientHeight + 100) {
+                                    chatBox.scrollTop = chatBox.scrollHeight;
+                                }
                             }
-                        }
-                    } catch (e) {}
+                        } catch (e) {}
+                    }
                 }
             }
+
+            if (!webSearchOn || roundFinish !== 'tool_calls' || roundToolCalls.length === 0 || abortController.signal.aborted) break;
+            // Execute this round's web_search calls server-side (keyless DDG,
+            // one implementation shared with the CLI chat mode) and feed the
+            // results back as tool messages; the next iteration streams the
+            // follow-up turn into the same bubble.
+            const roundAssistant = { role: 'assistant', content: fullContent.slice(roundTextStart) || null, tool_calls: roundToolCalls, timestamp: new Date().toLocaleTimeString() };
+            toolExchange.push(roundAssistant);
+            requestMessages.push({ role: 'assistant', content: roundAssistant.content, tool_calls: roundAssistant.tool_calls });
+            for (const call of roundToolCalls) {
+                let q = '';
+                try { q = (JSON.parse(call.function.arguments || '{}') || {}).query || ''; } catch { q = call.function.arguments || ''; }
+                const actLine = document.createElement('div');
+                actLine.className = 'text-xs text-gray-500 italic my-1';
+                actLine.textContent = `\u{1F50D} web search: "${q || '(no query)'}" \u2026`;
+                contentBody.appendChild(actLine);
+                let toolContent;
+                try {
+                    const sr = await (await fetch('/api/web-search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: q }) })).json();
+                    actLine.textContent = `\u{1F50D} web search: "${sr.query}" \u2192 ${sr.count} result${sr.count === 1 ? '' : 's'}`;
+                    toolContent = JSON.stringify({ query: sr.query, count: sr.count, results: (sr.results || []).map(x => ({ title: x.title, url: x.url, snippet: x.snippet })) }).slice(0, 6000);
+                } catch (err) {
+                    actLine.textContent = `\u{1F50D} web search failed: ${err.message}`;
+                    toolContent = JSON.stringify({ error: err.message });
+                }
+                const toolMsg = { role: 'tool', tool_call_id: call.id, content: toolContent, timestamp: new Date().toLocaleTimeString() };
+                toolExchange.push(toolMsg);
+                requestMessages.push({ role: 'tool', tool_call_id: call.id, content: toolContent });
+            }
         }
+        // Persist any web-search tool exchange into the history so the NEXT
+        // turn replays it (citations stay grounded in the same results).
+        for (const ex of toolExchange) chatContext.push(ex);
         chatContext.push({ role: 'assistant', content: fullContent, reasoning: fullReasoning, timestamp: new Date().toLocaleTimeString(), prefillMetrics, thinkMetrics, answerMetrics, responseMetrics, prefillSamples: activePrefillSamples, templateKwargs: Object.keys(templateKwargs).length > 0 ? templateKwargs : null });
         // Store kwargs on the raw button so the "View Raw" toggle can display
         // them as a red annotation (THINKING OFF, custom kwargs, etc.)
@@ -2405,26 +2518,112 @@ document.getElementById('abort-btn').addEventListener('click', () => {
     if (abortController) abortController.abort();
 });
 
-// --- Multimodal image attachment ---
-// Stores base64 data URLs of attached images. Cleared after submission.
-let attachedImages = []; // [{ dataUrl, name }]
+// --- Multimodal media attachment ---
+// Cleared after submission. Images carry `dataUrl` (a data: URI, for
+// image_url); video/audio carry `dataB64` (raw base64, no data: prefix --
+// see readAsRawBase64 below for why).
+let attachedMedia = []; // [{ kind: 'image'|'video'|'audio', dataUrl?, dataB64?, name }]
 const attachBtn = document.getElementById('attach-image-btn');
 const imageInput = document.getElementById('image-file-input');
+
+// Video/audio go in via llama.cpp's NATIVE input_video/input_audio content
+// types (mtmd shells out to ffmpeg itself server-side for video -- default
+// 4fps sampling with proper Qwen-VL temporal position encoding, not just N
+// independent photos -- and has a built-in decoder for audio). The server
+// only accepts RAW base64 for these two (no `data:` URI prefix, unlike
+// image_url), so the data: URI FileReader gives us gets its prefix stripped
+// before storing. See dash-cli/src/modes/chat.js's header comment for the
+// full mtmd_helper trace this is based on.
+const MAX_IMG_BYTES = 25 * 1024 * 1024;
+// server4.js's /api/chat proxy caps the whole request body at 100MB
+// (MAX_CHAT_BODY_SIZE) -- base64 inflates by ~1.33x, so two max-size files
+// alone would be ~67MB, leaving headroom for a real conversation on top.
+const MAX_AV_BYTES = 25 * 1024 * 1024;
+const MAX_AV_FILES = 2;
+
+function mediaKindOf(file) {
+    if (file.type.startsWith('image/')) return 'image';
+    if (file.type.startsWith('video/')) return 'video';
+    if (file.type.startsWith('audio/')) return 'audio';
+    return null;
+}
+
+function readAsRawBase64(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result).split(',')[1] || '');
+        reader.onerror = () => reject(reader.error || new Error('could not read file'));
+        reader.readAsDataURL(file);
+    });
+}
+
 if (attachBtn && imageInput) {
     attachBtn.addEventListener('click', () => imageInput.click());
     imageInput.addEventListener('change', () => {
         Array.from(imageInput.files).forEach(file => {
-            const reader = new FileReader();
-            reader.onload = () => {
-                attachedImages.push({ dataUrl: reader.result, name: file.name });
-                renderAttachedImageThumbnails();
-            };
-            reader.readAsDataURL(file);
+            const kind = mediaKindOf(file);
+            if (!kind) { alert(`"${file.name}": not a recognized image/video/audio type`); return; }
+            const avCount = attachedMedia.filter(m => m.kind !== 'image').length;
+            if (kind === 'image' && file.size > MAX_IMG_BYTES) {
+                alert(`"${file.name}" is ${(file.size / 1048576).toFixed(1)} MB -- over the ${MAX_IMG_BYTES / 1048576} MB image limit`);
+                return;
+            }
+            if (kind !== 'image') {
+                if (file.size > MAX_AV_BYTES) {
+                    alert(`"${file.name}" is ${(file.size / 1048576).toFixed(1)} MB -- over the ${MAX_AV_BYTES / 1048576} MB ${kind} limit`);
+                    return;
+                }
+                if (avCount >= MAX_AV_FILES) {
+                    alert(`too many video/audio attachments (max ${MAX_AV_FILES} per message)`);
+                    return;
+                }
+            }
+            if (kind === 'image') {
+                const reader = new FileReader();
+                reader.onload = () => {
+                    attachedMedia.push({ kind, dataUrl: reader.result, name: file.name });
+                    renderAttachedImageThumbnails();
+                };
+                reader.readAsDataURL(file);
+            } else {
+                readAsRawBase64(file).then(dataB64 => {
+                    attachedMedia.push({ kind, dataB64, name: file.name });
+                    renderAttachedImageThumbnails();
+                }).catch(err => alert(`"${file.name}": ${err.message}`));
+            }
         });
         imageInput.value = ''; // reset so re-selecting the same file works
     });
 }
-// Render/remove thumbnails above the textarea
+// "show thinking" toggle: hides the reasoning blocks in the transcript
+// (the model still thinks either way -- this is purely a display control).
+// Applied as a class on the chat container so it also affects messages that
+// are still rendering / already rendered.
+const showThinkingEl = document.getElementById('chat-show-thinking');
+if (showThinkingEl) {
+    const applyShowThinking = () => {
+        document.getElementById('chat-container').classList.toggle('hide-thinking', !showThinkingEl.checked);
+    };
+    showThinkingEl.addEventListener('change', applyShowThinking);
+    applyShowThinking();
+}
+// Chat-transcript thumbnails for a SENT message's attached media (as opposed
+// to renderAttachedImageThumbnails below, which is the pre-send attach
+// tray). Images get a real preview; video/audio have no previewable
+// `dataUrl` (raw base64 only), so they render as a labeled chip.
+function mediaThumbsHtml(media, borderClass = 'border-gray-600') {
+    if (!media || !media.length) return '';
+    const items = media.map(item => {
+        if (item.kind === 'image') return `<img src="${item.dataUrl}" class="h-16 w-16 object-cover rounded-lg border ${borderClass}" loading="lazy">`;
+        const icon = item.kind === 'video' ? '🎬' : '🎵';
+        return `<div class="h-16 w-16 flex flex-col items-center justify-center gap-1 rounded-lg border ${borderClass} bg-gray-800 text-[9px] text-gray-400 px-1 text-center" title="${escapeHtml(item.name || '')}"><span class="text-lg">${icon}</span><span class="truncate max-w-full">${escapeHtml(item.name || item.kind)}</span></div>`;
+    });
+    return `<div class="flex flex-wrap gap-2 mb-2">${items.join('')}</div>`;
+}
+
+// Render/remove thumbnails above the textarea. Images get a real preview;
+// video/audio have no `dataUrl` to preview (raw base64 only, see above), so
+// they get a labeled chip instead.
 function renderAttachedImageThumbnails() {
     let container = document.getElementById('attached-images');
     if (!container) {
@@ -2435,18 +2634,22 @@ function renderAttachedImageThumbnails() {
         ta.parentElement.insertBefore(container, ta);
     }
     container.innerHTML = '';
-    attachedImages.forEach((img, i) => {
+    attachedMedia.forEach((item, i) => {
         const wrap = document.createElement('div');
         wrap.className = 'relative group';
-        wrap.innerHTML = `<img src="${img.dataUrl}" class="h-16 w-16 object-cover rounded-lg border border-gray-700" title="${escapeHtml(img.name)}">
-            <button type="button" class="absolute -top-1 -right-1 h-4 w-4 rounded-full bg-red-600 text-white text-[10px] leading-4 hover:bg-red-500 opacity-0 group-hover:opacity-100 transition-opacity" title="Remove">✕</button>`;
+        const icon = item.kind === 'video' ? '🎬' : '🎵';
+        wrap.innerHTML = item.kind === 'image'
+            ? `<img src="${item.dataUrl}" class="h-16 w-16 object-cover rounded-lg border border-gray-700" title="${escapeHtml(item.name)}">
+               <button type="button" class="absolute -top-1 -right-1 h-4 w-4 rounded-full bg-red-600 text-white text-[10px] leading-4 hover:bg-red-500 opacity-0 group-hover:opacity-100 transition-opacity" title="Remove">✕</button>`
+            : `<div class="h-16 w-16 flex flex-col items-center justify-center gap-1 rounded-lg border border-gray-700 bg-gray-800 text-[9px] text-gray-400 px-1 text-center" title="${escapeHtml(item.name)}"><span class="text-lg">${icon}</span><span class="truncate max-w-full">${escapeHtml(item.name)}</span></div>
+               <button type="button" class="absolute -top-1 -right-1 h-4 w-4 rounded-full bg-red-600 text-white text-[10px] leading-4 hover:bg-red-500 opacity-0 group-hover:opacity-100 transition-opacity" title="Remove">✕</button>`;
         wrap.querySelector('button').addEventListener('click', () => {
-            attachedImages.splice(i, 1);
+            attachedMedia.splice(i, 1);
             renderAttachedImageThumbnails();
         });
         container.appendChild(wrap);
     });
-    if (attachedImages.length === 0) container.remove();
+    if (attachedMedia.length === 0) container.remove();
 }
 
 // --- Tokens/sec chart x-axis toggle (time-spaced vs evenly-spaced) ---
@@ -2495,9 +2698,19 @@ document.getElementById('server-ctx').addEventListener('input', (e) => {
     updateContextUI(currentContextTokens, currentContextLimit);
 });
 
-// --- Worker Docker Control & Polling Logic ---
+// --- RPC Worker Control & Polling Logic ---
 let showWorkerLogs = false;
 let workerStatusInterval = null;
+
+// Seed the worker field from dashboard.config.json's rpcWorker.ssh. Only fills
+// an empty field, so a restored launch config's rpcTarget always wins.
+fetch('/api/worker/config').then(r => r.json()).then(({ ssh }) => {
+    const el = document.getElementById('worker-ssh');
+    if (ssh && !el.value.trim()) {
+        el.value = ssh;
+        refreshCommandPreview();
+    }
+}).catch(() => {});
 // workerLogsInterval declared near the top of the file (see comment there) --
 // updateSecondNodeVisibility() needs it to exist before this point during page load.
 
@@ -2527,23 +2740,19 @@ async function updateWorkerStatus() {
         // Only update if not currently transitioning (animating pulse)
         if (!badge.classList.contains('animate-pulse')) {
             const startBtn = document.getElementById('btn-worker-start');
-            const tsContainer = document.getElementById('tensor-split-container');
             if (data.status === 'running') {
                 badge.className = 'px-1.5 py-0.5 rounded text-[9px] font-semibold bg-green-900/20 border border-green-800 text-green-400';
                 badge.innerText = 'RUNNING';
-                tsContainer.classList.remove('hidden');
                 startBtn.disabled = true;
                 startBtn.classList.add('opacity-50', 'cursor-not-allowed');
             } else if (data.status === 'stopped') {
                 badge.className = 'px-1.5 py-0.5 rounded text-[9px] font-semibold bg-yellow-900/20 border border-yellow-800 text-yellow-400';
                 badge.innerText = 'STOPPED';
-                tsContainer.classList.add('hidden');
                 startBtn.disabled = false;
                 startBtn.classList.remove('opacity-50', 'cursor-not-allowed');
             } else if (data.status === 'offline') {
                 badge.className = 'px-1.5 py-0.5 rounded text-[9px] font-semibold bg-red-900/20 border border-red-800 text-red-400';
                 badge.innerText = 'OFFLINE';
-                tsContainer.classList.add('hidden');
                 startBtn.disabled = false;
                 startBtn.classList.remove('opacity-50', 'cursor-not-allowed');
             }
@@ -2647,6 +2856,160 @@ document.getElementById('btn-worker-logs-toggle').addEventListener('click', () =
     }
 });
 
+// --- Remote Access (Cloudflare quick tunnel + password gate) Logic ---
+// The tunnel and the GATE are one switch: starting the tunnel arms the gate
+// on ALL traffic (local + tunnel) and stopping it drops the gate. The server
+// holds the password (PBKDF2, per-boot salt) and the gate state; the UI just
+// renders status. While starting, the spinner shows until the server returns
+// the URL (cloudflared takes a few seconds to register with the edge).
+function tunnelSetBusy(on) {
+    document.getElementById('tunnel-busy').classList.toggle('hidden', !on);
+    document.getElementById('btn-tunnel-start').disabled = on;
+    document.getElementById('btn-tunnel-stop').disabled = on;
+    document.getElementById('tunnel-password').disabled = on;
+}
+
+function tunnelSetError(msg) {
+    const el = document.getElementById('tunnel-error');
+    if (msg) { el.textContent = msg; el.classList.remove('hidden'); }
+    else { el.textContent = ''; el.classList.add('hidden'); }
+}
+
+// Render live status (badge, URL, stop button). When syncBox is set, also
+// mirror the running state onto the checkbox + control visibility -- used at
+// page load and after a stop, so a tunnel started elsewhere (e.g. the CLI)
+// shows up. It is deliberately NOT used while the user is mid-start, so a
+// just-checked box isn't yanked back by a stale DOWN read.
+function tunnelRenderStatus(st, syncBox) {
+    const toggle = document.getElementById('tunnel-toggle');
+    const badge = document.getElementById('tunnel-status-badge');
+    const urlRow = document.getElementById('tunnel-url-row');
+    const urlEl = document.getElementById('tunnel-url');
+    const stopBtn = document.getElementById('btn-tunnel-stop');
+    const up = !!st && st.active;
+    const starting = !!st && st.starting;
+    const on = up || starting;
+    if (syncBox) {
+        toggle.checked = on;
+        document.getElementById('tunnel-controls').classList.toggle('hidden', !on);
+    }
+    document.getElementById('tunnel-status-row').classList.remove('hidden');
+    badge.className = 'px-1.5 py-0.5 rounded text-[9px] font-semibold ' +
+        (up ? 'bg-green-900/30 border border-green-800 text-green-400'
+            : starting ? 'bg-yellow-900/20 border border-yellow-800 text-yellow-400 animate-pulse'
+            : 'bg-gray-850 text-gray-500');
+    badge.innerText = up ? 'UP (gated)' : starting ? 'STARTING…' : 'DOWN';
+    if (up && st.url) {
+        urlEl.value = st.url;
+        urlRow.classList.remove('hidden');
+    } else {
+        urlRow.classList.add('hidden');
+    }
+    stopBtn.disabled = !on;
+}
+
+// Fetch live status and render it (syncing the box). Returns the state, or
+// null when the dashboard is unreachable or we're locked out on the gate
+// page (no cookie) -- in which case the login page is being shown anyway.
+async function tunnelRefresh() {
+    try {
+        const res = await fetch('/api/tunnel', { headers: { Accept: 'application/json' } });
+        if (!res.ok) return null;
+        const st = await res.json();
+        tunnelRenderStatus(st, true);
+        return st;
+    } catch { /* dashboard unreachable; SSE will surface it */ }
+    return null;
+}
+
+const tunnelToggle = document.getElementById('tunnel-toggle');
+tunnelToggle.addEventListener('change', () => {
+    const on = tunnelToggle.checked;
+    document.getElementById('tunnel-controls').classList.toggle('hidden', !on);
+    if (on) {
+        // The user is about to start: reveal the password field. Do NOT
+        // refresh here -- a stale DOWN read would uncheck the box before they
+        // have a chance to type a password.
+        return;
+    }
+    // Unchecking while UP is a stop request (with confirmation, since it also
+    // drops the gate for everyone). tunnelRefresh re-checks the box from live
+    // state; if it's still checked afterwards, the tunnel is really up.
+    tunnelRefresh().then(() => {
+        if (tunnelToggle.checked && confirm('Stop the tunnel? This also drops the password gate for local access.')) {
+            document.getElementById('btn-tunnel-stop').click();
+        }
+    });
+});
+
+document.getElementById('btn-tunnel-start').addEventListener('click', async () => {
+    const pw = document.getElementById('tunnel-password').value;
+    tunnelSetError('');
+    if (!pw || pw.length < 4) { tunnelSetError('Password must be at least 4 characters.'); return; }
+    tunnelSetBusy(true);
+    try {
+        const res = await fetch('/api/tunnel', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'start', password: pw })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) { tunnelSetError(data.error || `Start failed (HTTP ${res.status})`); return; }
+        tunnelRenderStatus(data, true);
+        // The gate is armed now, so this tab's next request would 401. Grab a
+        // session cookie (same password, via the one unauthenticated route) so
+        // the sidebar can still read status / stop the tunnel from THIS tab
+        // until the user refreshes -- a refresh lands on the gate page and
+        // re-authenticates the same way. The URL above is how anyone else gets
+        // in.
+        try {
+            await fetch('/api/tunnel/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pw }) });
+        } catch { /* non-fatal: the Stop button would still work via the gate page */ }
+        document.getElementById('tunnel-password').value = '';
+    } catch (e) {
+        tunnelSetError(e.message);
+    } finally {
+        tunnelSetBusy(false);
+    }
+});
+
+document.getElementById('tunnel-password').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') document.getElementById('btn-tunnel-start').click();
+});
+
+document.getElementById('btn-tunnel-stop').addEventListener('click', async () => {
+    tunnelSetError('');
+    tunnelSetBusy(true);
+    try {
+        const res = await fetch('/api/tunnel', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'stop' })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) tunnelSetError(data.error || `Stop failed (HTTP ${res.status})`);
+    } catch (e) {
+        tunnelSetError(e.message);
+    } finally {
+        tunnelSetBusy(false);
+        await tunnelRefresh();
+    }
+});
+
+document.getElementById('btn-tunnel-copy').addEventListener('click', async () => {
+    const urlEl = document.getElementById('tunnel-url');
+    try {
+        await navigator.clipboard.writeText(urlEl.value);
+        const btn = document.getElementById('btn-tunnel-copy');
+        const old = btn.textContent;
+        btn.textContent = 'Copied';
+        setTimeout(() => { btn.textContent = old; }, 1200);
+    } catch { urlEl.select(); }
+});
+
+// Reflect a live tunnel (started earlier, e.g. from the CLI) on page load.
+tunnelRefresh();
+
 // --- Master Logs Logic ---
 let showMasterLogs = false;
 let masterLogsInterval = null;
@@ -2732,9 +3095,9 @@ function updateSecondNodeVisibility() {
 // Tensor split only makes sense with an actual second compute target to split
 // across: a real second local GPU (deviceB set and different from deviceA) or
 // an RPC worker -- these two cases can't overlap (see applyRpcToggleUI).
-// RPC's own visibility here is driven by updateWorkerStatus() instead (only
-// shown once the remote worker is confirmed actually running), so this only
-// touches the container for the local-split case, to avoid fighting that.
+// The slider shows as soon as RPC is on, not only once the worker is RUNNING:
+// Boot starts the worker itself (server4.js ensureRpcWorker), so the split
+// has to be settable beforehand.
 // Node A/B labels follow the same split: "GPU A"/"GPU B" for a local pair,
 // "Local"/"Worker" once RPC is in the picture.
 function updateTensorSplitVisibility() {
@@ -2742,9 +3105,7 @@ function updateTensorSplitVisibility() {
     const deviceB = document.getElementById('device-select-b').value || document.getElementById('device-manual-b').value.trim();
     const localSplit = !!(deviceA && deviceB && deviceA !== deviceB);
     const rpcEnabled = document.getElementById('rpc-toggle').checked;
-    if (!rpcEnabled) {
-        document.getElementById('tensor-split-container').classList.toggle('hidden', !localSplit);
-    }
+    document.getElementById('tensor-split-container').classList.toggle('hidden', !(localSplit || rpcEnabled));
     document.querySelectorAll('.node-a-label').forEach(el => { el.textContent = rpcEnabled ? 'Local' : 'GPU A'; });
     document.querySelectorAll('.node-b-label').forEach(el => { el.textContent = rpcEnabled ? 'Worker' : 'GPU B'; });
 }
@@ -3398,7 +3759,7 @@ function renderChatSession(messages, scrollToIndex = -1) {
     messages.forEach((msg, idx) => {
         const ts = msg.timestamp || '';
         if (msg.role === 'user') {
-            const imgThumbs = msg.images ? `<div class="flex flex-wrap gap-2 mb-2">${msg.images.map(u => `<img src="${u}" class="h-16 w-16 object-cover rounded-lg border border-gray-600" loading="lazy">`).join('')}</div>` : '';
+            const imgThumbs = mediaThumbsHtml(msg.media);
             chatBox.insertAdjacentHTML('beforeend', `
                 <div id="msg-${idx}" class="msg-wrapper p-4 rounded-xl border border-gray-700 bg-gray-800 max-w-4xl mx-auto shadow-sm w-full mb-4">
                     <div class="flex justify-between items-center mb-2">
@@ -3544,11 +3905,12 @@ function renderChatHistory() {
 }
 
 function saveChatSession() {
-    // Strip .images from messages before persisting — base64 data URLs would
-    // blow past the ~5MB localStorage quota on a single photo upload.
-    const msgsWithoutImages = chatContext.map(({ images: _drop, ...rest }) => rest);
+    // Strip .media from messages before persisting — base64 data (images,
+    // and now much larger video/audio payloads) would blow past the ~5MB
+    // localStorage quota on a single attachment.
+    const msgsWithoutMedia = chatContext.map(({ media: _drop, ...rest }) => rest);
     const existingIndex = allChatSessions.findIndex(s => s.id === currentSessionId);
-    const session = { id: currentSessionId, messages: msgsWithoutImages };
+    const session = { id: currentSessionId, messages: msgsWithoutMedia };
     if (existingIndex > -1) {
         allChatSessions[existingIndex] = session;
     } else {
@@ -3574,10 +3936,11 @@ try {
     const saved = localStorage.getItem('cluster_chat_history');
     if (saved) {
         allChatSessions = JSON.parse(saved);
-        // Strip any images from previously-loaded sessions (may have been
-        // saved before the strip fix, or from a different client version).
+        // Strip any media from previously-loaded sessions (may have been
+        // saved before the strip fix, or from a different client version --
+        // including the old `.images` field name from before media kinds).
         allChatSessions.forEach(s => {
-            s.messages.forEach(m => { delete m.images; });
+            s.messages.forEach(m => { delete m.media; delete m.images; });
         });
         renderChatHistory();
     }
@@ -3717,7 +4080,7 @@ function renderExpandDetails(row) {
         }
         if (cfg.jinja !== undefined) cfgHtml += `<span class="text-gray-500">jinja</span><span class="text-gray-200">${cfg.jinja ? 'on' : 'off'}</span>`;
         if (cfg.chatTemplateFile) cfgHtml += `<span class="text-gray-500">template</span><span class="text-gray-200">${esc(cfg.chatTemplateFile)}</span>`;
-        if (cfg.mmprojEnabled && cfg.mmprojPath) cfgHtml += `<span class="text-gray-500">mmproj</span><span class="text-gray-200">${esc(cfg.mmprojPath)}</span>`;
+        if (cfg.mmprojEnabled && cfg.mmprojPath) cfgHtml += `<span class="text-gray-500">mmproj</span><span class="text-gray-200">${esc(cfg.mmprojPath)}${cfg.mmprojOffload === false ? ' (kept in RAM)' : ''}</span>`;
         if (cfg.loadMode) cfgHtml += `<span class="text-gray-500">load</span><span class="text-gray-200">${esc(cfg.loadMode)}</span>`;
         if (cfg.verbosity != null) cfgHtml += `<span class="text-gray-500">verbosity</span><span class="text-gray-200">${cfg.verbosity}</span>`;
         cfgHtml += `</div>`;
@@ -4572,7 +4935,13 @@ function createTpsChart(canvas, linearX, pointsFor) {
         options: {
             responsive: true, maintainAspectRatio: false, animation: { duration: 0 },
             interaction: { intersect: false, mode: 'index' },
-            plugins: { legend: { display: true, labels: { color: '#9ca3af' } } },
+            plugins: {
+                legend: { display: true, labels: { color: '#9ca3af' } },
+                // tokenLines (above) was defined but never wired to a tooltip --
+                // the hover never showed prefill/gen token counts despite the
+                // data being right there in the same point.
+                tooltip: { callbacks: { afterBody: tokenLines } }
+            },
             scales: {
                 x: linearX
                     ? { type: 'linear', ticks: { color: '#6b7280', maxTicksLimit: 8, callback: v => v >= 60 ? `${Math.floor(v/60)}m` : `${Math.round(v)}s` }, grid: { color: 'rgba(55,65,81,0.3)' }, title: { display: true, text: 'Elapsed', color: '#6b7280', font: { size: 9 } } }
@@ -4611,7 +4980,67 @@ function renderMonitorChart() {
     monitorTpsChart.update('none');
 }
 
-function renderRequestTable(rows, tbodyId, emptyId, clickVarName) {
+// Peak GPU temp for EACH card reached during a request, for the Thermal
+// column -- shared by Monitor and History since both render through this
+// same function. Live/session rows carry their own sample series (metrics),
+// so this can report a true per-card peak with a real thermal-throttle flag
+// exactly like server4.js's isRealThermal. Backfilled History rows carry no
+// samples (the CSV never stored a series, only the completion-time
+// snapshot), so they fall back to that snapshot and approximate "hot" with
+// the same THERMAL_TEMP_FLOOR corroboration threshold server4.js uses.
+const THERMAL_TEMP_FLOOR = 75;
+function requestThermalCell(r) {
+    let master = null, worker = null, masterHot = false, workerHot = false;
+    if (Array.isArray(r.metrics) && r.metrics.length > 0) {
+        for (const s of r.metrics) {
+            if (typeof s.masterTemp === 'number' && (master === null || s.masterTemp > master)) master = s.masterTemp;
+            if (typeof s.workerTemp === 'number' && (worker === null || s.workerTemp > worker)) worker = s.workerTemp;
+            if (s.masterThermal) masterHot = true;
+            if (s.workerThermal) workerHot = true;
+        }
+    } else {
+        master = typeof r.detail?.gpuTemp === 'number' ? r.detail.gpuTemp : null;
+        worker = typeof r.detail?.wGpuTemp === 'number' ? r.detail.wGpuTemp : null;
+        // No throttle_reasons in the CSV snapshot -- approximate with the
+        // same temperature floor server4.js requires to corroborate one.
+        masterHot = master != null && master >= THERMAL_TEMP_FLOOR;
+        workerHot = worker != null && worker >= THERMAL_TEMP_FLOOR;
+    }
+    if (master == null && worker == null) return '<span class="text-gray-600">--</span>';
+    const part = (v, hot) => v == null ? null : `<span class="${hot ? 'text-orange-400' : 'text-gray-500'}">${v.toFixed(0)}&deg;</span>`;
+    const parts = [part(master, masterHot), part(worker, workerHot)].filter(Boolean);
+    const title = (masterHot || workerHot) ? 'Real thermal throttle seen on the card shown in orange' : 'Master / Worker GPU temp';
+    return `<span title="${title}">${parts.join(' / ')}</span>`;
+}
+
+// Prompt/Gen t/s text-color fade for Monitor & History: red (worst) ->
+// orange -> gray (mid) -> blue/green (best this run), positioned by where a
+// row's value falls between the lowest and highest value in the FULL row set
+// passed to renderRequestTable (not just the currently-displayed slice), so
+// "peak" always tracks the actual best of the run/window, not wherever the
+// display happens to be paginated to.
+function tpsFadeDomain(rows, key, filterFn) {
+    const vals = rows.filter(r => (!filterFn || filterFn(r)) && typeof r[key] === 'number' && r[key] > 0).map(r => r[key]);
+    if (vals.length < 2) return null;
+    const lo = Math.min(...vals), hi = Math.max(...vals);
+    return hi > lo ? { lo, hi } : null;
+}
+function tpsFadeColor(v, domain, goodRgb) {
+    if (!domain || typeof v !== 'number') return '';
+    const t = Math.max(0, Math.min(1, (v - domain.lo) / (domain.hi - domain.lo)));
+    const stops = [[0, [248, 113, 113]], [0.33, [251, 146, 60]], [0.66, [156, 163, 175]], [1, goodRgb]];
+    for (let i = 0; i < stops.length - 1; i++) {
+        const [t0, c0] = stops[i], [t1, c1] = stops[i + 1];
+        if (t >= t0 && t <= t1) {
+            const lt = (t - t0) / (t1 - t0 || 1);
+            const c = c0.map((v0, idx) => Math.round(v0 + (c1[idx] - v0) * lt));
+            return `color: rgb(${c[0]},${c[1]},${c[2]})`;
+        }
+    }
+    return '';
+}
+
+function renderRequestTable(rows, tbodyId, emptyId, clickVarName, maxDisplay = 100) {
     const tbody = document.getElementById(tbodyId);
     const emptyEl = document.getElementById(emptyId);
     if (!tbody) return;
@@ -4621,7 +5050,13 @@ function renderRequestTable(rows, tbodyId, emptyId, clickVarName) {
         return;
     }
     emptyEl.classList.add('hidden');
-    const displayRows = [...rows].reverse().slice(0, 100); // most recent first
+    // Cache-hit requests (promptTokens <= 64) have a meaningless "prompt t/s"
+    // -- a few tokens over fixed per-request overhead, not a prefill rate
+    // (same reasoning as the Bench view's isColdPrefill). Excluded from the
+    // domain so one cache hit can't anchor the whole fade scale.
+    const promptDomain = tpsFadeDomain(rows, 'promptTps', r => (r.promptTokens ?? 0) > 64);
+    const genDomain = tpsFadeDomain(rows, 'genTps');
+    const displayRows = [...rows].reverse().slice(0, maxDisplay); // most recent first
     // Row click expands the omni graph for that specific request -- live rows
     // carry their samples inline (from the COMPLETION payload), backfilled
     // rows fetch them from the server's short ring buffer on demand (see
@@ -4635,11 +5070,12 @@ function renderRequestTable(rows, tbodyId, emptyId, clickVarName) {
             <td class="px-4 py-1.5 text-gray-500">${r.live ? '<span class="inline-block h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span> live' : (r.timestamp ? new Date(r.timestamp).toLocaleTimeString() : '--')}${r.aborted ? ' <span class="text-orange-400 cursor-help" title="Request was canceled by the client before finishing (agent tool-call aborts, user interrupts). Counts are the last values observed live, not final totals.">⚠</span>' : ''}</td>
             <td class="px-4 py-1.5 truncate max-w-[220px]" title="${escapeHtml(r.model || '')}">${escapeHtml(r.model || '--')}</td>
             <td class="px-4 py-1.5 text-right font-mono">${r.promptTokens ?? '--'}</td>
-            <td class="px-4 py-1.5 text-right font-mono text-blue-400">${r.promptTpsRange || fmtTpsRange(r.promptTps, r.prefillTpsMin, r.prefillTpsMax)}</td>
+            <td class="px-4 py-1.5 text-right font-mono text-blue-400" style="${tpsFadeColor(r.promptTps, promptDomain, [96, 165, 250])}">${r.promptTpsRange || fmtTpsRange(r.promptTps, r.prefillTpsMin, r.prefillTpsMax)}</td>
             <td class="px-4 py-1.5 text-right font-mono">${r.genTokens ?? '--'}</td>
-            <td class="px-4 py-1.5 text-right font-mono text-green-400">${r.genTpsRange || fmtTpsRange(r.genTps, r.genTpsMin, r.genTpsMax)}</td>
+            <td class="px-4 py-1.5 text-right font-mono text-green-400" style="${tpsFadeColor(r.genTps, genDomain, [74, 222, 128])}">${r.genTpsRange || fmtTpsRange(r.genTps, r.genTpsMin, r.genTpsMax)}</td>
             <td class="px-4 py-1.5 text-right font-mono text-purple-400" title="${r.draftAcceptRate != null ? `${r.draftAccepted ?? '?'} accepted / ${r.draftGenerated ?? '?'} generated draft tokens${r.draftMeanLen != null ? `, mean accepted run ${Number(r.draftMeanLen).toFixed(2)}` : ''}` : 'no speculative drafting on this request'}">${r.draftAcceptRate != null ? (r.draftAcceptRate * 100).toFixed(0) + '%' : '--'}</td>
             <td class="px-4 py-1.5 text-right font-mono">${r.wallTime != null ? Number(r.wallTime).toFixed(1) : '--'}</td>
+            <td class="px-4 py-1.5 text-right font-mono">${requestThermalCell(r)}</td>
         </tr>
     `).join('');
 }
@@ -4869,6 +5305,14 @@ const _historyTpsLinearX = { value: true }; // true = time-spaced (linear), fals
 let historyDataPoints = [];
 let historyRequestRows = [];
 const HISTORY_CAP = 200;
+// Pagination over the CSV, which can grow into the thousands of rows over a
+// project's lifetime -- historyRequestRows only ever holds what's been paged
+// in so far, oldest-loaded-first, and historyOffset tracks how far back (in
+// rows-from-the-newest) the next "load older" page should start from.
+let historyOffset = 0;
+let historyTotal = 0;
+let historyDisplayLimit = 100;
+let historyLoadingOlder = false;
 
 function initHistoryChart() {
     if (historyTpsChart) return;
@@ -4898,38 +5342,63 @@ function renderHistoryChart() {
 }
 
 function renderHistoryTable() {
-    renderRequestTable(historyRequestRows, 'history-requests-body', 'history-requests-empty', '__historyRowsForClick');
+    renderRequestTable(historyRequestRows, 'history-requests-body', 'history-requests-empty', '__historyRowsForClick', historyDisplayLimit);
+    updateHistoryLoadStatus();
+}
+
+function updateHistoryLoadStatus() {
+    const statusEl = document.getElementById('history-load-status');
+    const btn = document.getElementById('history-load-older');
+    if (!statusEl || !btn) return;
+    const shown = Math.min(historyDisplayLimit, historyRequestRows.length);
+    statusEl.textContent = historyTotal > 0
+        ? `Showing ${shown} of ${historyTotal} logged requests`
+        : (historyRequestRows.length === 0 ? 'No requests logged yet.' : '');
+    // More to see either because more rows are already loaded than currently
+    // displayed, or because the server has older rows this page never fetched.
+    const moreToShow = historyRequestRows.length > historyDisplayLimit || historyOffset < historyTotal;
+    btn.classList.toggle('hidden', !moreToShow);
+    btn.disabled = historyLoadingOlder;
+    btn.textContent = historyLoadingOlder ? 'Loading…' : 'Load 100 older';
+}
+
+function csvRowToHistoryRow(r) {
+    return {
+        timestamp: r.timestamp, model: r.model, runId: r.runId,
+        promptTokens: r.promptTokens, promptTps: r.promptTps,
+        genTokens: r.genTokens, genTps: r.genTps, wallTime: r.wallTime,
+        draftAcceptRate: r.draftAcceptRate ?? null,
+        draftAccepted: r.draftAccepted ?? null,
+        draftGenerated: r.draftGenerated ?? null,
+        draftMeanLen: r.draftMeanLen ?? null,
+        aborted: !!r.aborted,
+        metrics: null,
+        // Same server-computed range Monitor uses; null on rows logged
+        // before ranges were persisted.
+        prefillTpsMin: r.prefillTpsMin ?? null, prefillTpsMax: r.prefillTpsMax ?? null,
+        genTpsMin: r.genTpsMin ?? null, genTpsMax: r.genTpsMax ?? null,
+        promptTpsRange: null,
+        genTpsRange: null,
+        detail: r.detail || null // full row detail for expanded view
+    };
 }
 
 // Re-fetches on every visit (not one-shot) -- History is meant to reflect
 // "everything ever logged" at the moment you're looking, including whatever
-// completed while you were on a different tab.
+// completed while you were on a different tab. Resets pagination back to the
+// newest window each time, same as before this feature existed.
 async function backfillHistoryData() {
     const statusEl = document.getElementById('history-chart-status');
     try {
         const res = await fetch(`/api/logs/recent?limit=${HISTORY_CAP}`);
         const data = await res.json();
         const rows = data.rows || [];
+        historyTotal = data.total ?? rows.length;
+        historyOffset = rows.length;
+        historyDisplayLimit = 100;
         historyDataPoints = rows.map(r => ({ time: new Date(r.timestamp).getTime(), promptTps: r.promptTps, genTps: r.genTps,
             promptTokens: r.promptTokens, genTokens: r.genTokens }));
-        historyRequestRows = rows.map(r => ({
-            timestamp: r.timestamp, model: r.model, runId: r.runId,
-            promptTokens: r.promptTokens, promptTps: r.promptTps,
-            genTokens: r.genTokens, genTps: r.genTps, wallTime: r.wallTime,
-            draftAcceptRate: r.draftAcceptRate ?? null,
-            draftAccepted: r.draftAccepted ?? null,
-            draftGenerated: r.draftGenerated ?? null,
-            draftMeanLen: r.draftMeanLen ?? null,
-            aborted: !!r.aborted,
-            metrics: null,
-            // Same server-computed range Monitor uses; null on rows logged
-            // before ranges were persisted.
-            prefillTpsMin: r.prefillTpsMin ?? null, prefillTpsMax: r.prefillTpsMax ?? null,
-            genTpsMin: r.genTpsMin ?? null, genTpsMax: r.genTpsMax ?? null,
-            promptTpsRange: null,
-            genTpsRange: null,
-            detail: r.detail || null // full row detail for expanded view
-        }));
+        historyRequestRows = rows.map(csvRowToHistoryRow);
         if (statusEl) statusEl.textContent = '';
     } catch (e) {
         if (statusEl) statusEl.textContent = 'Failed to load history';
@@ -4937,6 +5406,40 @@ async function backfillHistoryData() {
     renderHistoryChart();
     renderHistoryTable();
 }
+
+// "Load 100 older": reveal more of what's already fetched first, and only go
+// back to the server once the loaded window itself runs out -- keeps repeat
+// clicks near-instant while still reaching all the way back through the CSV.
+async function loadOlderHistory() {
+    if (historyLoadingOlder) return;
+    if (historyRequestRows.length > historyDisplayLimit) {
+        historyDisplayLimit += 100;
+        renderHistoryTable();
+        return;
+    }
+    if (historyOffset >= historyTotal) return;
+    historyLoadingOlder = true;
+    updateHistoryLoadStatus();
+    try {
+        const res = await fetch(`/api/logs/recent?limit=${HISTORY_CAP}&offset=${historyOffset}`);
+        const data = await res.json();
+        const rows = data.rows || [];
+        historyTotal = data.total ?? historyTotal;
+        historyOffset += rows.length;
+        historyDisplayLimit += 100;
+        // Older rows prepend -- historyRequestRows stays oldest-loaded-first,
+        // same order the CSV/server return it in.
+        historyDataPoints = rows.map(r => ({ time: new Date(r.timestamp).getTime(), promptTps: r.promptTps, genTps: r.genTps,
+            promptTokens: r.promptTokens, genTokens: r.genTokens })).concat(historyDataPoints);
+        historyRequestRows = rows.map(csvRowToHistoryRow).concat(historyRequestRows);
+    } catch (e) {
+        // Leave existing state intact -- the button just stays available to retry.
+    }
+    historyLoadingOlder = false;
+    renderHistoryChart();
+    renderHistoryTable();
+}
+document.getElementById('history-load-older')?.addEventListener('click', loadOlderHistory);
 
 // --- Tab switching (Interactive / Monitor / History) ---
 function setTabButtonActive(id, active) {
@@ -6356,7 +6859,7 @@ async function runSweep(onlyRow) {
                 const completionArrived = new Promise(res => { abCaptureResolve = res; });
                 console.log(`[ab-sweep] ${row.label} rep ${rep + 1}: sending request, abCaptureResolve armed = ${!!abCaptureResolve}`);
                 const reqSentAt = Date.now();
-                const resp = await fetch('http://localhost:8080/v1/chat/completions', {
+                const resp = await fetch('/api/chat', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ model: 'ab-test', messages: [{ role: 'user', content: prompt }], max_tokens: maxTokens, stream: false })
                 });
