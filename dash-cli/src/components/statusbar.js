@@ -1,14 +1,12 @@
 import React from 'react';
 import { Box, Text, useStdout } from 'ink';
-import { fmtUptime, portFromCommand } from '../format.js';
+import { fmtUptime, portFromCommand, modelName } from '../format.js';
 import { h } from '../h.js';
 
 const TABS = [
   ['1', 'Monitor', 'mode1'],
   ['2', 'Launch', 'mode2'],
   ['3', 'Chat', 'mode3'],
-  ['4', 'Bench', 'mode4'],
-  ['5', 'History', 'mode5'],
 ];
 
 // Exact text of each tab segment, in render order -- shared by the component
@@ -20,10 +18,9 @@ const TABS = [
 export function tabLayout(mode) {
   return TABS.map(([key, label, modeId], i) => {
     const active = mode === modeId;
-    const built = modeId === 'mode1' || modeId === 'mode2' || modeId === 'mode3';
     const prefix = i > 0 ? '  ' : '';
-    const text = prefix + (built ? ` ${key} ${label} ` : ` ${key} ${label}· `);
-    return { modeId, label, built, active, text };
+    const text = `${prefix} ${key} ${label} `;
+    return { modeId, label, active, text };
   });
 }
 
@@ -56,10 +53,10 @@ export function StatusBar({ mode, conn, server, modelUpSince }) {
   const portLen = running ? 2 + String(port).length : 0;
   const upLen = running && uptime ? 13 : 0; // '  up HH:MM:SS'
   const connText = conn === 'live' ? '\u25CF ' : conn === 'reconnecting' ? '\u25CC reconnecting' : '\u25CB offline';
-  const brand = cols >= 96 ? '  Mission Control' : '';
+  const brand = cols >= 96 ? '  LL-Dash' : '';
   const fixedLen = 9 + 2 + stateLen + portLen + upLen + connText.length + brand.length;
   const modelMax = Math.max(14, cols - fixedLen - 2);
-  const rawModel = server.model || 'no model loaded';
+  const rawModel = (server.model && modelName(server.model)) || 'no model loaded';
   const model = rawModel.length > modelMax ? rawModel.slice(0, Math.max(1, modelMax - 1)) + '\u2026' : rawModel;
   const pad = Math.max(1, cols - fixedLen - model.length);
 
@@ -83,17 +80,25 @@ export function StatusBar({ mode, conn, server, modelUpSince }) {
       return h(Text, { key: t.modeId }, prefix,
         t.active
           ? h(Text, { bold: true, color: 'white', backgroundColor: 'blue' }, body)
-          : t.built
-            ? h(Text, { dimColor: true }, body)
-            : h(Text, { color: 'gray' }, body));
+          : h(Text, { dimColor: true }, body));
     })),
   );
 }
 
-// Bottom line: contextual key hints.
+// Bottom line: contextual key hints -- the key in bold, its label dim, so the
+// keys read at a glance. An empty list still takes its row (a hint row that
+// comes and goes would shift everything above it).
+// The hints are keyed by POSITION on purpose: keyed by content, a hint added
+// in front of the others is an insert-before inside a Text, which ink 5.2
+// doesn't re-measure (insertBeforeNode returns before marking the node
+// dirty) -- the line kept its old width and lost its tail.
 export function KeymapBar({ hints }) {
+  if (!hints || hints.length === 0) return h(Text, null, ' ');
   return h(Box, null,
-    h(Text, { dimColor: true },
-      hints.map(([k, label], i) => `${i > 0 ? '  ' : ''}${k}: ${label}`).join('')),
+    h(Text, null,
+      hints.map(([k, label], i) => h(Text, { key: i },
+        i > 0 ? '  ' : '',
+        h(Text, { bold: true, color: 'cyan' }, k),
+        h(Text, { dimColor: true }, `: ${label}`)))),
   );
 }

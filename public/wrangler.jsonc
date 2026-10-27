@@ -1,0 +1,27 @@
+// lab.kylebaker.io as a Cloudflare Worker with static assets (2026-10-22). See STATIC-ARCHITECTURE.md, section 6.
+// No script: Cloudflare serves the build (dist-static/) itself, with its _headers and _redirects. publish-static.js
+// deploys with `wrangler deploy --config wrangler.jsonc --name <pagesProject> --assets <build>`; by hand, in public/:
+//   npx wrangler dev --port 4174          (local, the same asset server)
+//   npx wrangler deploy --dry-run         (checks this file and the build; uploads nothing)
+//
+// html_handling / not_found_handling: what Pages did, and what the build's rules and step 6d expect -- /results serves
+// results.html, /results.html and /results/ redirect to /results, an unknown path is 404.html with status 404.
+// workers_dev: OFF (Kyle 10-22, before the first deploy): the account's workers.dev subdomain is built from his e-mail
+// address, so lab-kylebaker.<account>.workers.dev would publish it; the site lives only at lab.kylebaker.io.
+// preview_urls: no per-version URLs (nothing uses them).
+//
+// NEVER add "routes" or "route" here (publish-static.js refuses to deploy if you do): run from cron, with no terminal
+// to ask, wrangler REPLACES an existing DNS record for a custom domain. lab.kylebaker.io is attached once, by hand
+// (step 6g); deploys without a route leave an attached domain alone.
+// Whole-line comments only: publish-static.js reads this file too.
+{
+  "name": "lab-kylebaker",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./dist-static",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  },
+  "workers_dev": false,
+  "preview_urls": false
+}

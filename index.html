@@ -3,15 +3,19 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cluster Command Center</title>
+    <title>LL-Dash</title>
+    <!-- KBIO tile (2026-10-22; source set + make.py in experiment-1/favicon-kbio/), served from this dir by server4.js -->
+    <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <link rel="stylesheet" href="./vendor/fonts.css">
     <link rel="stylesheet" href="./vendor/tailwind.css">
     <script src="./vendor/marked.min.js"></script>
     <script src="./vendor/chart.js"></script>
+    <script src="./ui/shared/theme.js"></script> <!-- Chart.js defaults from the design tokens -->
     <style>
-        ::-webkit-scrollbar { width: 8px; height: 8px; }
-        ::-webkit-scrollbar-track { background: #111827; }
-        ::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
-        .prose pre { background-color: #111827 !important; padding: 1rem; border-radius: 0.5rem; border: 1px solid #374151; }
+        /* Scrollbars, form controls, tables etc. are skinned in tailwind.src.css (built into vendor/tailwind.css). */
+        .prose pre { background-color: #0c0d11 !important; padding: 1rem; border-radius: 0.6rem; border: 1px solid #252832; }
         .fade-bottom { mask-image: linear-gradient(to bottom, black 40%, transparent 100%); -webkit-mask-image: linear-gradient(to top, black 40%, transparent 100%); }
         /* "show thinking" toggle: hide the reasoning blocks transcript-wide */
         .hide-thinking .reasoning-container { display: none !important; }
@@ -64,488 +68,535 @@
                 animation: fade-out-end 0.6s ease-out forwards;
             }
 
-        /* Utilities missing from the static vendor/tailwind.css build (it was
-           compiled before these classes were first used -- new classes never
-           appear in it, they just silently do nothing). Keep in sync when
-           adding UI that uses previously-unused Tailwind classes. */
-        .inset-x-0 { left: 0; right: 0; }
-        .top-10 { top: 2.5rem; }
-        .bottom-0 { bottom: 0; }
-        .z-30 { z-index: 30; }
-        .backdrop-blur-sm { backdrop-filter: blur(4px); }
-        .bg-gray-950\/85 { background-color: rgba(3,7,18,0.85); }
-        .bg-yellow-900\/40 { background-color: rgba(113,63,18,0.4); }
-        .bg-green-900\/40 { background-color: rgba(20,83,45,0.4); }
-        .text-orange-400 { color: #fb923c; }
-        .text-amber-400 { color: #fbbf24; }
-        .grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-        .grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-        .grid-cols-6 { grid-template-columns: repeat(6, minmax(0, 1fr)); }
-        .col-span-2 { grid-column: span 2 / span 2; }
-        .col-span-3 { grid-column: span 3 / span 3; }
-        .gap-x-2 { column-gap: 0.5rem; }
-        .gap-y-1 { row-gap: 0.25rem; }
-        .pb-1 { padding-bottom: 0.25rem; }
-        .duration-500 { transition-duration: 500ms; }
-        .min-h-\[16rem\] { min-height: 16rem; }
-        .max-h-\[32rem\] { max-height: 32rem; }
-        .hover\:bg-indigo-500:hover { background-color: #6366f1; }
-        .hover\:bg-gray-700:hover { background-color: #374151; }
-        .break-all { word-break: break-all; }
-        .bg-amber-700 { background-color: #b45309; }
-        .hover\:bg-amber-600:hover { background-color: #d97706; }
-        .select-none { user-select: none; }
-        .pl-3 { padding-left: 0.75rem; }
-        .pb-2 { padding-bottom: 0.5rem; }
-        .hover\:text-red-400:hover { color: #f87171; }
-        .ml-auto { margin-left: auto; }
-        .inline-block { display: inline-block; }
+
+        /* Phones and tablets (below 1024px -- two 20-24rem sidebars leave main
+           unusably narrow under that): both sidebars become slide-over drawers
+           opened by the tab-bar toggles (setDrawerOpen in script.js).
+           The !important width/display override the desktop-only inline width
+           and collapse state, so those never leak onto a phone. */
+        .drawer-backdrop { display: none; }
+        @supports (height: 100dvh) { body.h-screen { height: 100dvh; } }
+        @media (max-width: 1023px) {
+            #left-resizer, #sidebar-resizer { display: none !important; }
+            /* swipeable on touch; desktop keeps the scrollbar as a cue that tabs are cut off */
+            .tab-strip { scrollbar-width: none; }
+            .tab-strip::-webkit-scrollbar { display: none; }
+            #launch-sidebar, #telemetry-sidebar {
+                position: fixed; top: 0; bottom: 0; z-index: 45;
+                width: min(88vw, 24rem) !important;
+                display: flex !important;
+                visibility: hidden;
+                transition: transform .2s ease, visibility 0s linear .2s;
+                box-shadow: 0 0 40px rgba(0,0,0,.6);
+            }
+            #launch-sidebar { left: 0; transform: translateX(-100%); }
+            #telemetry-sidebar { right: 0; transform: translateX(100%); padding: 1rem; }
+            #launch-sidebar.drawer-open, #telemetry-sidebar.drawer-open {
+                transform: none; visibility: visible; transition: transform .2s ease;
+            }
+            body.drawer-active .drawer-backdrop {
+                display: block; position: fixed; inset: 0; z-index: 44; background: rgba(0,0,0,.6);
+            }
+            /* iOS Safari zooms the page when an input under 16px gets focus */
+            input, select, textarea { font-size: 16px !important; }
+            #expand-modal .expand-chart-box { aspect-ratio: 4 / 3 !important; }
+        }
     </style>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans h-screen flex flex-col md:flex-row overflow-hidden">
 
     <aside id="launch-sidebar" class="w-full md:w-80 bg-gray-900 border-r border-gray-800 flex flex-col overflow-y-auto shrink-0" style="width: 20rem;">
-        <div class="p-5 border-b border-gray-800 bg-gray-900/90 sticky top-0 z-10 backdrop-blur">
-            <h1 class="text-lg font-bold text-white tracking-tight flex items-center gap-2 mb-3">
-                <svg class="w-5 h-5 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
-                Cluster Control
-            </h1>
-            <div class="flex items-center justify-between gap-2">
-                <div id="engine-status" class="flex flex-1 items-center gap-2 px-3 py-2 rounded-lg bg-red-900/20 border border-red-800 text-red-400 text-xs font-semibold">
+        <!-- Header: brand + engine status. Status pill classes are set by script.js (setEngineBadge). -->
+        <div class="px-5 pt-4 pb-4 border-b border-gray-800 bg-gray-900/90 sticky top-0 z-10 backdrop-blur">
+            <div class="flex items-center gap-2.5 mb-3.5">
+                <div class="brand-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7l8-4 8 4-8 4-8-4z"/><path d="M4 12l8 4 8-4"/><path d="M4 17l8 4 8-4"/></svg>
+                </div>
+                <div class="leading-tight min-w-0">
+                    <h1 class="text-[15px] font-semibold text-white tracking-tight">LL-Dash</h1>
+                    <div class="text-[11px] text-gray-500">llama.cpp control room</div>
+                </div>
+            </div>
+            <div class="flex items-stretch gap-2">
+                <div id="engine-status" class="status-pill is-stopped flex-1">
                     <span class="h-2 w-2 rounded-full bg-red-500"></span> ENGINE STOPPED
                 </div>
-                <button id="btn-stop-server" class="hidden px-3 py-2 bg-red-900/40 hover:bg-red-800 border border-red-800 text-red-400 rounded-lg text-xs font-bold transition-colors">Kill</button>
+                <button id="btn-stop-server" title="Stop llama-server" class="hidden px-3 py-2 bg-red-900/40 hover:bg-red-800 border border-red-800 text-red-400 rounded-lg text-xs font-bold transition-colors">Kill</button>
             </div>
         </div>
 
-        <div class="p-5 space-y-5">
-            <div class="space-y-3">
-                <div id="hardware-config-section" class="space-y-3">
-                    <div class="flex justify-between items-end">
-                        <h2 class="text-xs font-bold tracking-wider text-gray-500 uppercase">Hardware Config</h2>
-                        <button onclick="openHFModal()" class="text-[10px] text-indigo-400 hover:text-indigo-300 underline">Find Models (HF)</button>
-                    </div>
-                </div>
-                <!-- Loads a saved profile (model, launch mode, devices, every field,
-                     the raw command) immediately on selection. Saving happens at the
-                     bottom of this panel, right above Load Model. -->
-                <div class="flex gap-1.5 items-center w-full">
-                    <span class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider shrink-0">Profile</span>
-                    <select id="load-profile-select" class="flex-1 min-w-0 bg-gray-800 border border-indigo-900/60 rounded-md px-2 py-1.5 text-xs text-gray-300">
-                        <option value="">Load Saved Profile...</option>
-                    </select>
-                    <button type="button" id="btn-paste-profile" title="Add a profile from a pasted line: 'name :: -m <model-substring> <server args>'" class="px-2 py-1.5 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded text-[11px] text-indigo-300">＋</button>
-                    <button type="button" id="btn-delete-profile" title="Delete selected profile" class="px-2 py-1.5 bg-red-900/30 hover:bg-red-900/50 border border-red-800/40 rounded text-[11px] text-red-400">×</button>
-                </div>
-                <select id="model-select" class="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-sm text-gray-200">
+        <!-- MODEL: profile, model, build, devices. Always visible -- it's what every launch starts from.
+             (#hardware-config-section is what setHardwareConfigLocked dims while a model runs.) -->
+        <section class="px-5 pt-4 pb-5 space-y-3">
+            <div id="hardware-config-section" class="flex justify-between items-center">
+                <h2 class="side-title">Model</h2>
+                <button onclick="openHFModal()" class="text-[11px] font-medium text-indigo-400 hover:text-indigo-300">Find on Hugging Face</button>
+            </div>
+            <!-- Engine: which binary serves the model. llama-server (the default, every field
+                 below) or Strata (Qwen3.8-Flash-Next IQ3_XXS / coder IQ1_M -- config-file driven,
+                 launched via queue-serve.sh; see lib/strata.js). Switching hides the fields the
+                 other engine doesn't use (script.js setEngine). -->
+            <div class="flex gap-1.5 items-center">
+                <label class="field-label !mb-0" style="width:auto;flex:none">Engine</label>
+                <select id="engine-select" class="field flex-1 min-w-0">
+                    <option value="llama-server">llama-server (GGUF)</option>
+                    <option value="strata">Strata · Qwen3.8-Flash-Next</option>
+                </select>
+            </div>
+            <!-- Loads a saved profile (model, launch mode, devices, every field, the raw command)
+                 immediately on selection. Saving happens in the footer, next to Load Model. -->
+            <div class="flex gap-1.5 items-center w-full">
+                <select id="load-profile-select" class="field flex-1 min-w-0" title="Saved profile">
+                    <option value="">Load saved profile…</option>
+                </select>
+                <button type="button" id="btn-paste-profile" title="Add a profile from a pasted line: 'name :: -m <model-substring> <server args>'" class="btn btn-sm h-[30px] w-[30px] !p-0 text-indigo-300">＋</button>
+                <button type="button" id="btn-delete-profile" title="Delete selected profile" class="btn btn-sm btn-danger h-[30px] w-[30px] !p-0">×</button>
+            </div>
+            <!-- The loaded profile's fit on THIS machine (script.js renderProfileFitNote, from /api/profiles
+                 `availability`): where it runs, and what was re-pointed or is missing. -->
+            <div id="profile-fit-note" class="hidden text-[10px]"></div>
+            <div class="flex gap-1.5" id="llama-model-row">
+                <select id="model-select" class="field flex-1 min-w-0 !text-[13px] !py-2 font-medium">
                     <option>Loading models...</option>
                 </select>
-
-                <!-- Compute config sits directly under the model selector: picking a
-                     model auto-snaps every field below (and the raw command box) to
-                     the last config you ran for it, sourced from the CSV (see
-                     snapToLastUsedConfig() in script.js and config_json in
-                     server4.js). The master always launches natively now (no Docker;
-                     see server4.js resolveLaunchCommand) -- RPC is an optional add-on
-                     below, off by default, not a separate mode. RPC needs a local
-                     build compiled with GGML_RPC=ON and a ggml-rpc-server binary
-                     on the worker (dashboard.config.json rpcWorker; see README). -->
-                <div class="p-3 bg-gray-800/50 border border-gray-700/50 rounded-lg space-y-3">
-                    <div>
-                        <label class="block text-[10px] text-gray-400 mb-0.5">Build <span class="text-indigo-400 cursor-help" title="Which compiled llama-server binary to launch (configured in dashboard.config.json). Different builds can expose different backends/devices for the same physical GPUs -- e.g. a CUDA+Vulkan build shows an extra native CUDA0 device for an NVIDIA card that a Vulkan-only build can only reach through Vulkan. Switching this re-runs device detection automatically.">?</span></label>
-                        <select id="build-select" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-[10px] text-gray-200"></select>
-                    </div>
-                    <!-- Detected automatically on load and on Build change (script.js
-                         devicesDetectedPromise/detectDevices) -- no manual trigger, since
-                         GPU hotplug isn't supported by the kernel. -->
-                    <span class="text-[10px] text-gray-400">Vulkan/CUDA devices on this machine</span>
-                    <div id="device-detect-status" class="hidden text-[9px] text-amber-400"></div>
-
-                    <div id="device-dropdown-row" class="hidden grid grid-cols-2 gap-2">
-                        <div>
-                            <label class="block text-[9px] text-gray-500 mb-0.5">GPU A</label>
-                            <select id="device-select-a" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-[10px] text-gray-200"></select>
-                        </div>
-                        <div>
-                            <label class="block text-[9px] text-gray-500 mb-0.5">GPU B</label>
-                            <select id="device-select-b" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-[10px] text-gray-200"></select>
-                        </div>
-                    </div>
-
-                    <!-- Manual fallback: shown when detection fails/times out, or the user
-                         wants to type device ids directly. -->
-                    <div id="device-manual-row" class="grid grid-cols-2 gap-2">
-                        <div>
-                            <label class="block text-[9px] text-gray-500 mb-0.5">GPU A id</label>
-                            <input type="text" id="device-manual-a" placeholder="e.g. Vulkan0" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-[10px] text-gray-200 font-mono">
-                        </div>
-                        <div>
-                            <label class="block text-[9px] text-gray-500 mb-0.5">GPU B id</label>
-                            <input type="text" id="device-manual-b" placeholder="e.g. Vulkan1" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-[10px] text-gray-200 font-mono">
-                        </div>
-                    </div>
-
-                    <!-- RPC Worker: an optional extra device, independent of the local
-                         GPU(s) above -- off by default. Enabling it forces GPU B back to
-                         "None" (script.js applyRpcToggleUI), since the split is exactly
-                         2-way (this machine vs. the worker); see resolveLaunchCommand
-                         and monitor.py's local_second_gpu/worker_ssh handling. -->
-                    <div class="space-y-2 border-t border-gray-700/50 pt-2">
-                        <label class="flex items-center gap-2 text-xs font-semibold text-indigo-400">
-                            <input type="checkbox" id="rpc-toggle" class="accent-indigo-500 rounded">
-                            Enable RPC Worker <span class="text-indigo-400 cursor-help" title="Adds a remote llama.cpp RPC worker as a second compute target alongside (not instead of) this machine's GPU(s). Requires a local build compiled with GGML_RPC=ON -- see README -- and ggml-rpc-server running on the worker (Start Worker launches it over SSH).">?</span>
-                        </label>
-                        <input type="text" id="worker-ssh" placeholder="user@worker-host" class="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-xs text-gray-200">
-
-                        <div id="worker-ssh-controls" class="space-y-2 border-t border-gray-700/50 pt-2 opacity-50">
-                            <div class="flex items-center gap-2 mb-2">
-                                <label class="text-[10px] text-gray-400 w-1/4">Transport</label>
-                                <select id="transport-type" disabled class="flex-1 bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-xs text-gray-200">
-                                    <option value="WiFi">Wi-Fi / LAN</option>
-                                    <option value="TB4">Thunderbolt 4</option>
-                                    <option value="WAN">Internet (away from home)</option>
-                                </select>
-                            </div>
-                            <div class="flex justify-between items-center text-[10px]">
-                                <span class="text-gray-400">Worker Status:</span>
-                                <span id="worker-status-badge" class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-gray-850 text-gray-500">DISABLED</span>
-                            </div>
-                            <div class="flex gap-2">
-                                <button id="btn-worker-start" disabled class="flex-1 px-2 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-[10px] font-medium transition-colors">Start Worker</button>
-                                <button id="btn-worker-stop" disabled class="flex-1 px-2 py-1 bg-red-900/30 hover:bg-red-900/50 text-red-400 rounded text-[10px] font-medium transition-colors">Stop</button>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Remote access: Cloudflare quick tunnel + hard password
-                         gate. Checking the box reveals a password field; Start
-                         spins cloudflared (spinner until the URL is up) and
-                         ARMS THE GATE ON ALL TRAFFIC (local + tunnel) -- the
-                         only unauthenticated response is the login page itself.
-                         While up: a browser can open this live dash at the
-                         tunnel URL, and a remote CLI can connect to the backend
-                         (llama-cli -s <tunnel-url> --token <pw>). Stop drops
-                         the gate and restores normal local access. -->
-                    <div class="space-y-2 border-t border-gray-700/50 pt-2">
-                        <label class="flex items-center gap-2 text-xs font-semibold text-indigo-400">
-                            <input type="checkbox" id="tunnel-toggle" class="accent-indigo-500 rounded">
-                            Remote access (Cloudflare tunnel)
-                            <span class="text-indigo-400 cursor-help" title="Starts a Cloudflare quick tunnel (trycloudflare.com, no account) to this dashboard and arms a hard password gate on ALL traffic. While up: a browser can open the live web dash at the tunnel URL, and a remote CLI can connect to the local backend. Your local dashboard also asks for the password after a refresh. Stop drops the gate.">?</span>
-                        </label>
-                        <div id="tunnel-controls" class="hidden space-y-2 border-t border-gray-700/50 pt-2">
-                            <div class="flex gap-2">
-                                <input type="password" id="tunnel-password" placeholder="password (min 4 chars)" class="flex-1 bg-gray-900 border border-gray-700 rounded-md px-3 py-1.5 text-xs text-gray-200" autocomplete="new-password">
-                                <button id="btn-tunnel-start" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-[10px] font-medium transition-colors">Start</button>
-                            </div>
-                            <div id="tunnel-status-row" class="hidden flex justify-between items-center text-[10px]">
-                                <span class="text-gray-400">Tunnel Status:</span>
-                                <span id="tunnel-status-badge" class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-gray-850 text-gray-500">DOWN</span>
-                            </div>
-                            <div id="tunnel-url-row" class="hidden">
-                                <label class="block text-[9px] text-gray-500 mb-0.5">Tunnel URL (share this)</label>
-                                <div class="flex gap-1">
-                                    <input type="text" id="tunnel-url" readonly class="flex-1 bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-[10px] text-cyan-300 font-mono">
-                                    <button id="btn-tunnel-copy" class="px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded text-[10px]">Copy</button>
-                                </div>
-                            </div>
-                            <div id="tunnel-busy" class="hidden text-[10px] text-indigo-400 animate-pulse">starting cloudflared… (waits for the URL, up to 30 s)</div>
-                            <div id="tunnel-error" class="hidden text-[10px] text-red-400"></div>
-                            <button id="btn-tunnel-stop" disabled class="w-full px-2 py-1 bg-red-900/30 hover:bg-red-900/50 text-red-400 rounded text-[10px] font-medium transition-colors">Stop tunnel</button>
-                        </div>
-                    </div>
-
-                    <!-- Shared 2-way tensor split -- always exactly local-GPU-A vs. one
-                         other target (local GPU B, or the RPC worker; enabling RPC rules
-                         out GPU B, see above), so one slider covers both; only the
-                         visible label changes (updateTensorSplitVisibility() in script.js). -->
-                    <div id="tensor-split-container" class="hidden pt-2 border-t border-gray-700/50 mt-2">
-                        <div class="flex justify-between text-[10px] text-gray-400 mb-1">
-                            <span>Tensor Split (<span class="node-a-label">GPU A</span>/<span class="node-b-label">GPU B</span>)</span>
-                            <span id="ts-val-display">50% / 50%</span>
-                        </div>
-                        <input type="range" id="server-tensor-split" min="0" max="100" value="50" class="w-full accent-indigo-500 cursor-pointer">
-                    </div>
-                </div>
-
-                <div class="grid grid-cols-2 gap-3">
-                    <div>
-                        <label class="block text-[10px] text-gray-400 mb-1">Context</label>
-                        <input type="number" id="server-ctx" value="110000" class="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                    </div>
-                    <div>
-                        <label class="block text-[10px] text-gray-400 mb-1">GPU Layers</label>
-                        <input type="number" id="server-ngl" value="999" class="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                    </div>
-                </div>
-
-                <div class="grid grid-cols-2 gap-3 mb-2">
-                    <div>
-                        <label class="flex items-center gap-2 text-xs font-semibold text-gray-200 mt-5" title="Accelerates processing and reduces VRAM usage for long contexts (Requires Ampere+ GPU)">
-                            <input type="checkbox" id="server-fa" checked class="accent-indigo-500 rounded">
-                            Flash Attention <span class="text-indigo-400 cursor-help" title="Accelerates processing and reduces VRAM usage for long contexts (Requires Ampere+ GPU)">?</span>
-                        </label>
-                    </div>
-                </div>
-
-                <div class="grid grid-cols-2 gap-3 mb-3">
-                    <div>
-                        <label class="block text-[10px] text-gray-400 mb-1">Cache Type K</label>
-                        <select id="server-cache-k" class="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-sm text-gray-200">
-                            <option value="q8_0">q8_0</option>
-                            <option value="f16">f16</option>
-                            <option value="q4_0">q4_0</option>
-                            <option value="q4_1">q4_1</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label class="block text-[10px] text-gray-400 mb-1">Cache Type V</label>
-                        <select id="server-cache-v" class="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-sm text-gray-200">
-                            <option value="q8_0">q8_0</option>
-                            <option value="f16">f16</option>
-                            <option value="q4_0">q4_0</option>
-                            <option value="q4_1">q4_1</option>
-                        </select>
-                    </div>
-                </div>
-
-                <div class="space-y-2 pt-1">
-                    <label class="block text-xs font-semibold text-gray-200">
-                        Speculative Decoding <span class="text-indigo-400 cursor-help" title="--spec-type a,b,c -- comma-separated list of speculative decoding strategies to attempt. Check any combination; forces -np 1. Per-request draft acceptance rate is logged to Monitor Mode so you can tune this.">?</span>
-                    </label>
-                    <div id="spec-type-list" class="grid grid-cols-2 gap-x-2 gap-y-1 pl-1">
-                        <label class="flex items-center gap-1.5 text-[11px] text-gray-300"><input type="checkbox" value="draft-mtp" class="spec-type-cb accent-indigo-500 rounded">draft-mtp <span class="text-indigo-400 cursor-help" title="Uses the model's built-in MTP head (model must support it).">?</span></label>
-                        <label class="flex items-center gap-1.5 text-[11px] text-gray-300"><input type="checkbox" value="draft-simple" class="spec-type-cb accent-indigo-500 rounded">draft-simple <span class="text-indigo-400 cursor-help" title="Classic separate small draft model. Requires a Draft Model path below.">?</span></label>
-                        <label class="flex items-center gap-1.5 text-[11px] text-gray-300"><input type="checkbox" value="draft-eagle3" class="spec-type-cb accent-indigo-500 rounded">draft-eagle3 <span class="text-indigo-400 cursor-help" title="EAGLE3 draft head. Requires a compatible Draft Model path below.">?</span></label>
-                        <label class="flex items-center gap-1.5 text-[11px] text-gray-300"><input type="checkbox" value="draft-dflash" class="spec-type-cb accent-indigo-500 rounded">draft-dflash <span class="text-indigo-400 cursor-help" title="DFlash draft model. Requires a compatible Draft Model path below.">?</span></label>
-                        <label class="flex items-center gap-1.5 text-[11px] text-gray-300"><input type="checkbox" value="draft-dspark" class="spec-type-cb accent-indigo-500 rounded">draft-dspark <span class="text-indigo-400 cursor-help" title="DSpark draft model. Requires a compatible Draft Model path below.">?</span></label>
-                        <label class="flex items-center gap-1.5 text-[11px] text-gray-300"><input type="checkbox" value="ngram-simple" class="spec-type-cb accent-indigo-500 rounded">ngram-simple <span class="text-indigo-400 cursor-help" title="Drafts by simple n-gram lookup over the existing context. No draft model needed; cheap, works best on repetitive text.">?</span></label>
-                        <label class="flex items-center gap-1.5 text-[11px] text-gray-300"><input type="checkbox" value="ngram-map-k" class="spec-type-cb accent-indigo-500 rounded">ngram-map-k <span class="text-indigo-400 cursor-help" title="N-gram map keyed lookup variant. No draft model needed.">?</span></label>
-                        <label class="flex items-center gap-1.5 text-[11px] text-gray-300"><input type="checkbox" value="ngram-map-k4v" class="spec-type-cb accent-indigo-500 rounded">ngram-map-k4v <span class="text-indigo-400 cursor-help" title="N-gram map k4v lookup variant. No draft model needed.">?</span></label>
-                        <label class="flex items-center gap-1.5 text-[11px] text-gray-300"><input type="checkbox" value="ngram-mod" class="spec-type-cb accent-indigo-500 rounded">ngram-mod <span class="text-indigo-400 cursor-help" title="Adaptive n-gram drafting (self-resets on low acceptance streaks). No draft model needed.">?</span></label>
-                        <label class="flex items-center gap-1.5 text-[11px] text-gray-300"><input type="checkbox" value="ngram-cache" class="spec-type-cb accent-indigo-500 rounded">ngram-cache <span class="text-indigo-400 cursor-help" title="N-gram cache drafting. No draft model needed.">?</span></label>
-                    </div>
-                    <div id="spec-options" class="hidden pl-1 space-y-2">
-                        <div class="grid grid-cols-2 gap-2">
-                            <div>
-                                <label class="block text-[10px] text-gray-400 mb-1">Draft N Max <span class="text-indigo-400 cursor-help" title="--spec-draft-n-max N -- number of tokens to draft per step (default: 3). Higher = bigger wins when acceptance is high, more wasted work when it's low.">?</span></label>
-                                <input type="number" id="mtp-draft-n" value="2" min="1" max="16" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                            </div>
-                            <div>
-                                <label class="block text-[10px] text-gray-400 mb-1">Draft N Min <span class="text-indigo-400 cursor-help" title="--spec-draft-n-min N -- minimum number of draft tokens to use. Leave blank to omit the flag (llama-server default).">?</span></label>
-                                <input type="number" id="spec-draft-n-min" placeholder="none" min="0" step="1" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                            </div>
-                        </div>
-                        <div>
-                            <label class="block text-[10px] text-gray-400 mb-1">Draft Model <span class="text-indigo-400 cursor-help" title="--spec-draft-model PATH -- separate draft model for the draft-simple/eagle3/dflash/dspark strategies. Not needed for draft-mtp or the ngram-* strategies. Launch fails with a visible error if a strategy that needs it is checked without it.">?</span></label>
-                            <input type="text" id="spec-draft-model" placeholder="/path/to/draft.gguf (only for draft-simple/eagle3/dflash/dspark)" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-[11px] font-mono">
-                        </div>
-                        <div id="spec-ngram-options" class="hidden grid grid-cols-3 gap-2">
-                            <div>
-                                <label class="block text-[10px] text-gray-400 mb-1">Ngram N <span class="text-indigo-400 cursor-help" title="--spec-ngram-<type>-size-n N -- length of the lookup n-gram (default: 12). Applied to each checked ngram-simple/map-k/map-k4v strategy. Blank = llama-server default.">?</span></label>
-                                <input type="number" id="spec-ngram-size-n" placeholder="12" min="1" max="1024" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                            </div>
-                            <div>
-                                <label class="block text-[10px] text-gray-400 mb-1">Ngram M <span class="text-indigo-400 cursor-help" title="--spec-ngram-<type>-size-m N -- length of the drafted m-gram on a lookup hit (default: 48). Applied to each checked ngram-simple/map-k/map-k4v strategy. Blank = llama-server default.">?</span></label>
-                                <input type="number" id="spec-ngram-size-m" placeholder="48" min="1" max="1024" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                            </div>
-                            <div>
-                                <label class="block text-[10px] text-gray-400 mb-1">Min Hits <span class="text-indigo-400 cursor-help" title="--spec-ngram-<type>-min-hits N -- minimum lookup hits before an m-gram is proposed (default: 1). Applied to each checked ngram-simple/map-k/map-k4v strategy. Blank = llama-server default.">?</span></label>
-                                <input type="number" id="spec-ngram-min-hits" placeholder="1" min="1" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                <div class="pt-2 border-t border-gray-700/40">
-                    <label class="flex items-center gap-2 text-xs font-semibold text-gray-200">
-                        <input type="checkbox" id="reasoning-preserve-toggle" class="accent-indigo-500 rounded">
-                        Reasoning Preserve <span class="text-indigo-400 cursor-help" title="Retains reasoning/thinking context from prior turns instead of stripping it (--reasoning-preserve)">?</span>
-                    </label>
-                </div>
-                <div class="pt-2 border-t border-gray-700/40 space-y-2">
-                    <label class="block text-[10px] text-gray-400 font-semibold">Sampling</label>
-                    <div class="grid grid-cols-2 gap-2">
-                        <div>
-                            <label class="block text-[10px] text-gray-400 mb-1">Temp <span class="text-indigo-400 cursor-help" title="--temp N -- temperature (default: 0.80). Lower = more deterministic, higher = more random.">?</span></label>
-                            <input type="number" id="server-temp" value="0.80" min="0" step="0.05" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                        </div>
-                        <div>
-                            <label class="block text-[10px] text-gray-400 mb-1">Top-K <span class="text-indigo-400 cursor-help" title="--top-k N -- top-k sampling (default: 40, 0 = disabled). Restricts sampling to the N most likely tokens.">?</span></label>
-                            <input type="number" id="server-top-k" value="40" step="1" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                        </div>
-                        <div>
-                            <label class="block text-[10px] text-gray-400 mb-1">Top-P <span class="text-indigo-400 cursor-help" title="--top-p N -- top-p sampling (default: 0.95, 1.0 = disabled). Restricts sampling to the smallest set of tokens whose cumulative probability exceeds N.">?</span></label>
-                            <input type="number" id="server-top-p" value="0.95" min="0" max="1" step="0.01" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                        </div>
-                        <div>
-                            <label class="block text-[10px] text-gray-400 mb-1">Min-P <span class="text-indigo-400 cursor-help" title="--min-p N -- min-p sampling (default: 0.05, 0.0 = disabled). Discards tokens less likely than N times the most likely token.">?</span></label>
-                            <input type="number" id="server-min-p" value="0.05" min="0" max="1" step="0.01" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                        </div>
-                        <div>
-                            <label class="block text-[10px] text-gray-400 mb-1">Presence Penalty <span class="text-indigo-400 cursor-help" title="--presence-penalty N -- repeat alpha presence penalty (default: 0.00, 0.0 = disabled). Flat penalty applied to any token that has appeared at all so far.">?</span></label>
-                            <input type="number" id="server-presence-penalty" value="0.00" step="0.05" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                        </div>
-                        <div>
-                            <label class="block text-[10px] text-gray-400 mb-1">Repeat Penalty <span class="text-indigo-400 cursor-help" title="--repeat-penalty N -- penalize repeat sequence of tokens (default: 1.00, 1.0 = disabled). Scales down the probability of tokens already seen recently.">?</span></label>
-                            <input type="number" id="server-repeat-penalty" value="1.00" min="0" step="0.05" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                        </div>
-                    </div>
-                </div>
-                <div class="pt-2 border-t border-gray-700/40">
-                    <label class="block text-[10px] text-gray-400 mb-1">N CPU MoE Layers <span class="text-indigo-400 cursor-help" title="-ncmoe/--n-cpu-moe N -- keep the Mixture of Experts (MoE) weights of the first N layers in the CPU. Only relevant for MoE models; frees VRAM at the cost of CPU-offloaded expert compute. Leave blank to omit the flag entirely.">?</span></label>
-                    <input type="number" id="server-n-cpu-moe" placeholder="none" min="0" step="1" class="w-24 bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                </div>
-                <div class="pt-2 border-t border-gray-700/40 space-y-2">
-                    <label class="flex items-center gap-2 text-xs font-semibold text-gray-200">
-                        <input type="checkbox" id="jinja-toggle" class="accent-indigo-500 rounded">
-                        Jinja Template Engine <span class="text-indigo-400 cursor-help" title="--jinja -- whether to use the jinja template engine for chat (default: disabled). Required to use a custom chat template file below, unless it's one of llama.cpp's built-in templates.">?</span>
-                    </label>
-                    <div>
-                        <label class="block text-[10px] text-gray-400 mb-1">Chat Template File <span class="text-indigo-400 cursor-help" title="--chat-template-file PATH -- set a custom jinja chat template file (default: template taken from the model's own metadata). Enable Jinja above unless this is one of llama.cpp's built-in template names.">?</span></label>
-                        <input type="text" id="server-chat-template-file" placeholder="/path/to/template.jinja" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-[11px] font-mono">
-                    </div>
-                </div>
-                <div class="pt-2 border-t border-gray-700/40 space-y-2">
-                    <label class="flex items-center gap-2 text-xs font-semibold text-gray-200">
-                        <input type="checkbox" id="mmproj-toggle" class="accent-indigo-500 rounded">
-                        Multimodal (mmproj) <span class="text-indigo-400 cursor-help" title="--mmproj PATH -- enable vision/multimodal input by loading a CLIP projector alongside the model. The projector must match the model's vision architecture -- HF snapshot caching often puts it in a DIFFERENT snapshot folder than the model weights, since each revision only downloads the files it references. Path is saved per-profile.">?</span>
-                    </label>
-                    <div>
-                        <label class="block text-[10px] text-gray-400 mb-1">mmproj File Path</label>
-                        <input type="text" id="server-mmproj-path" placeholder="/path/to/mmproj-F16.gguf" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-[11px] font-mono">
-                    </div>
-                    <label class="flex items-center gap-2 text-[11px] text-gray-300">
-                        <input type="checkbox" id="mmproj-offload-toggle" class="accent-indigo-500 rounded">
-                        Keep mmproj in system RAM (don't offload to GPU) <span class="text-indigo-400 cursor-help" title="--no-mmproj-offload -- where the CLIP projector lives. Unchecked (default): the projector is loaded into VRAM alongside the model, same as llama.cpp's own default. Checked: the projector stays in system RAM/CPU, freeing ~0.9 GB of VRAM for the F16 Qwen3.8 mmproj -- the vision encoder only runs while an image is being embedded, so CPU execution only costs you on the image-embed step, not on text generation. Only sent to the server when checked (newer llama.cpp builds only; older builds ignore the option).">?</span>
-                    </label>
-                </div>
-                <div class="pt-2 border-t border-gray-700/40">
-                    <label class="block text-[10px] text-gray-400 mb-1">Load Mode <span class="text-indigo-400 cursor-help" title="-lm/--load-mode MODE (default: mmap). none: no special loading mode. mmap: memory-map the model file. mlock: force the model to stay resident in RAM, never swapped/compressed. mmap+mlock: both. dio: use DirectIO if available.">?</span></label>
-                    <select id="server-load-mode" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                        <option value="">Default (mmap)</option>
-                        <option value="none">none</option>
-                        <option value="mmap">mmap</option>
-                        <option value="mlock">mlock</option>
-                        <option value="mmap+mlock">mmap+mlock</option>
-                        <option value="dio">dio (DirectIO)</option>
-                    </select>
-                </div>
-                <div class="pt-2 border-t border-gray-700/40">
-                    <label class="block text-[10px] text-gray-400 mb-1">Verbosity (-lv) <span class="text-indigo-400 cursor-help" title="-lv/--verbosity N -- log verbosity threshold. 3=info (default), 4=trace, 5=debug -- each shows everything the level below it does, plus more detail. Floor is 3: this dashboard's status detection (model loaded/ready) and telemetry capture (Monitor Mode, per-request CSV logging) both parse llama-server's INFO-level log lines, which llama-server itself suppresses below verbosity 3 -- going lower silently breaks the dashboard, not just quiets it.">?</span></label>
-                    <select id="server-verbosity" class="w-24 bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
-                        <option value="3">3 (info)</option>
-                        <option value="4">4 (trace)</option>
-                        <option value="5">5 (debug)</option>
-                    </select>
-                </div>
-
-                <div class="border border-gray-700/50 rounded-lg overflow-hidden">
-                    <button id="btn-advanced-toggle" type="button" class="w-full flex justify-between items-center px-3 py-2 bg-gray-800/50 hover:bg-gray-800 text-xs font-semibold text-gray-300 transition-colors">
-                        <span>Advanced (Extra Args / Launch Command)</span>
-                        <span id="advanced-icon" class="text-[9px] transition-transform">&#9660;</span>
-                    </button>
-                    <div id="advanced-panel" class="p-3 space-y-3 bg-gray-800/20 border-t border-gray-700/50">
-                        <div class="space-y-2">
-                            <div class="flex justify-between items-center">
-                                <label class="block text-[10px] text-gray-400">Extra llama-server args <span class="text-indigo-400 cursor-help" title="Raw arguments appended verbatim (space-separated). -m paths are auto-mapped. Anything the GUI above doesn't expose goes here -- it's the only free-text field that actually persists across profile loads and reboots.">?</span></label>
-                                <button type="button" id="btn-flag-reference" class="px-1.5 py-0.5 bg-gray-700 hover:bg-gray-600 rounded text-[9px] text-gray-300">Flags</button>
-                            </div>
-                            <textarea id="extra-args" rows="2" placeholder="e.g. --ctx-cache-type k8 --flash-attn-offload" class="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-[10px] font-mono text-gray-200 resize-y"></textarea>
-                        </div>
-                        <!-- Raw launch command: READ-ONLY preview of the literal command
-                             that will be spawned (see server4.js /api/start's rawCommand
-                             branch -- it sends this box's text verbatim, so it's always
-                             exactly what runs). Auto-regenerated from every field in this
-                             panel, including Extra llama-server args above. It used to be
-                             directly hand-editable, but any flag typed only into this box
-                             (e.g. a custom jinja chat-template path) had nowhere to persist
-                             and got silently wiped the next time anything regenerated it
-                             (a GUI field change, a saved-profile load, ...). Anything the
-                             GUI doesn't expose now belongs in Extra llama-server args above,
-                             which IS a real persisted field the box always incorporates. -->
-                        <div class="space-y-1 pt-2 border-t border-gray-700/40">
-                            <div class="flex justify-between items-center">
-                                <label class="block text-[10px] text-gray-400">Launch Command <span class="text-indigo-400 cursor-help" title="Read-only preview of the literal command that will run, auto-regenerated from every field in this panel (including Extra llama-server args above). To add a flag the GUI doesn't expose, use Extra llama-server args above, not this box.">?</span></label>
-                                <span id="raw-command-status" class="text-[9px] text-gray-600"></span>
-                            </div>
-                            <textarea id="raw-launch-command" rows="4" spellcheck="false" readonly class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1.5 text-[10px] font-mono text-gray-400 resize-y leading-snug cursor-text"></textarea>
-                        </div>
-                    </div>
-                </div>
-                <div class="flex flex-col gap-2">
-                    <!-- Saves the ENTIRE current setup (model, launch mode, devices, every
-                         field, the raw command box) as a named profile -- loading happens
-                         from the dropdown at the top of this panel. -->
-                    <button type="button" id="btn-save-config" class="w-full px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded-md text-xs text-gray-300">Save Profile <span class="text-indigo-400 cursor-help" title="Saves this entire setup (model, launch mode, devices, all fields, the launch command) as a named profile, loadable from the dropdown at the top.">?</span></button>
-                    <div class="flex gap-2">
-                        <button id="btn-start-server" class="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-md text-sm font-medium transition-colors">Load Model</button>
-                    </div>
-                    <div id="boot-timer" class="text-[10px] text-gray-500 text-center font-mono hidden mt-1">Boot Time: 0.0s</div>
-                    <!-- Item 15c: Historical stats summary — populated from /api/logs/summary -->
-                    <div id="historical-stats" class="text-[10px] text-gray-500 text-center font-mono hidden mt-1 space-y-0.5"></div>
-                </div>
+                <button type="button" id="btn-snap-last-config" title="Apply the settings of the last run with this model (and transport). Picking a model on its own never changes your other settings." class="btn btn-sm text-indigo-300">Last settings</button>
             </div>
 
-            <!-- Log Panels (moved out of RPC section, item 8b) -->
-            <div class="space-y-2">
-                <div class="flex justify-between items-center">
-                    <h2 class="text-xs font-bold tracking-wider text-gray-500 uppercase">Server Logs</h2>
+            <!-- Compute config: the master always launches natively on the ordered device table
+                 below -- local GPUs and RPC workers (dashboard.config.json rpcWorkers) in any mix.
+                 See snapToLastUsedConfig() in script.js and resolveLaunchCommand in server4.js. -->
+            <div class="p-3 bg-gray-950/60 border border-gray-800 rounded-xl space-y-3" id="llama-compute-box">
+                <div>
+                    <label class="field-label">Build <span class="text-indigo-400 cursor-help help-tip" title="Which compiled llama-server binary to launch (configured in dashboard.config.json). Different builds can expose different backends/devices for the same physical GPUs -- a build with a vendor backend (CUDA, ROCm) as well as Vulkan lists each card once per backend, where a Vulkan-only build reaches it through Vulkan alone. Switching this re-runs device detection automatically.">?</span></label>
+                    <select id="build-select" class="field"></select>
                 </div>
+                <!-- Device table: one row per physical GPU (/api/devices `cards`) plus one row per
+                     configured RPC worker (`workers`). Enabled rows, top to bottom, are the launch's
+                     `devices` list = the -dev and -ts order (renderDeviceTable/devicesFromTable). -->
+                <div class="space-y-1.5">
+                    <div class="flex justify-between items-center">
+                        <span class="field-label !mb-0">Devices <span class="text-indigo-400 cursor-help help-tip" title="Check the GPUs (and RPC workers) the model runs on: one row per physical card in this machine, identical cards numbered. Order is layer order: the first row gets the first layers, the last row the output layer. Share is each device's -ts proportion; leave shares blank to let llama-server split by free VRAM. A build with several backends reaches a card through any of them -- pick one per card.">?</span> <span id="machine-signature" class="ml-1 font-mono font-normal normal-case text-[9px] text-gray-600"></span></span>
+                        <button type="button" id="btn-suggest-split" class="text-[11px] font-medium text-indigo-400 hover:text-indigo-300" title="Set every enabled device's share in proportion to its free VRAM (local cards: as of the last detection; a worker: from telemetry, which only covers it while a launch uses it).">Suggest split</button>
+                    </div>
+                    <div id="device-detect-status" class="hidden text-[9px] text-amber-400"></div>
+                    <div id="device-table" class="space-y-1"></div>
+                    <!-- How a launch on more than one device is divided (llama.cpp --split-mode). Shown from two
+                         enabled devices up (script.js renderDeviceSplitSummary). `row` is not offered: it is
+                         deprecated in llama.cpp and fails to load. -->
+                    <div id="device-split-mode-row" class="hidden flex items-center gap-2">
+                        <label class="field-label !mb-0" for="device-split-mode">Split mode <span class="text-indigo-400 cursor-help help-tip" title="How llama.cpp divides the model across the enabled devices (--split-mode). layer: whole layers per device, in the table's order (the default). tensor: single tensors placed across devices -- experimental in llama.cpp; try it against layer before relying on it. A -sm flag in Extra arguments overrides this.">?</span></label>
+                        <select id="device-split-mode" class="field flex-1">
+                            <option value="layer">layer</option>
+                            <option value="tensor">tensor (experimental)</option>
+                        </select>
+                    </div>
+                    <div id="device-split-summary" class="text-[9px] text-gray-500"></div>
+                    <div id="device-warnings" class="hidden text-[9px] text-amber-400"></div>
+                    <div id="device-transport-row" class="hidden flex items-center gap-2">
+                        <label class="field-label !mb-0">Transport <span class="text-indigo-400 cursor-help help-tip" title="How this machine reaches the RPC worker(s). Recorded with each request so History and the last-used-config snap group runs by connection type.">?</span></label>
+                        <select id="transport-type" class="field flex-1">
+                            <option value="WiFi">Wi-Fi / LAN</option>
+                            <option value="TB4">Thunderbolt 4</option>
+                            <option value="WAN">Internet (away from home)</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+        </section>
 
-                <!-- Master Logs -->
-                <div id="master-logs-container" class="bg-gray-800/50 rounded-lg border border-gray-700/50 overflow-hidden">
-                    <button id="btn-master-logs-toggle" class="w-full flex justify-between items-center px-3 py-2 hover:bg-gray-800 text-xs font-semibold text-gray-300 transition-colors">
-                        <span class="flex items-center gap-2"><span class="text-yellow-400">●</span> Master Logs</span>
-                        <span id="master-logs-icon" class="text-[9px] transition-transform">&#9654;</span>
+        <!-- The remaining launch fields, grouped. Each group remembers open/closed (index.html
+             footer script, localStorage side_group_<key>); the hint on the right summarises the
+             group's current values so a closed group still tells you what it's set to. -->
+        <!-- Strata engine (Qwen3.8-Flash-Next): the base config file carries everything the engine
+             takes (pack, native/ple weights, expert profile, mtp, env); this group overrides its values
+             -- context, kv, rope, spec, pipeline windows, resident budget, cards + layer split and the
+             two env switches (2026-10-17) -- and the Sampling group below feeds its sampling block.
+             Blank / "base" keeps the file's value, shown as the placeholder. The Launch command box shows
+             the queue-serve.sh line that will run: always the base config's OWN install's launcher. -->
+        <details class="side-group hidden" data-key="strata" id="group-strata">
+            <summary>Strata config <span class="side-hint" data-hint="strata"></span></summary>
+            <div class="side-body">
+                <div>
+                    <label class="field-label">Base config <span class="text-indigo-400 cursor-help help-tip" title="A strata-*.json file of one of the Strata installs (dashboard.config.json strataInstalls; the first one listed is the current install). Everything not overridden below (pack, weights, expert profile, mtp, env, port) comes from it, and it launches through its own install's queue-serve.sh.">?</span></label>
+                    <select id="strata-base" class="field font-mono !text-[11px]">
+                        <option value="">loading…</option>
+                    </select>
+                    <!-- which install the picked config belongs to, and whether its launcher turns THP off (script.js showStrataBase) -->
+                    <div id="strata-install-info" class="mt-1 text-[11px] text-gray-500 leading-snug"></div>
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="field-label">Max context <span class="text-indigo-400 cursor-help help-tip" title="--max-context N -- token window. Blank = the base config's value.">?</span></label>
+                        <input type="number" id="strata-max-context" placeholder="base" min="1" step="1" class="field font-mono">
+                    </div>
+                    <div>
+                        <label class="field-label">KV type <span class="text-indigo-400 cursor-help help-tip" title="--kv TYPE -- KV cache type: int8, fp16, q4_0, or k8v4 (INT8 K + rotated Q4_0 V). Blank = the base config's value.">?</span></label>
+                        <select id="strata-kv" class="field">
+                            <option value="">base</option>
+                            <option value="int8">int8</option>
+                            <option value="fp16">fp16</option>
+                            <option value="q4_0">q4_0</option>
+                            <option value="k8v4">k8v4</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="field-label">KV resident <span class="text-indigo-400 cursor-help help-tip" title="--kv-resident N -- KV tokens pinned in VRAM. Blank = the base config's value.">?</span></label>
+                        <input type="number" id="strata-kv-resident" placeholder="base" min="0" step="1" class="field font-mono">
+                    </div>
+                    <div>
+                        <label class="field-label">Spec n <span class="text-indigo-400 cursor-help help-tip" title="--spec N -- speculative (MTP) draft tokens per step. Blank = the base config's value.">?</span></label>
+                        <input type="number" id="strata-spec" placeholder="base" min="0" step="1" class="field font-mono">
+                    </div>
+                    <div>
+                        <label class="field-label">Spec min-p <span class="text-indigo-400 cursor-help help-tip" title="--spec-min-p N -- minimum draft-token probability for the spec decode to accept. Blank = the base config's value.">?</span></label>
+                        <input type="number" id="strata-spec-min-p" placeholder="base" min="0" max="1" step="0.05" class="field font-mono">
+                    </div>
+                    <div>
+                        <label class="field-label">RoPE scaling <span class="text-indigo-400 cursor-help help-tip" title="--rope-scaling MODE -- context-extension mode (yarn for >128k on non-yarn bases). 'base' leaves the file as-is.">?</span></label>
+                        <select id="strata-rope-scaling" class="field">
+                            <option value="">base</option>
+                            <option value="yarn">yarn</option>
+                            <option value="none">none (remove)</option>
+                        </select>
+                    </div>
+                </div>
+                <div>
+                    <label class="field-label">RoPE scale <span class="text-indigo-400 cursor-help help-tip" title="--rope-scale N -- yarn scaling factor (e.g. 4 for a 1M window on a 256k base). Blank = the base config's value.">?</span></label>
+                    <input type="number" id="strata-rope-scale" placeholder="base" min="0" step="0.5" class="field font-mono">
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="field-label">Pipeline windows <span class="text-indigo-400 cursor-help help-tip" title="--pipeline-windows 0..2 -- on a layer split over two or more cards, 2 lets the first card start the next verify window while the last one finishes (the two-XTX benchmark config uses 2); 1 overlaps only short prompt reads; 0 = off. Strata 0.1.43.1 and newer.">?</span></label>
+                        <select id="strata-pipeline-windows" class="field">
+                            <option value="">base</option>
+                            <option value="0">0 (off)</option>
+                            <option value="1">1</option>
+                            <option value="2">2</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="field-label">Resident budget <span class="text-indigo-400 cursor-help help-tip" title="--resident-budget-gib N -- host RAM (GiB) for the pinned copy of the experts no card holds (the two-XTX UD-IQ4_XS config uses 40). Blank = the base config's value.">?</span></label>
+                        <input type="number" id="strata-resident-budget" placeholder="base" min="1" step="1" class="field font-mono">
+                    </div>
+                    <div>
+                        <label class="field-label">GPUs <span class="text-indigo-400 cursor-help help-tip" title="The config's &quot;gpu&quot;: the cards the engine uses, by its numbering -- 0 for the first card, 0,1 for a layer split over both. Blank = the base config's value.">?</span></label>
+                        <input type="text" id="strata-gpu" placeholder="base" class="field font-mono">
+                    </div>
+                    <div>
+                        <label class="field-label">Layer split <span class="text-indigo-400 cursor-help help-tip" title="The config's &quot;layer_split&quot; (two or more GPUs): auto places the layers by each card's free VRAM; a number is the first layer of each later card (27 for two cards, 16,32 for three). Blank = the base config's value.">?</span></label>
+                        <input type="text" id="strata-layer-split" placeholder="base" class="field font-mono">
+                    </div>
+                    <div>
+                        <label class="field-label">Stage trim <span class="text-indigo-400 cursor-help help-tip" title="env STRATA_STAGE_TRIM=1 -- on a layer split each card loads only the dense weights of its own layers; the VRAM it frees goes to the expert cache. Strata 0.1.43.1 and newer.">?</span></label>
+                        <select id="strata-stage-trim" class="field">
+                            <option value="">base</option>
+                            <option value="on">on</option>
+                            <option value="off">off</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="field-label">Kernel copy <span class="text-indigo-400 cursor-help help-tip" title="env STRATA_HIP_ADAPT_KERNEL_COPY=1 (AMD) -- the adaptive expert tier's swaps are copied by a kernel instead of SDMA (#884); with pipeline windows 2 it ended the two-card verify stalls of 2026-10-15. Strata 0.1.43.1 and newer.">?</span></label>
+                        <select id="strata-kernel-copy" class="field">
+                            <option value="">base</option>
+                            <option value="on">on</option>
+                            <option value="off">off</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+        </details>
+
+        <details class="side-group" data-key="runtime" id="group-runtime" open>
+            <summary>Runtime <span class="side-hint" data-hint="runtime"></span></summary>
+            <div class="side-body">
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="field-label">Context</label>
+                        <input type="number" id="server-ctx" value="110000" class="field font-mono">
+                    </div>
+                    <div>
+                        <label class="field-label">GPU layers</label>
+                        <input type="number" id="server-ngl" value="999" class="field font-mono">
+                    </div>
+                    <div>
+                        <label class="field-label">Cache type K</label>
+                        <select id="server-cache-k" class="field">
+                            <option value="q8_0">q8_0</option>
+                            <option value="f16">f16</option>
+                            <option value="q4_0">q4_0</option>
+                            <option value="q4_1">q4_1</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="field-label">Cache type V</label>
+                        <select id="server-cache-v" class="field">
+                            <option value="q8_0">q8_0</option>
+                            <option value="f16">f16</option>
+                            <option value="q4_0">q4_0</option>
+                            <option value="q4_1">q4_1</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="field-label">CPU MoE layers <span class="text-indigo-400 cursor-help help-tip" title="-ncmoe/--n-cpu-moe N -- keep the Mixture of Experts (MoE) weights of the first N layers in the CPU. Only relevant for MoE models; frees VRAM at the cost of CPU-offloaded expert compute. Leave blank to omit the flag entirely.">?</span></label>
+                        <input type="number" id="server-n-cpu-moe" placeholder="none" min="0" step="1" class="field font-mono">
+                    </div>
+                    <div>
+                        <label class="field-label">Load mode <span class="text-indigo-400 cursor-help help-tip" title="-lm/--load-mode MODE (default: mmap). none: no special loading mode. mmap: memory-map the model file. mlock: force the model to stay resident in RAM, never swapped/compressed. mmap+mlock: both. dio: use DirectIO if available.">?</span></label>
+                        <select id="server-load-mode" class="field">
+                            <option value="">Default (mmap)</option>
+                            <option value="none">none</option>
+                            <option value="mmap">mmap</option>
+                            <option value="mlock">mlock</option>
+                            <option value="mmap+mlock">mmap+mlock</option>
+                            <option value="dio">dio (DirectIO)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="space-y-2">
+                    <label class="check-row" title="-fa on -- faster attention and much smaller compute buffers at long context. Supported by llama.cpp's CUDA, ROCm and Vulkan backends; llama.cpp falls back per device when a card or head size has no FA kernel. (The 'Ampere+ only' rule belongs to the separate Python flash-attn library, not llama.cpp.)">
+                        <input type="checkbox" id="server-fa" checked class="accent-indigo-500 rounded">
+                        Flash attention <span class="text-indigo-400 cursor-help help-tip" title="-fa on -- faster attention and much smaller compute buffers at long context. Supported by llama.cpp's CUDA, ROCm and Vulkan backends; llama.cpp falls back per device when a card or head size has no FA kernel. (The 'Ampere+ only' rule belongs to the separate Python flash-attn library, not llama.cpp.)">?</span>
+                    </label>
+                    <label class="check-row">
+                        <input type="checkbox" id="reasoning-preserve-toggle" class="accent-indigo-500 rounded">
+                        Reasoning preserve <span class="text-indigo-400 cursor-help help-tip" title="Retains reasoning/thinking context from prior turns instead of stripping it (--reasoning-preserve)">?</span>
+                    </label>
+                </div>
+            </div>
+        </details>
+
+        <details class="side-group" data-key="spec" id="group-spec">
+            <summary>Speculative decoding <span class="side-hint" data-hint="spec"></span></summary>
+            <div class="side-body">
+                <div class="text-[11px] text-gray-500 -mt-1">--spec-type: check any combination; forces -np 1. Per-request draft acceptance shows in Monitor. <span class="text-indigo-400 cursor-help help-tip" title="--spec-type a,b,c -- comma-separated list of speculative decoding strategies to attempt. Check any combination; forces -np 1. Per-request draft acceptance rate is logged to Monitor Mode so you can tune this.">?</span></div>
+                <div id="spec-type-list" class="grid grid-cols-2 gap-x-2 gap-y-1.5">
+                    <label class="flex items-center gap-1.5 text-[11.5px] text-gray-300 font-mono"><input type="checkbox" value="draft-mtp" class="spec-type-cb accent-indigo-500 rounded">draft-mtp <span class="text-indigo-400 cursor-help help-tip" title="Uses the model's built-in MTP head (model must support it).">?</span></label>
+                    <label class="flex items-center gap-1.5 text-[11.5px] text-gray-300 font-mono"><input type="checkbox" value="draft-simple" class="spec-type-cb accent-indigo-500 rounded">draft-simple <span class="text-indigo-400 cursor-help help-tip" title="Classic separate small draft model. Requires a Draft Model path below.">?</span></label>
+                    <label class="flex items-center gap-1.5 text-[11.5px] text-gray-300 font-mono"><input type="checkbox" value="draft-eagle3" class="spec-type-cb accent-indigo-500 rounded">draft-eagle3 <span class="text-indigo-400 cursor-help help-tip" title="EAGLE3 draft head. Requires a compatible Draft Model path below.">?</span></label>
+                    <label class="flex items-center gap-1.5 text-[11.5px] text-gray-300 font-mono"><input type="checkbox" value="draft-dflash" class="spec-type-cb accent-indigo-500 rounded">draft-dflash <span class="text-indigo-400 cursor-help help-tip" title="DFlash draft model. Requires a compatible Draft Model path below.">?</span></label>
+                    <label class="flex items-center gap-1.5 text-[11.5px] text-gray-300 font-mono"><input type="checkbox" value="draft-dspark" class="spec-type-cb accent-indigo-500 rounded">draft-dspark <span class="text-indigo-400 cursor-help help-tip" title="DSpark draft model. Requires a compatible Draft Model path below.">?</span></label>
+                    <label class="flex items-center gap-1.5 text-[11.5px] text-gray-300 font-mono"><input type="checkbox" value="ngram-simple" class="spec-type-cb accent-indigo-500 rounded">ngram-simple <span class="text-indigo-400 cursor-help help-tip" title="Drafts by simple n-gram lookup over the existing context. No draft model needed; cheap, works best on repetitive text.">?</span></label>
+                    <label class="flex items-center gap-1.5 text-[11.5px] text-gray-300 font-mono"><input type="checkbox" value="ngram-map-k" class="spec-type-cb accent-indigo-500 rounded">ngram-map-k <span class="text-indigo-400 cursor-help help-tip" title="N-gram map keyed lookup variant. No draft model needed.">?</span></label>
+                    <label class="flex items-center gap-1.5 text-[11.5px] text-gray-300 font-mono"><input type="checkbox" value="ngram-map-k4v" class="spec-type-cb accent-indigo-500 rounded">ngram-map-k4v <span class="text-indigo-400 cursor-help help-tip" title="N-gram map k4v lookup variant. No draft model needed.">?</span></label>
+                    <label class="flex items-center gap-1.5 text-[11.5px] text-gray-300 font-mono"><input type="checkbox" value="ngram-mod" class="spec-type-cb accent-indigo-500 rounded">ngram-mod <span class="text-indigo-400 cursor-help help-tip" title="Adaptive n-gram drafting (self-resets on low acceptance streaks). No draft model needed.">?</span></label>
+                    <label class="flex items-center gap-1.5 text-[11.5px] text-gray-300 font-mono"><input type="checkbox" value="ngram-cache" class="spec-type-cb accent-indigo-500 rounded">ngram-cache <span class="text-indigo-400 cursor-help help-tip" title="N-gram cache drafting. No draft model needed.">?</span></label>
+                </div>
+                <div id="spec-options" class="hidden space-y-3 pt-3 border-t border-gray-800">
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="field-label">Draft n max <span class="text-indigo-400 cursor-help help-tip" title="--spec-draft-n-max N -- number of tokens to draft per step (default: 3). Higher = bigger wins when acceptance is high, more wasted work when it's low.">?</span></label>
+                            <input type="number" id="mtp-draft-n" value="2" min="1" max="16" class="field font-mono">
+                        </div>
+                        <div>
+                            <label class="field-label">Draft n min <span class="text-indigo-400 cursor-help help-tip" title="--spec-draft-n-min N -- minimum number of draft tokens to use. Leave blank to omit the flag (llama-server default).">?</span></label>
+                            <input type="number" id="spec-draft-n-min" placeholder="none" min="0" step="1" class="field font-mono">
+                        </div>
+                    </div>
+                    <div id="spec-draft-model-row" class="hidden">
+                        <label class="field-label">Draft model <span class="text-indigo-400 cursor-help help-tip" title="--spec-draft-model PATH -- separate draft model for the draft-simple/eagle3/dflash/dspark strategies. Not needed for draft-mtp or the ngram-* strategies. Launch fails with a visible error if a strategy that needs it is checked without it.">?</span></label>
+                        <input type="text" id="spec-draft-model" placeholder="/path/to/draft.gguf" class="field font-mono !text-[11px]">
+                    </div>
+                    <div>
+                        <label class="field-label">Draft device <span class="text-indigo-400 cursor-help help-tip" title="--spec-draft-device ID -- where the draft/MTP model runs. Only enabled local devices are offered: drafting on an RPC worker would put a network round trip in every draft step. Default lets llama-server place it.">?</span></label>
+                        <select id="spec-draft-device" class="field font-mono">
+                            <option value="">default</option>
+                        </select>
+                    </div>
+                    <div id="spec-ngram-options" class="hidden grid grid-cols-3 gap-2">
+                        <div>
+                            <label class="field-label">Ngram N <span class="text-indigo-400 cursor-help help-tip" title="--spec-ngram-<type>-size-n N -- length of the lookup n-gram (default: 12). Applied to each checked ngram-simple/map-k/map-k4v strategy. Blank = llama-server default.">?</span></label>
+                            <input type="number" id="spec-ngram-size-n" placeholder="12" min="1" max="1024" class="field font-mono">
+                        </div>
+                        <div>
+                            <label class="field-label">Ngram M <span class="text-indigo-400 cursor-help help-tip" title="--spec-ngram-<type>-size-m N -- length of the drafted m-gram on a lookup hit (default: 48). Applied to each checked ngram-simple/map-k/map-k4v strategy. Blank = llama-server default.">?</span></label>
+                            <input type="number" id="spec-ngram-size-m" placeholder="48" min="1" max="1024" class="field font-mono">
+                        </div>
+                        <div>
+                            <label class="field-label">Min hits <span class="text-indigo-400 cursor-help help-tip" title="--spec-ngram-<type>-min-hits N -- minimum lookup hits before an m-gram is proposed (default: 1). Applied to each checked ngram-simple/map-k/map-k4v strategy. Blank = llama-server default.">?</span></label>
+                            <input type="number" id="spec-ngram-min-hits" placeholder="1" min="1" class="field font-mono">
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </details>
+
+        <details class="side-group" data-key="sampling">
+            <summary>Sampling <span class="side-hint" data-hint="sampling"></span></summary>
+            <div class="side-body">
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="field-label">Temperature <span class="text-indigo-400 cursor-help help-tip" title="--temp N -- temperature (default: 0.80). Lower = more deterministic, higher = more random.">?</span></label>
+                        <input type="number" id="server-temp" value="0.80" min="0" step="0.05" class="field font-mono">
+                    </div>
+                    <div>
+                        <label class="field-label">Top-K <span class="text-indigo-400 cursor-help help-tip" title="--top-k N -- top-k sampling (default: 40, 0 = disabled). Restricts sampling to the N most likely tokens.">?</span></label>
+                        <input type="number" id="server-top-k" value="40" step="1" class="field font-mono">
+                    </div>
+                    <div>
+                        <label class="field-label">Top-P <span class="text-indigo-400 cursor-help help-tip" title="--top-p N -- top-p sampling (default: 0.95, 1.0 = disabled). Restricts sampling to the smallest set of tokens whose cumulative probability exceeds N.">?</span></label>
+                        <input type="number" id="server-top-p" value="0.95" min="0" max="1" step="0.01" class="field font-mono">
+                    </div>
+                    <!-- Strata's sampling block only takes temperature/top_p/top_k; the three below
+                         are llama-server-only and get hidden (class 'llama-sampler') in strata mode. -->
+                    <div class="llama-sampler">
+                        <label class="field-label">Min-P <span class="text-indigo-400 cursor-help help-tip" title="--min-p N -- min-p sampling (default: 0.05, 0.0 = disabled). Discards tokens less likely than N times the most likely token.">?</span></label>
+                        <input type="number" id="server-min-p" value="0.05" min="0" max="1" step="0.01" class="field font-mono">
+                    </div>
+                    <div class="llama-sampler">
+                        <label class="field-label">Presence penalty <span class="text-indigo-400 cursor-help help-tip" title="--presence-penalty N -- repeat alpha presence penalty (default: 0.00, 0.0 = disabled). Flat penalty applied to any token that has appeared at all so far.">?</span></label>
+                        <input type="number" id="server-presence-penalty" value="0.00" step="0.05" class="field font-mono">
+                    </div>
+                    <div class="llama-sampler">
+                        <label class="field-label">Repeat penalty <span class="text-indigo-400 cursor-help help-tip" title="--repeat-penalty N -- penalize repeat sequence of tokens (default: 1.00, 1.0 = disabled). Scales down the probability of tokens already seen recently.">?</span></label>
+                        <input type="number" id="server-repeat-penalty" value="1.00" min="0" step="0.05" class="field font-mono">
+                    </div>
+                </div>
+            </div>
+        </details>
+
+        <details class="side-group" data-key="templates" id="group-templates">
+            <summary>Template &amp; vision <span class="side-hint" data-hint="templates"></span></summary>
+            <div class="side-body">
+                <label class="check-row">
+                    <input type="checkbox" id="jinja-toggle" class="accent-indigo-500 rounded">
+                    Jinja template engine <span class="text-indigo-400 cursor-help help-tip" title="--jinja -- whether to use the jinja template engine for chat (default: disabled). Required to use a custom chat template file below, unless it's one of llama.cpp's built-in templates.">?</span>
+                </label>
+                <div>
+                    <label class="field-label">Chat template file <span class="text-indigo-400 cursor-help help-tip" title="--chat-template-file PATH -- set a custom jinja chat template file (default: template taken from the model's own metadata). Enable Jinja above unless this is one of llama.cpp's built-in template names.">?</span></label>
+                    <input type="text" id="server-chat-template-file" placeholder="/path/to/template.jinja" class="field font-mono !text-[11px]">
+                </div>
+                <div class="pt-3 border-t border-gray-800 space-y-3">
+                    <label class="check-row">
+                        <input type="checkbox" id="mmproj-toggle" class="accent-indigo-500 rounded">
+                        Multimodal (mmproj) <span class="text-indigo-400 cursor-help help-tip" title="--mmproj PATH -- enable vision/multimodal input by loading a CLIP projector alongside the model. The projector must match the model's vision architecture -- HF snapshot caching often puts it in a DIFFERENT snapshot folder than the model weights, since each revision only downloads the files it references. Path is saved per-profile.">?</span>
+                    </label>
+                    <div>
+                        <label class="field-label">mmproj file</label>
+                        <input type="text" id="server-mmproj-path" placeholder="/path/to/mmproj-F16.gguf" class="field font-mono !text-[11px]">
+                    </div>
+                    <label class="check-row !text-[11.5px] !font-normal !text-gray-400">
+                        <input type="checkbox" id="mmproj-offload-toggle" checked class="accent-indigo-500 rounded">
+                        Keep projector in system RAM <span class="text-indigo-400 cursor-help help-tip" title="--no-mmproj-offload -- where the CLIP projector lives. Checked (default): it stays in system RAM and runs on the CPU, freeing ~0.9 GB of VRAM for the F16 Qwen3.8 mmproj. The vision encoder only runs while an image is being embedded, so this costs time on that step, not on text generation. Unchecked: the projector goes into VRAM alongside the model (llama.cpp's own default). Only builds that know the flag get it; older builds ignore the option.">?</span>
+                    </label>
+                </div>
+            </div>
+        </details>
+
+        <details class="side-group" data-key="advanced">
+            <summary>Advanced <span class="side-hint" data-hint="advanced"></span></summary>
+            <div class="side-body">
+                <!-- Kept (hidden) for script.js, which wires a click handler to it; the <details>
+                     above is the disclosure now. -->
+                <button id="btn-advanced-toggle" type="button" class="hidden"><span id="advanced-icon"></span></button>
+                <div id="advanced-panel" class="space-y-3">
+                    <div>
+                        <label class="field-label">Verbosity (-lv) <span class="text-indigo-400 cursor-help help-tip" title="-lv/--verbosity N -- log verbosity threshold. 3=info (default), 4=trace, 5=debug -- each shows everything the level below it does, plus more detail. Floor is 3: this dashboard's status detection (model loaded/ready) and telemetry capture (Monitor Mode, per-request CSV logging) both parse llama-server's INFO-level log lines, which llama-server itself suppresses below verbosity 3 -- going lower silently breaks the dashboard, not just quiets it.">?</span></label>
+                        <select id="server-verbosity" class="field !w-32">
+                            <option value="3">3 (info)</option>
+                            <option value="4">4 (trace)</option>
+                            <option value="5">5 (debug)</option>
+                        </select>
+                    </div>
+                    <div id="llama-extra-args">
+                        <div class="flex justify-between items-center mb-1">
+                            <label class="field-label !mb-0">Extra llama-server args <span class="text-indigo-400 cursor-help help-tip" title="Raw arguments appended verbatim (space-separated). -m paths are auto-mapped. Anything the GUI above doesn't expose goes here -- it's the only free-text field that actually persists across profile loads and reboots.">?</span></label>
+                            <button type="button" id="btn-flag-reference" class="btn btn-sm !py-0.5">Flags</button>
+                        </div>
+                        <textarea id="extra-args" rows="2" placeholder="e.g. --ctx-cache-type k8 --flash-attn-offload" class="field font-mono !text-[11px] resize-y"></textarea>
+                    </div>
+                    <!-- Raw launch command: READ-ONLY preview of the literal command that will be
+                         spawned (server4.js /api/start's rawCommand branch sends it verbatim).
+                         Auto-regenerated from every field; flags the GUI doesn't expose belong in
+                         Extra llama-server args above, which persists. -->
+                    <div>
+                        <div class="flex justify-between items-center mb-1">
+                            <label class="field-label !mb-0">Launch command <span class="text-indigo-400 cursor-help help-tip" title="Read-only preview of the literal command that will run, auto-regenerated from every field in this panel (including Extra llama-server args above). To add a flag the GUI doesn't expose, use Extra llama-server args above, not this box.">?</span></label>
+                            <span id="raw-command-status" class="text-[9px] text-gray-600"></span>
+                        </div>
+                        <textarea id="raw-launch-command" rows="5" spellcheck="false" readonly class="w-full bg-gray-950 border border-gray-800 rounded-md px-2.5 py-2 text-[11px] font-mono text-gray-400 resize-y leading-relaxed"></textarea>
+                        <div id="raw-command-warnings" class="hidden text-[9px] text-amber-400"></div>
+                    </div>
+                </div>
+            </div>
+        </details>
+
+        <!-- Actions: sticky so Load Model is always one click away, however far the groups scroll. -->
+        <div class="sticky bottom-0 z-10 px-5 py-3 border-t border-gray-800 bg-gray-900/90 backdrop-blur space-y-2">
+            <div class="flex gap-2">
+                <!-- Saves the ENTIRE current setup (model, launch mode, devices, every field, the
+                     raw command box) as a named profile, loadable from the Model section. -->
+                <button type="button" id="btn-save-config" class="btn" title="Saves this entire setup (model, launch mode, devices, all fields, the launch command) as a named profile, loadable from the dropdown at the top.">Save profile</button>
+                <button id="btn-start-server" class="btn btn-go flex-1 !py-2 !text-[13px]">
+                    <svg class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor"><path d="M6.3 2.84A1.5 1.5 0 004 4.11v11.78a1.5 1.5 0 002.3 1.27l9.34-5.89a1.5 1.5 0 000-2.54L6.3 2.84z"/></svg>
+                    Load model
+                </button>
+            </div>
+            <div id="boot-timer" class="text-[10px] text-gray-500 text-center font-mono hidden">Boot Time: 0.0s</div>
+            <!-- Item 15c: Historical stats summary -- populated from /api/logs/summary -->
+            <div id="historical-stats" class="text-[10px] text-gray-500 text-center font-mono hidden space-y-0.5"></div>
+        </div>
+
+        <details class="side-group" data-key="logs">
+            <summary>Server logs</summary>
+            <div class="side-body !gap-2">
+                <div id="master-logs-container" class="bg-gray-950/60 rounded-lg border border-gray-800 overflow-hidden">
+                    <button id="btn-master-logs-toggle" class="w-full flex justify-between items-center px-3 py-2 hover:bg-gray-800/60 text-xs font-medium text-gray-300 transition-colors">
+                        <span class="flex items-center gap-2"><span class="h-1.5 w-1.5 rounded-full bg-amber-400"></span> Master</span>
+                        <span id="master-logs-icon" class="text-[9px] text-gray-500 transition-transform">&#9654;</span>
                     </button>
                     <div id="master-logs-body" class="max-h-0 overflow-hidden transition-[max-height] duration-300">
                         <pre id="master-logs-pre" class="px-3 py-2 pb-16 text-[9px] font-mono text-gray-400 max-h-80 overflow-y-auto whitespace-pre-wrap select-text bg-gray-950/50" style="mask-image: linear-gradient(to top, black 40%, transparent 100%);">No logs fetched yet.</pre>
                     </div>
                 </div>
-
-                <!-- Worker Logs -->
-                <div id="worker-logs-container" class="bg-gray-800/50 rounded-lg border border-gray-700/50 overflow-hidden">
-                    <button id="btn-worker-logs-toggle" class="w-full flex justify-between items-center px-3 py-2 hover:bg-gray-800 text-xs font-semibold text-gray-300 transition-colors">
-                        <span class="flex items-center gap-2"><span class="text-red-400">●</span> Worker Logs</span>
-                        <span id="worker-logs-icon" class="text-[9px] transition-transform">&#9654;</span>
+                <div id="worker-logs-container" class="bg-gray-950/60 rounded-lg border border-gray-800 overflow-hidden">
+                    <button id="btn-worker-logs-toggle" class="w-full flex justify-between items-center px-3 py-2 hover:bg-gray-800/60 text-xs font-medium text-gray-300 transition-colors">
+                        <span class="flex items-center gap-2"><span class="h-1.5 w-1.5 rounded-full bg-red-400"></span> <span id="worker-logs-title">Worker Logs</span></span>
+                        <span id="worker-logs-icon" class="text-[9px] text-gray-500 transition-transform">&#9654;</span>
                     </button>
                     <div id="worker-logs-body" class="max-h-0 overflow-hidden transition-[max-height] duration-300">
                         <pre id="worker-logs-pre" class="px-3 py-2 pb-16 text-[9px] font-mono text-gray-400 max-h-80 overflow-y-auto whitespace-pre-wrap select-text bg-gray-950/50" style="mask-image: linear-gradient(to top, black 40%, transparent 100%);">No logs fetched yet.</pre>
                     </div>
                 </div>
             </div>
+        </details>
 
-            <hr class="border-gray-800">
-
-            <div class="space-y-2 flex-1 min-h-[150px]">
-                <div class="flex justify-between items-center">
-                    <h2 class="text-xs font-bold tracking-wider text-gray-500 uppercase">Chat History</h2>
-                    <button id="btn-new-chat" class="flex items-center gap-1 px-2 py-1 bg-indigo-600/20 hover:bg-indigo-600/40 border border-indigo-500/30 text-indigo-400 rounded text-[10px] font-semibold transition-colors">
-                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
-                        New Chat
-                    </button>
-                </div>
+        <details class="side-group flex-1" data-key="chats" open>
+            <summary>Chat history</summary>
+            <div class="side-body !gap-2">
+                <button id="btn-new-chat" class="btn btn-sm self-start text-indigo-300">
+                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
+                    New chat
+                </button>
                 <div id="history-list" class="space-y-1 overflow-y-auto max-h-48 pr-2 text-xs text-gray-400">
                     <div class="italic text-gray-600">No prompts yet.</div>
                 </div>
             </div>
-        </div>
+        </details>
     </aside>
-    <div id="left-resizer" class="hidden md:block w-1 hover:w-2 bg-gray-800 hover:bg-indigo-500 cursor-col-resize transition-all shrink-0 z-20"></div>
+    <div id="left-resizer" class="hidden md:block resizer"></div>
 
-    <main class="flex-1 flex flex-col min-w-0 bg-gray-950 relative">
+    <main class="flex-1 flex flex-col min-w-0 min-h-0 bg-gray-950 relative">
         <!-- Interactive (this dashboard's own chat) vs Monitor (this browser
              session only, live) vs History (every request ever logged, from
              CSV) -- all three are client-agnostic: they show requests from
              this dashboard's chat, opencode, Cline, curl, anything that hits
              llama-server. See server4.js logCompletedRequest() for the
              capture side. -->
-        <div class="flex border-b border-gray-800 bg-gray-900/50 shrink-0">
-            <button type="button" id="toggle-left-sidebar" title="Collapse/expand the launch sidebar" class="px-2 py-2 text-xs text-gray-500 hover:text-gray-300">⟨⟨</button>
-            <button type="button" id="tab-interactive" class="px-4 py-2 text-xs font-semibold text-indigo-400 border-b-2 border-indigo-500">Interactive</button>
-            <button type="button" id="tab-monitor" class="px-4 py-2 text-xs font-semibold text-gray-500 border-b-2 border-transparent hover:text-gray-300">Monitor</button>
-            <button type="button" id="tab-history" class="px-4 py-2 text-xs font-semibold text-gray-500 border-b-2 border-transparent hover:text-gray-300">History</button>
-            <button type="button" id="tab-bench" class="px-4 py-2 text-xs font-semibold text-gray-500 border-b-2 border-transparent hover:text-gray-300">Bench</button>
-            <button type="button" id="toggle-right-sidebar" title="Collapse/expand the telemetry sidebar" class="px-2 py-2 text-xs text-gray-500 hover:text-gray-300 ml-auto">⟩⟩</button>
+        <!-- Top bar: sidebar toggles + top-level tabs. Tab classes are set by script.js
+             setTabButtonActive (.nav-tab / .is-active). -->
+        <div class="app-topbar">
+            <button type="button" id="toggle-left-sidebar" title="Collapse/expand the launch sidebar" class="icon-btn"></button>
+            <div class="tab-strip flex flex-1 min-w-0 overflow-x-auto">
+                <nav class="nav-tabs">
+                    <button type="button" id="tab-interactive" class="nav-tab is-active"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4.5h12a1.5 1.5 0 011.5 1.5v6.5A1.5 1.5 0 0116 14H9l-3.5 3v-3H4a1.5 1.5 0 01-1.5-1.5V6A1.5 1.5 0 014 4.5z"/></svg>Chat</button>
+                    <button type="button" id="tab-monitor" class="nav-tab"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 10h3l2-5 3 10 2-5h5"/></svg>Monitor</button>
+                    <button type="button" id="tab-history" class="nav-tab"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7"/><path d="M10 6v4l2.5 2"/></svg>History</button>
+                    <button type="button" id="tab-bench" class="nav-tab"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 16.5h14M5.5 13.5V9M10 13.5V4.5M14.5 13.5v-6"/></svg>Bench</button>
+                    <button type="button" id="tab-models" class="nav-tab"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 2.5l6.5 3.75v7.5L10 17.5l-6.5-3.75v-7.5L10 2.5z"/><path d="M3.5 6.25L10 10l6.5-3.75M10 10v7.5"/></svg>Results</button>
+                </nav>
+            </div>
+            <a href="/posts" class="icon-btn" title="Posts for lab.kylebaker.io (the public site's blog editor)"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 3.5l3 3L7 16H4v-3l9.5-9.5z"/><path d="M11.5 5.5l3 3"/></svg></a>
+            <button type="button" id="toggle-right-sidebar" title="Collapse/expand the telemetry sidebar" class="icon-btn"></button>
         </div>
 
         <!-- Monitor: THIS SESSION ONLY (nothing backfilled from CSV -- only
@@ -554,11 +605,14 @@
              updating omni graph (GPU + prefill/gen tps), independent of any
              single request, fed every telemetry poll tick regardless of which
              tab is active. -->
-         <div id="monitor-view" class="hidden flex-1 flex-col min-h-0 p-6 space-y-4 overflow-hidden">
+         <div id="monitor-view" class="hidden flex-1 flex-col min-h-0 p-3 md:p-6 space-y-4 overflow-y-auto">
             <!-- Live in-flight request status: fed by the same PREFILL_PROGRESS /
                  GEN_PROGRESS broadcasts that drive the sidebar, so it works for
                  requests from ANY client (opencode, curl, ...), not just this
                  dashboard's chat. -->
+            <!-- One card per server running now (queue lanes): script.js renderMonitorServers, fed by the same
+                 telemetry tick as the sidebar. Hidden with no lane busy; then the single card below shows. -->
+            <div id="monitor-servers" class="hidden grid gap-4"></div>
             <div id="live-request-card" class="bg-gray-900 border border-gray-800 rounded-xl p-4">
                 <div class="flex justify-between items-center mb-2">
                     <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">Live Request</h3>
@@ -585,18 +639,20 @@
             </div>
             <div class="bg-gray-900 border border-gray-800 rounded-xl p-4 cursor-pointer hover:border-gray-700 transition-colors" id="session-omni-card" title="Click to expand and see all session activity since page load">
                 <div class="flex justify-between items-center mb-2">
-                    <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">Session Activity <span class="text-gray-600 normal-case font-normal">(last 2 min -- click to expand full session · <button id="session-omni-reset" class="underline hover:text-gray-400">reset lines</button> · <label class="cursor-pointer"><input type="checkbox" class="omni-smooth-cb accent-indigo-500"> smooth</label>)</span></h3>
+                    <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">Session Activity <span class="text-gray-600 normal-case font-normal">(every card and every server, last 2 min -- click to expand full session · <button id="session-omni-reset" class="underline hover:text-gray-400">reset lines</button> · <label class="cursor-pointer"><input type="checkbox" class="omni-smooth-cb accent-indigo-500"> smooth</label>)</span></h3>
                 </div>
                 <div class="h-48"><canvas id="sessionOmniChart"></canvas></div>
             </div>
             <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
                 <div class="flex justify-between items-center mb-2">
-                    <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">Tokens/sec — this session</h3>
-                    <button id="monitor-tps-xaxis-toggle" type="button" class="text-[10px] text-gray-500 hover:text-gray-300 transition-colors px-1.5 py-0.5 rounded border border-gray-700 hover:border-gray-500" title="Switch between time-spaced (linear) and evenly-spaced (categorical) x-axis">time</button>
+                    <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">Tokens/sec — this session <span class="text-gray-600 normal-case font-normal">(stacked by server: the top of each stack is the machine's total)</span></h3>
                 </div>
-                <div class="h-64"><canvas id="monitorTpsChart"></canvas></div>
+                <div class="text-[10px] text-gray-500 mb-1">Generating</div>
+                <div class="h-40"><canvas id="monitorGenStackChart"></canvas></div>
+                <div class="text-[10px] text-gray-500 mt-3 mb-1">Reading prompts</div>
+                <div class="h-40"><canvas id="monitorPrefillStackChart"></canvas></div>
             </div>
-            <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden flex-1 min-h-0 flex flex-col">
+            <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden flex-1 min-h-[24rem] flex flex-col">
                 <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider p-4 pb-2 shrink-0">Requests This Session</h3>
                 <div class="overflow-x-auto overflow-y-auto flex-1 min-h-0">
                     <table class="w-full text-xs">
@@ -609,8 +665,8 @@
                                 <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Gen tok</th>
                                 <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Gen t/s</th>
                                 <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900" title="Speculative draft acceptance: accepted / generated draft tokens for this request. Blank when speculative decoding was off or nothing was drafted.">Draft acc</th>
-                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Wall (s)</th>
-                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900" title="Peak GPU temp seen during this request (Master/Worker). Orange = a real thermal throttle was seen (hw_thermal_slowdown, or sw_thermal_slowdown corroborated by a hot reading -- see isRealThermal).">Thermal</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Wall</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900" title="Peak temp seen during this request, per GPU. Orange = a real thermal throttle was seen (hw_thermal_slowdown, or sw_thermal_slowdown corroborated by a hot reading -- see isRealThermal).">Thermal</th>
                             </tr>
                         </thead>
                         <tbody id="monitor-requests-body" class="text-gray-300"></tbody>
@@ -623,16 +679,34 @@
         <!-- History: every request ever logged, backfilled from the CSV --
              what "Monitor" used to be before it split into session-only +
              all-time. -->
-        <div id="history-view" class="hidden flex-1 flex-col min-h-0 p-6 space-y-4 overflow-hidden">
+        <div id="history-view" class="hidden flex-1 flex-col min-h-0 p-3 md:p-6 space-y-4 overflow-y-auto">
             <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
                 <div class="flex justify-between items-center mb-2">
                     <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">Tokens/sec — every completed request</h3>
-                    <button id="history-tps-xaxis-toggle" type="button" class="text-[10px] text-gray-500 hover:text-gray-300 transition-colors px-1.5 py-0.5 rounded border border-gray-700 hover:border-gray-500" title="Switch between time-spaced (linear) and evenly-spaced (categorical) x-axis">time</button>
-                    <span id="history-chart-status" class="text-[10px] text-gray-600"></span>
+                    <!-- 2026-10-01, Kyle: the chart is a pannable TIME WINDOW fetched from /api/logs/range
+                         (script.js fetchHistoryWindow), not the table's loaded rows. The time/cat x-axis
+                         toggle is gone: an evenly-spaced axis means nothing for a panned, downsampled window. -->
+                    <div class="flex items-center gap-1.5">
+                        <button id="history-win-24h" type="button" class="text-[10px] text-gray-500 hover:text-gray-300 transition-colors px-1.5 py-0.5 rounded border border-gray-700 hover:border-gray-500" title="The 24 hours up to the newest request">last 24 h</button>
+                        <button id="history-win-all" type="button" class="text-[10px] text-gray-500 hover:text-gray-300 transition-colors px-1.5 py-0.5 rounded border border-gray-700 hover:border-gray-500" title="Everything ever logged (downsampled)">all</button>
+                    </div>
                 </div>
                 <div class="h-64"><canvas id="historyTpsChart"></canvas></div>
+                <!-- Scrollbar (2026-10-01, Kyle): the track is padded to the plot area's left/right by
+                     script.js updateHistoryScrollbar, so it spans exactly the plot = the whole extent;
+                     the thumb is the visible window. -->
+                <!-- Inline styles, not new Tailwind classes: vendor/tailwind.css is prebuilt and has none of these. -->
+                <div id="history-scroll" class="mt-1 select-none" style="visibility:hidden">
+                    <div id="history-scroll-track" class="relative h-3 rounded" style="touch-action:none;cursor:pointer;background:rgba(37,40,50,0.8);border:1px solid rgba(54,58,71,0.6)">
+                        <div id="history-scroll-thumb" class="absolute top-0 bottom-0 rounded" style="left:0;width:24px;touch-action:none;cursor:grab;background:rgba(116,123,140,0.85)"></div>
+                    </div>
+                </div>
+                <div class="flex justify-between items-center gap-2 mt-1 text-[10px] text-gray-600">
+                    <span id="history-chart-status"></span>
+                    <span class="truncate">wheel/pinch zoom · drag, sideways or shift+wheel pan · double-click resets</span>
+                </div>
             </div>
-            <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden flex-1 min-h-0 flex flex-col">
+            <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden flex-1 min-h-[24rem] flex flex-col">
                 <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider p-4 pb-2 shrink-0">Recent Requests</h3>
                 <div class="overflow-x-auto overflow-y-auto flex-1 min-h-0">
                     <table class="w-full text-xs">
@@ -645,8 +719,8 @@
                                 <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Gen tok</th>
                                 <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Gen t/s</th>
                                 <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900" title="Speculative draft acceptance: accepted / generated draft tokens for this request. Blank when speculative decoding was off or nothing was drafted.">Draft acc</th>
-                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Wall (s)</th>
-                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900" title="Peak GPU temp seen during this request (Master/Worker). Orange = a real thermal throttle was seen (hw_thermal_slowdown, or sw_thermal_slowdown corroborated by a hot reading -- see isRealThermal).">Thermal</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900">Wall</th>
+                                <th class="text-right font-medium px-4 py-2 sticky top-0 z-10 bg-gray-900" title="Peak temp seen during this request, per GPU. Orange = a real thermal throttle was seen (hw_thermal_slowdown, or sw_thermal_slowdown corroborated by a hot reading -- see isRealThermal).">Thermal</th>
                             </tr>
                         </thead>
                         <tbody id="history-requests-body" class="text-gray-300"></tbody>
@@ -664,35 +738,65 @@
             </div>
         </div>
 
-        <div id="bench-view" class="hidden flex-1 flex-col overflow-y-auto p-6 space-y-4">
-            <div class="flex gap-1 shrink-0">
-                <button type="button" id="bench-subtab-hw" class="px-3 py-1.5 rounded-md text-xs font-semibold bg-indigo-600 text-white">llama-bench — hardware</button>
-                <button type="button" id="bench-subtab-server" class="px-3 py-1.5 rounded-md text-xs font-semibold bg-gray-800 text-gray-400 hover:text-gray-200">llama-server — spec sweep</button>
+        <div id="bench-view" class="hidden flex-1 flex-col overflow-y-auto p-3 md:p-6 space-y-4">
+            <div class="flex flex-wrap items-end gap-3 shrink-0 pt-1">
+                <div>
+                    <h2 class="text-[20px] font-semibold tracking-tight text-white">Bench</h2>
+                    <div class="text-[12px] text-gray-500 mt-0.5">Hardware speed, launch sweeps, public suites and private quality runs</div>
+                </div>
+                <div class="seg-row ml-auto p-1 rounded-[11px] bg-gray-900 border border-gray-800">
+                    <button type="button" id="bench-subtab-hw" class="seg-btn is-on"><span class="text-gray-500 font-normal">speed ·</span> llama-bench</button>
+                    <button type="button" id="bench-subtab-server" class="seg-btn"><span class="text-gray-500 font-normal">speed ·</span> spec sweep</button>
+                    <button type="button" id="bench-subtab-suites" class="seg-btn"><span class="text-gray-500 font-normal">quality ·</span> public suites</button>
+                    <button type="button" id="bench-subtab-codebench" class="seg-btn"><span class="text-gray-500 font-normal">quality ·</span> codebench</button>
+                </div>
+            </div>
+            <!-- Quality benchmarks (codebench): Runs / Live / Kick off. Rendered by ui/benchmarks/index.js (ES module, loaded at the bottom of the page); lib/codebench.js + /api/codebench/* behind it. -->
+            <div id="bench-card-codebench" class="hidden bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3"><div class="text-xs text-gray-500">Loading ui/benchmarks…</div></div>
+            <!-- Public coding suites against the served model (lib/suites.js) -->
+            <div id="bench-card-suites" class="hidden bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">
+                <div class="text-xs text-gray-400">Runs a public suite against whatever llama-server is serving right now (same <code>/v1</code> the chat uses; launch a model first). Public suites are in every model's training data — use them as a sanity baseline; <code>~/code/codebench</code> is the uncontaminated one.</div>
+                <div class="flex flex-wrap gap-2 items-end">
+                    <label class="text-[10px] text-gray-400">Suite<br><select id="suite-id" class="bg-gray-950 border border-gray-700 rounded px-2 py-1 text-xs"></select></label>
+                    <label class="text-[10px] text-gray-400">Dataset (EvalPlus)<br><select id="suite-dataset" class="bg-gray-950 border border-gray-700 rounded px-2 py-1 text-xs"><option>humaneval</option><option>mbpp</option></select></label>
+                    <label class="text-[10px] text-gray-400">Model name sent<br><input id="suite-model" value="local" class="bg-gray-950 border border-gray-700 rounded px-2 py-1 text-xs w-32"></label>
+                    <label class="text-[10px] text-gray-400">Aider: # tests (blank = all 225)<br><input id="suite-numtests" class="bg-gray-950 border border-gray-700 rounded px-2 py-1 text-xs w-24"></label>
+                    <button type="button" id="suite-start" class="btn btn-primary">Run suite</button>
+                    <button type="button" id="suite-stop" class="btn btn-danger">Stop</button>
+                    <span id="suite-status" class="text-[10px] text-gray-500"></span>
+                </div>
+                <div id="suite-result" class="text-sm font-mono text-green-300"></div>
+                <!-- This sub-tab's OWN output. No other sub-tab's runs appear here. -->
+                <pre id="suite-log" class="text-[10px] font-mono text-gray-300 bg-gray-950 border border-gray-800 rounded p-2 max-h-[55vh] overflow-auto whitespace-pre-wrap"></pre>
+                <div class="border-t border-gray-800 pt-3">
+                    <div class="card-title mb-3">Public-suite leaderboard</div>
+                    <div id="suite-leaderboard"></div>
+                </div>
             </div>
             <div id="bench-card-hw" class="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">
                 <div class="flex justify-between items-center">
-                    <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">llama-bench <span class="text-indigo-400 cursor-help font-normal normal-case" title="Runs llama-bench from the selected build. The model server must be stopped first (the bench needs the VRAM). Depths (-d) test prompt/gen speed at context depth -- the key number for long-context tuning. NOTE: llama-bench measures raw decode with NO speculative decoding; its gen numbers are no-spec baselines.">?</span></h3>
+                    <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">llama-bench <span class="text-indigo-400 cursor-help help-tip font-normal normal-case" title="Runs llama-bench from the selected build. The model server must be stopped first (the bench needs the VRAM). Depths (-d) test prompt/gen speed at context depth -- the key number for long-context tuning. NOTE: llama-bench measures raw decode with NO speculative decoding; its gen numbers are no-spec baselines.">?</span></h3>
                     <span id="bench-status" class="text-[10px] text-gray-500"></span>
                 </div>
 
                 <!-- Target: what runs where -->
                 <div class="border border-gray-800 rounded-lg p-3 space-y-2">
                     <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Target</div>
-                    <div class="grid grid-cols-4 gap-2">
+                    <div class="grid grid-cols-1 md:grid-cols-4 gap-2">
                         <div>
                             <label class="block text-[10px] text-gray-400 mb-1">Build</label>
                             <select id="bench-build" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs"></select>
                         </div>
-                        <div class="col-span-3">
+                        <div class="md:col-span-3">
                             <label class="block text-[10px] text-gray-400 mb-1">Model</label>
                             <select id="bench-model" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono"></select>
                         </div>
                     </div>
-                    <div class="grid grid-cols-4 gap-2">
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
                         <div class="col-span-2">
-                            <label class="block text-[10px] text-gray-400 mb-1">Devices <span class="text-indigo-400 cursor-help" title="-dev -- which GPU(s) run the bench. Solo entries isolate one card; pair entries test the multi-GPU pipeline. Pick Custom to type anything.">?</span></label>
+                            <label class="block text-[10px] text-gray-400 mb-1">Devices <span class="text-indigo-400 cursor-help help-tip" title="-dev -- which GPU(s) run the bench. Solo entries isolate one card; pair and triple entries (distinct physical cards) test the multi-GPU pipeline. RPC workers aren't offered -- the bench runner doesn't start them; pick Custom (and --rpc in extra args) for one that's already running.">?</span></label>
                             <select id="bench-devices-select" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono"></select>
-                            <input type="text" id="bench-devices" placeholder="e.g. CUDA0,Vulkan2" class="hidden mt-1 w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono">
+                            <input type="text" id="bench-devices" placeholder="device ids from --list-devices, e.g. Vulkan0,Vulkan1" class="hidden mt-1 w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono">
                         </div>
                         <div>
                             <label class="block text-[10px] text-gray-400 mb-1">Split mode</label>
@@ -704,7 +808,7 @@
                             </select>
                         </div>
                         <div>
-                            <label class="block text-[10px] text-gray-400 mb-1">Tensor split <span class="text-indigo-400 cursor-help" title="-ts, e.g. 37/63. Blank = auto.">?</span></label>
+                            <label class="block text-[10px] text-gray-400 mb-1">Tensor split <span class="text-indigo-400 cursor-help help-tip" title="-ts, e.g. 37/63. Blank = auto.">?</span></label>
                             <input type="text" id="bench-ts" placeholder="auto" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono">
                         </div>
                     </div>
@@ -713,7 +817,7 @@
                 <!-- Params: how it runs -->
                 <div class="border border-gray-800 rounded-lg p-3 space-y-2">
                     <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Params</div>
-                    <div class="grid grid-cols-6 gap-2">
+                    <div class="grid grid-cols-2 md:grid-cols-6 gap-2">
                         <div>
                             <label class="block text-[10px] text-gray-400 mb-1">Prompt tok (-p)</label>
                             <input type="text" id="bench-p" value="8192" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono">
@@ -723,7 +827,7 @@
                             <input type="text" id="bench-n" value="128" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono">
                         </div>
                         <div class="col-span-2">
-                            <label class="block text-[10px] text-gray-400 mb-1">Depths (-d) <span class="text-indigo-400 cursor-help" title="Comma-separated context depths to test at. Depth 0 = empty context; higher depths show the long-context decay that matters for your real workload.">?</span></label>
+                            <label class="block text-[10px] text-gray-400 mb-1">Depths (-d) <span class="text-indigo-400 cursor-help help-tip" title="Comma-separated context depths to test at. Depth 0 = empty context; higher depths show the long-context decay that matters for your real workload.">?</span></label>
                             <input type="text" id="bench-d" value="0,32768,98304" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono">
                         </div>
                         <div>
@@ -744,20 +848,20 @@
                     </div>
                 </div>
 
-                <div class="flex gap-2 items-center">
-                    <button id="bench-run" class="px-4 py-1.5 bg-gray-800 hover:bg-gray-700 text-indigo-300 rounded-md text-xs font-semibold transition-colors" title="Runs the Target+Params form above ONCE, exactly as shown. Does not touch the queued rows.">Run form once</button>
-                    <button id="bench-add-row-btn" class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-indigo-300 rounded-md text-xs font-semibold transition-colors" title="Snapshot the Target+Params fields above (including extra args) as a custom matrix row -- it runs with ITS OWN settings, not the recommended defaults.">+ Matrix row</button>
-                    <button id="bench-auto-btn" class="px-4 py-1.5 bg-gray-800 hover:bg-gray-700 text-indigo-300 rounded-md text-xs font-semibold transition-colors" title="Generates the recommended comparison matrix from your detected builds and devices: solo runs per GPU (backend vs backend) and cross-GPU pairs, all with the recommended settings. Check the runs you want, pick a model, run them back to back.">Auto Matrix</button>
-                    <button id="bench-stop-btn" class="px-4 py-1.5 bg-gray-800 hover:bg-gray-700 text-red-400 rounded-md text-xs font-semibold transition-colors hidden">Stop</button>
+                <div class="flex flex-wrap gap-2 items-center">
+                    <button id="bench-run" class="btn" title="Runs the Target+Params form above ONCE, exactly as shown. Does not touch the queued rows.">Run form once</button>
+                    <button id="bench-add-row-btn" class="btn" title="Snapshot the Target+Params fields above (including extra args) as a custom matrix row -- it runs with ITS OWN settings, not the recommended defaults.">+ Matrix row</button>
+                    <button id="bench-auto-btn" class="btn" title="Generates the recommended comparison matrix from your detected builds and devices: solo runs per GPU (backend vs backend) and cross-GPU pairs, all with the recommended settings. Check the runs you want, pick a model, run them back to back.">Auto Matrix</button>
+                    <button id="bench-stop-btn" class="btn btn-danger hidden">Stop</button>
                 </div>
 
                 <div id="bench-custom-list" class="space-y-1"></div>
                 <div>
                     <label class="block text-[10px] text-gray-400 mb-1">Manual run lines <span class="text-indigo-400 cursor-help" title="One llama-bench run per line: 'label :: -m <model-name-substring> <args...>'. The -m value is matched against your model list and replaced with the full path; everything else passes to llama-bench verbatim. Queue lines adds them to the custom rows above.">?</span></label>
-                    <textarea id="bench-manual-lines" rows="3" placeholder="iso-a :: -m Qwen3.8-27B-UD -fa 1 -ctk q8_0 -ctv q8_0 -p 8192 -n 128 -d 0,32768 -dev CUDA0/Vulkan2 -ts 40/60" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-[11px] font-mono"></textarea>
-                    <button id="bench-queue-lines" class="mt-1 px-3 py-1 bg-gray-800 hover:bg-gray-700 text-indigo-300 rounded-md text-xs font-semibold transition-colors">Queue lines</button>
+                    <textarea id="bench-manual-lines" rows="3" placeholder="iso-a :: -m Qwen3.8-27B-UD -fa 1 -ctk q8_0 -ctv q8_0 -p 8192 -n 128 -d 0,32768 -dev Vulkan0/Vulkan1 -ts 50/50" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-[11px] font-mono"></textarea>
+                    <button id="bench-queue-lines" class="btn btn-sm mt-1.5">Queue lines</button>
                 </div>
-                <button id="bench-run-queued" class="hidden px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-md text-xs font-semibold transition-colors" title="Runs the queued rows above, in order, server-side (each with its OWN saved settings -- the form above is not consulted).">Run queued rows</button>
+                <button id="bench-run-queued" class="hidden btn btn-primary self-start" title="Runs the queued rows above, in order, server-side (each with its OWN saved settings -- the form above is not consulted).">Run queued rows</button>
 
                 <!-- Auto matrix: generated checklist of build+device combos -->
                 <div id="bench-auto-panel" class="hidden border border-indigo-900/50 rounded-lg p-3 space-y-2">
@@ -767,16 +871,22 @@
                         <select id="bench-auto-model" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono"></select>
                     </div>
                     <div id="bench-auto-list" class="space-y-1 text-[11px] text-gray-300"></div>
-                    <div class="flex gap-2 items-center">
-                        <button id="bench-auto-run" class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-md text-xs font-semibold transition-colors">Run Matrix</button>
-                        <button id="bench-auto-resume" class="hidden px-4 py-1.5 bg-amber-700 hover:bg-amber-600 text-white rounded-md text-xs font-semibold transition-colors">Resume matrix</button>
+                    <div class="flex flex-wrap gap-2 items-center">
+                        <button id="bench-auto-run" class="btn btn-primary">Run Matrix</button>
+                        <button id="bench-auto-resume" class="hidden btn !bg-amber-700/80 !border-amber-600/60 !text-white">Resume matrix</button>
                         <span id="bench-auto-status" class="text-[10px] text-gray-500"></span>
                     </div>
                 </div>
             </div>
+            <!-- llama-bench's own leaderboard: only llama-bench measurements, one row per
+                 (build, devices, KV, offload flags) AT A STATED CONTEXT. -->
+            <div id="bench-card-hw-board" class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+                <div class="card-title mb-3">llama-bench leaderboard</div>
+                <div id="bench-leaderboard-hw"></div>
+            </div>
             <div id="bench-card-sweep" class="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3 hidden">
                 <div class="flex justify-between items-center">
-                    <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">Launch Sweep <span class="text-indigo-400 cursor-help font-normal normal-case" title="Benches the REAL llama-server including the speculative stack (llama-bench can't). Runs ANY number of queued configs sequentially. Configure the launch sidebar as usual, Add snapshots it as a row; Run launches each config, sends the test prompt, harvests the stats, stops, and moves on. Don't refresh the page mid-sweep -- the runner lives client-side.">?</span></h3>
+                    <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">Launch Sweep <span class="text-indigo-400 cursor-help help-tip font-normal normal-case" title="Benches the REAL llama-server including the speculative stack (llama-bench can't). Runs ANY number of queued configs sequentially. Configure the launch sidebar as usual, Add snapshots it as a row; Run launches each config, sends the test prompt, harvests the stats, stops, and moves on. Don't refresh the page mid-sweep -- the runner lives client-side.">?</span></h3>
                     <span id="ab-status" class="text-[10px] text-gray-500"></span>
                 </div>
                 <div id="ab-rows" class="space-y-1"></div>
@@ -784,23 +894,23 @@
                 <div>
                     <label class="block text-[10px] text-gray-400 mb-1">Manual run lines <span class="text-indigo-400 cursor-help" title="One llama-server launch per line: 'label :: -m <model-name-substring> <server args...>'. The -m value is matched against your model list; the rest is the exact launch command (binary prepended from the CUDA+Vulkan build). Queue lines adds sweep rows.">?</span></label>
                     <textarea id="ab-manual-lines" rows="3" placeholder="iso-mtp :: -m Qwen3.6-35B -c 32768 -ngl 999 --port 8080 -fa on --spec-type draft-mtp -np 1 -dev Vulkan2 --jinja" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-[11px] font-mono"></textarea>
-                    <button id="ab-queue-lines" class="mt-1 px-3 py-1 bg-gray-800 hover:bg-gray-700 text-indigo-300 rounded-md text-xs font-semibold transition-colors">Queue lines</button>
+                    <button id="ab-queue-lines" class="btn btn-sm mt-1.5">Queue lines</button>
                 </div>
-                <div class="flex gap-2">
-                    <button id="ab-add-btn" class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-indigo-300 rounded-md text-xs font-semibold transition-colors" title="Snapshot the current launch-sidebar settings (including the raw command box) as an A/B row.">+ Add current launch config</button>
-                    <button id="ab-run-btn" class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-md text-xs font-semibold transition-colors">Run Sweep</button>
-                    <button id="ab-clear-btn" class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-400 rounded-md text-xs font-semibold transition-colors">Clear</button>
+                <div class="flex flex-wrap gap-2">
+                    <button id="ab-add-btn" class="btn" title="Snapshot the current launch-sidebar settings (including the raw command box) as an A/B row.">+ Add current launch config</button>
+                    <button id="ab-run-btn" class="btn btn-primary">Run Sweep</button>
+                    <button id="ab-clear-btn" class="btn">Clear</button>
                 </div>
                 <div>
                     <label class="block text-[10px] text-gray-400 mb-1 flex items-center justify-between">
-                        <span>Test prompt <span class="text-indigo-400 cursor-help" title="Sent identically to every config. Use something representative of your real work -- ngram results especially depend on content (repetitive/code-heavy vs novel prose).">?</span></span>
+                        <span>Test prompt <span class="text-indigo-400 cursor-help help-tip" title="Sent identically to every config. Use something representative of your real work -- ngram results especially depend on content (repetitive/code-heavy vs novel prose).">?</span></span>
                         <span id="ab-prompt-token-count" class="text-gray-500 normal-case">~0 tokens</span>
                     </label>
                     <textarea id="ab-prompt" rows="3" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono" placeholder="paste a representative task prompt here"></textarea>
                 </div>
-                <div class="grid grid-cols-4 gap-2">
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
                     <div>
-                        <label class="block text-[10px] text-gray-400 mb-1">Gen tokens <span class="text-indigo-400 cursor-help" title="max_tokens per request -- fixed so every config generates comparable work.">?</span></label>
+                        <label class="block text-[10px] text-gray-400 mb-1">Gen tokens <span class="text-indigo-400 cursor-help help-tip" title="max_tokens per request -- fixed so every config generates comparable work.">?</span></label>
                         <input type="text" id="ab-gen-tokens" value="512" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono">
                     </div>
                     <div>
@@ -808,11 +918,11 @@
                         <input type="text" id="ab-reps" value="2" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono">
                     </div>
                     <div>
-                        <label class="block text-[10px] text-gray-400 mb-1">Cool to &deg;C <span class="text-indigo-400 cursor-help" title="Before each config, idle until the GPU is at or below this temperature. Removes the thermal ramp that otherwise makes later rows in a sweep slower than earlier ones. CPU temp is recorded but not gated on -- it shares cooling with the dGPU and lags. Blank or 0 disables.">?</span></label>
+                        <label class="block text-[10px] text-gray-400 mb-1">Cool to &deg;C <span class="text-indigo-400 cursor-help help-tip" title="Before each config, idle until the GPU is at or below this temperature. Removes the thermal ramp that otherwise makes later rows in a sweep slower than earlier ones. CPU temp is recorded but not gated on -- it shares cooling with the dGPU and lags. Blank or 0 disables.">?</span></label>
                         <input type="text" id="ab-cool-temp" value="0" placeholder="0 = off" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono">
                     </div>
                     <div>
-                        <label class="block text-[10px] text-gray-400 mb-1">Max cool (s) <span class="text-indigo-400 cursor-help" title="Give up waiting after this many seconds and run anyway (the row is still flagged if it was hot).">?</span></label>
+                        <label class="block text-[10px] text-gray-400 mb-1">Max cool (s) <span class="text-indigo-400 cursor-help help-tip" title="Give up waiting after this many seconds and run anyway (the row is still flagged if it was hot).">?</span></label>
                         <input type="text" id="ab-cool-max" value="300" class="w-full bg-gray-950 border border-gray-700 rounded-md px-2 py-1 text-xs font-mono">
                     </div>
                 </div>
@@ -829,17 +939,27 @@
                             <th class="text-right font-medium px-2 py-1">Gen tok</th>
                             <th class="text-right font-medium px-2 py-1">Gen t/s</th>
                             <th class="text-right font-medium px-2 py-1">Draft acc</th>
-                            <th class="text-right font-medium px-2 py-1">Wall (s)</th>
+                            <th class="text-right font-medium px-2 py-1">Wall</th>
                             <th class="text-right font-medium px-2 py-1">Thermal</th>
                         </tr></thead>
                         <tbody id="ab-results-body" class="text-gray-300"></tbody>
                     </table>
                 </div>
             </div>
+            <!-- The sweep's own leaderboard: llama-server rows (the real speculative stack),
+                 kept apart from llama-bench's no-spec numbers. -->
+            <div id="bench-card-sweep-board" class="hidden bg-gray-900 border border-gray-800 rounded-xl p-4">
+                <div class="card-title mb-3">Launch-sweep leaderboard</div>
+                <div id="bench-leaderboard-sweep"></div>
+            </div>
 
-            <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
-                <div class="flex justify-between items-center mb-2">
-                    <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">Run Telemetry</h3>
+            <!-- Telemetry + Output belong to the ACTIVE speed sub-tab only: they are hidden
+                 for Suites and codebench (those cards carry their own output), and the Output
+                 card keeps a SEPARATE pane per sub-tab so llama-bench never shows sweep runs
+                 and vice versa. Each pane keeps its own buffer and its own scroll position. -->
+            <div id="bench-telemetry-card" class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+                <div class="flex flex-wrap justify-between items-center gap-2 mb-2">
+                    <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">Run Telemetry <span id="bench-telemetry-scope" class="text-gray-600 normal-case font-normal"></span></h3>
                     <span class="text-[10px] text-gray-600">GPU/VRAM sampled during the run · Prefill/Gen token lines appear only for llama-server runs · <button id="bench-omni-reset" class="underline hover:text-gray-400">reset lines</button> · <label class="cursor-pointer"><input type="checkbox" class="omni-smooth-cb accent-indigo-500"> smooth</label></span>
                 </div>
                 <div class="h-48"><canvas id="benchOmniChart"></canvas></div>
@@ -848,23 +968,32 @@
                  min-content sizing, pinning the card to available height while
                  its children spill past the bottom edge. Let it grow; the view
                  scrolls. -->
-            <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <div id="bench-output-card" class="bg-gray-900 border border-gray-800 rounded-xl p-4">
                 <div class="flex justify-between items-center mb-2">
-                    <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">Output</h3>
+                    <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">Output <span id="bench-output-scope" class="text-gray-600 normal-case font-normal"></span></h3>
                     <div class="flex gap-2">
-                        <button id="bench-restore-btn" class="px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-400 rounded text-[10px] transition-colors" title="Reload the full transcript from logs/bench-history.log (undo for Clear view).">Restore from log</button>
-                        <button id="bench-clear-btn" class="px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-400 rounded text-[10px] transition-colors" title="Clears THIS view only. The permanent transcript in logs/bench-history.log is untouched -- Restore from log brings everything back.">Clear view</button>
+                        <button id="bench-restore-btn" class="btn btn-sm" title="Reload the full transcript from logs/bench-history.log (undo for Clear view). Both panes are refilled; each still shows only its own runs.">Restore from log</button>
+                        <button id="bench-clear-btn" class="btn btn-sm" title="Clears the ACTIVE pane's view only. The permanent transcript in logs/bench-history.log is untouched -- Restore from log brings everything back.">Clear view</button>
                     </div>
                 </div>
                 <div id="bench-output" class="text-[11px] font-mono text-gray-300 overflow-x-auto overflow-y-auto max-h-[32rem] space-y-0.5"></div>
+                <div id="bench-output-server" class="hidden text-[11px] font-mono text-gray-300 overflow-x-auto overflow-y-auto max-h-[32rem] space-y-0.5"></div>
             </div>
+        </div>
+
+        <!-- Results tab (the Models tab until 2026-10-22; still #tab-models / #models-view inside): rendered by
+             ui/models/index.js (ES module, loaded at the bottom of the page). Lands on the all-models overview;
+             clicking a row opens the detail view. -->
+
+        <div id="models-view" class="hidden flex-1 flex-col overflow-y-auto p-3 md:p-6">
+            <div class="text-xs text-gray-500 py-8 text-center animate-pulse">Loading the Results page…</div>
         </div>
 
         <!-- Boot Animation Overlay: floats over whatever view is active
              (absolute within <main>, below the tab bar) instead of living at
              the top of the chat scrollback where it disappears once messages
              exist. -->
-        <div id="boot-overlay" class="hidden flex-col items-center justify-center text-center absolute inset-x-0 bottom-0 top-10 z-30 bg-gray-950/85 backdrop-blur-sm">
+        <div id="boot-overlay" class="hidden flex-col items-center justify-center text-center absolute inset-x-0 bottom-0 top-[52px] z-30 bg-gray-950/85 backdrop-blur-sm">
                 <!-- Animated rings -->
                 <div class="relative w-40 h-40 mb-8">
                     <!-- Outer spinning ring -->
@@ -896,71 +1025,76 @@
                 </div>
         </div>
 
-        <div id="chat-container" class="flex-1 overflow-y-auto p-6 space-y-6 scroll-smooth">
+        <div id="chat-container" class="flex-1 overflow-y-auto p-3 md:p-6 space-y-6 scroll-smooth">
             <div class="flex flex-col items-center justify-center h-full text-gray-600 text-sm" id="empty-state">
                 <svg class="w-12 h-12 mb-3 opacity-20" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-1-13h2v6h-2zm0 8h2v2h-2z"/></svg>
                 (no content to show)
             </div>
         </div>
 
-        <div id="chat-input-bar" class="bg-gray-900 border-t border-gray-800 p-4">
-            <div class="relative flex flex-col gap-2">
-                <div class="flex justify-between items-center px-1">
-                    <span class="text-xs text-gray-500">System Prompt:</span>
-                    <input type="text" id="system-prompt" class="flex-1 ml-2 bg-transparent border-b border-gray-700 focus:border-indigo-500 text-xs text-gray-300 px-1 py-0.5 focus:outline-none">
-                    <span class="text-xs text-gray-500 ml-3">Thinking:</span>
-                    <select id="chat-thinking" title="Sent per-request as chat_template_kwargs (needs --jinja; template must support it). Levels map to reasoning_effort for templates that read it (e.g. Qwen3.8)." class="ml-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-300 px-1 py-0.5">
-                        <option value="">template default</option>
-                        <option value="xhigh" selected>on (xhigh)</option>
-                        <option value="medium">on (medium)</option>
-                        <option value="low">on (low)</option>
-                        <option value="off">off</option>
-                    </select>
-                    <label class="flex items-center gap-1 text-xs text-gray-500 ml-3 cursor-pointer" title="Show or hide the thinking/reasoning blocks in the transcript (the model still thinks either way)">
-                        <input type="checkbox" id="chat-show-thinking" checked class="accent-indigo-500 rounded">
-                        show thinking
-                    </label>
-                    <label class="flex items-center gap-1 text-xs text-gray-500 ml-3 cursor-pointer" title="Expose a web_search tool to the model. When it calls one, the dashboard performs a keyless web search and feeds the results back; the model may call it up to 2 times per answer.">
-                        <input type="checkbox" id="chat-web-search" class="accent-indigo-500 rounded">
-                        allow web search
-                    </label>
-                    <input type="text" id="chat-kwargs" placeholder='extra kwargs JSON, e.g. {"thinking_level":"high"}' title="Merged into chat_template_kwargs per request. Model/template specific." class="w-56 ml-2 bg-transparent border-b border-gray-700 focus:border-indigo-500 text-[11px] font-mono text-gray-300 px-1 py-0.5 focus:outline-none">
-                </div>
-                <textarea id="user-prompt" rows="3" disabled class="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-gray-100 disabled:opacity-50 resize-none shadow-sm placeholder-gray-500" placeholder="Waiting for server..."></textarea>
-                <div class="flex justify-between items-center">
-                    <div class="flex items-center gap-2">
-                        <span id="input-token-count" class="text-xs text-gray-500">~0 tokens</span>
-                        <button type="button" id="attach-image-btn" class="text-gray-500 hover:text-gray-300 transition-colors p-1 rounded hover:bg-gray-800" title="Attach image(s), a video, or audio for multimodal models -- video/audio go in via llama.cpp's native input_video/input_audio support (server-side ffmpeg frame sampling + a built-in audio decoder), so this only works if the loaded model/mmproj actually supports it" disabled>
-                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+        <!-- Composer: one card holding the prompt and its per-request controls; the system
+             prompt, extra kwargs and the log/history actions sit in a quiet row beneath. -->
+        <div id="chat-input-bar" class="px-3 md:px-8 pt-2 pb-4 shrink-0">
+            <div class="max-w-4xl mx-auto relative flex flex-col gap-2">
+                <div class="composer">
+                    <textarea id="user-prompt" rows="3" disabled class="w-full bg-transparent border-0 px-4 pt-3.5 pb-1 text-[14px] leading-relaxed text-gray-100 disabled:opacity-50 resize-none" placeholder="Waiting for server..."></textarea>
+                    <div class="flex flex-wrap items-center gap-x-3 gap-y-2 px-3 pb-2.5 pt-1">
+                        <button type="button" id="attach-image-btn" class="icon-btn !w-8 !h-8" title="Attach image(s), a video, or audio for multimodal models -- video/audio go in via llama.cpp's native input_video/input_audio support (server-side ffmpeg frame sampling + a built-in audio decoder), so this only works if the loaded model/mmproj actually supports it" disabled>
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M18.375 12.739l-7.693 7.693a4.5 4.5 0 01-6.364-6.364l10.94-10.94A3 3 0 1119.5 7.372L8.552 18.32m.009-.01l-.01.01m5.699-9.941l-7.81 7.81a1.5 1.5 0 002.112 2.13"/></svg>
                         </button>
                         <input type="file" id="image-file-input" accept="image/*,video/*,audio/*" multiple class="hidden">
-                    </div>
-                    <div class="flex-1 flex justify-center">
-                        <span id="status-indicator" class="text-xs text-indigo-400 hidden animate-pulse">Generating...</span>
-                    </div>
-                    <div class="flex gap-2">
-                        <button id="abort-btn" class="hidden px-4 py-1.5 bg-red-900/30 text-red-400 rounded-lg text-sm font-medium hover:bg-red-900/50">Stop</button>
-                        <button id="submit-btn" disabled class="px-6 py-1.5 bg-indigo-600 disabled:bg-gray-700 text-white rounded-lg text-sm font-medium shadow-sm">Send</button>
+                        <label class="composer-chip" title="Sent per-request as chat_template_kwargs (needs --jinja; template must support it). Levels map to reasoning_effort for templates that read it (e.g. Qwen3.8).">
+                            <span>Thinking</span>
+                            <select id="chat-thinking" class="composer-select">
+                                <option value="">template default</option>
+                                <option value="xhigh" selected>on · xhigh</option>
+                                <option value="medium">on · medium</option>
+                                <option value="low">on · low</option>
+                                <option value="off">off</option>
+                            </select>
+                        </label>
+                        <label class="composer-chip cursor-pointer" title="Show or hide the thinking/reasoning blocks in the transcript (the model still thinks either way)">
+                            <input type="checkbox" id="chat-show-thinking" checked class="accent-indigo-500 rounded">
+                            show thinking
+                        </label>
+                        <label class="composer-chip" title="Web calls per answer (searches and page fetches together): 0 = off, N = up to N, -1 = unlimited. When on, the model gets two tools: web_search (keyless DuckDuckGo, top 5 results with title, url and a short snippet) and web_fetch (reads one page: its readable text as markdown, capped at 12,000 characters; public sites only, never your LAN). Past the limit the model gets a 'limit reached' result and its next turn runs without the tools, so it answers from what it has.">
+                            web calls
+                            <input type="number" id="chat-max-searches" min="-1" step="1" value="0" class="w-9 bg-transparent border-0 p-0 text-[11.5px] font-mono text-gray-200 text-center">
+                        </label>
+                        <span id="input-token-count" class="text-[11px] text-gray-500 font-mono">~0 tokens</span>
+                        <span id="status-indicator" class="text-xs text-indigo-300 hidden animate-pulse">Generating…</span>
+                        <div class="flex gap-2 ml-auto">
+                            <button id="abort-btn" class="hidden btn btn-danger">Stop</button>
+                            <button id="submit-btn" disabled class="btn btn-primary !px-4">
+                                Send
+                                <svg class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor"><path d="M3.105 2.289a.75.75 0 00-.826.95l1.414 4.925A1.5 1.5 0 005.135 9.25h6.115a.75.75 0 010 1.5H5.135a1.5 1.5 0 00-1.442 1.086l-1.414 4.926a.75.75 0 00.826.95 28.896 28.896 0 0015.293-7.154.75.75 0 000-1.115A28.897 28.897 0 003.105 2.289z"/></svg>
+                            </button>
+                        </div>
                     </div>
                 </div>
-                <div class="flex justify-between items-center mt-1 border-t border-gray-800 pt-2">
-                    <button id="btn-view-csv" class="px-3 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded text-xs transition-colors">View Logs (CSV)</button>
-                    <div class="flex items-center gap-3">
-                        <button id="btn-clear-history" class="px-3 py-1 bg-gray-800 hover:bg-gray-700 text-red-400 rounded text-xs transition-colors">Clear History</button>
+                <div class="flex flex-wrap items-center gap-x-4 gap-y-1.5 px-1 text-[11px]">
+                    <label class="flex items-center gap-2 flex-1 min-w-[14rem]">
+                        <span class="text-gray-500 whitespace-nowrap">System</span>
+                        <input type="text" id="system-prompt" placeholder="system prompt (optional)" class="flex-1 min-w-0 bg-transparent border-0 border-b border-gray-800 focus:border-indigo-500 text-[11.5px] text-gray-300 px-1 py-0.5 rounded-none">
+                    </label>
+                    <input type="text" id="chat-kwargs" placeholder='extra kwargs JSON, e.g. {"thinking_level":"high"}' title="Merged into chat_template_kwargs per request. Model/template specific." class="w-full md:w-64 bg-transparent border-0 border-b border-gray-800 focus:border-indigo-500 text-[11px] font-mono text-gray-300 px-1 py-0.5 rounded-none">
+                    <div class="flex items-center gap-1 ml-auto">
+                        <button id="btn-view-csv" class="btn btn-ghost btn-sm">View logs (CSV)</button>
+                        <button id="btn-clear-history" class="btn btn-ghost btn-sm !text-red-400/80 hover:!text-red-300">Clear history</button>
                     </div>
                 </div>
             </div>
         </div>
     </main>
 
-    <div id="sidebar-resizer" class="hidden md:block w-1 hover:w-2 bg-gray-800 hover:bg-indigo-500 cursor-col-resize transition-all shrink-0 z-20"></div>
-    <aside id="telemetry-sidebar" class="w-full bg-gray-900 border-l border-gray-800 p-6 flex flex-col gap-5 hidden md:flex overflow-y-auto shrink-0 relative" style="width: 24rem;">
-        <div class="flex justify-between items-center">
-            <h2 class="text-sm font-bold tracking-wider text-gray-400 uppercase">Telemetry</h2>
-            <select id="polling-rate" class="bg-gray-800 text-xs text-gray-400 border border-gray-700 rounded px-1 py-0.5 outline-none">
-                <option value="500">Fast (0.5s)</option>
-                <option value="1000" selected>Normal (1s)</option>
-                <option value="2000">Slow (2s)</option>
+    <div id="sidebar-resizer" class="hidden md:block resizer"></div>
+    <aside id="telemetry-sidebar" class="w-full bg-gray-900 border-l border-gray-800 p-4 flex flex-col gap-3 hidden md:flex overflow-y-auto shrink-0 relative" style="width: 24rem;">
+        <div class="flex justify-between items-center px-1 pt-1 pb-1">
+            <h2 class="text-[13px] font-semibold text-gray-100 flex items-center gap-2"><span class="relative flex h-2 w-2"><span class="absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-60 animate-ping"></span><span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-400"></span></span>Telemetry</h2>
+            <select id="polling-rate" class="field !w-auto !py-1 !text-[11px] !text-gray-400" title="Telemetry polling rate">
+                <option value="500">Fast · 0.5s</option>
+                <option value="1000" selected>Normal · 1s</option>
+                <option value="2000">Slow · 2s</option>
             </select>
         </div>
 
@@ -970,202 +1104,153 @@
             <span>Telemetry polling failed (<span id="telemetry-failure-count">0</span> consecutive errors). Backing off...</span>
         </div>
 
-        <!-- Prefill Speed Card -->
-        <div class="bg-gray-800/50 p-3 rounded-xl border border-gray-700/50 space-y-2">
-            <div class="flex justify-between items-center">
-                <span class="text-xs font-semibold text-blue-400">Prefill (Prompt) <span class="text-gray-500 cursor-help ml-1" title="Speed of processing the initial prompt (Tokens/s). Avg is token-weighted: total prompt tokens / total prefill time across requests since page load.">?</span></span>
-                <span id="metric-prefill-tokens" class="text-[10px] text-gray-400">0 tokens</span>
+        <!-- Throughput: prefill + generation side by side. Live is the big number; avg is
+             token-weighted across requests since page load. The *-lanes rows appear while 2+
+             local GPU lanes run (script.js renderLaneSum; Live is then their sum). -->
+        <div class="grid grid-cols-2 gap-3">
+            <div class="tile !p-3 min-w-0">
+                <div class="flex justify-between items-center gap-1">
+                    <span class="tile-label"><span class="tile-dot bg-sky-400"></span>Prefill <span class="text-gray-500 cursor-help help-tip" title="Speed of processing the initial prompt (Tokens/s). Avg is token-weighted: total prompt tokens / total prefill time across requests since page load.">?</span></span>
+                </div>
+                <div id="metric-prefill" class="tile-value mt-1.5 truncate">-</div>
+                <div id="metric-prefill-lanes" class="hidden text-[10px] font-mono text-gray-500 leading-snug"></div>
+                <div class="flex justify-between gap-1 mt-1.5 pt-1.5 border-t border-gray-800 tile-sub">
+                    <span>avg <span id="metric-prefill-avg" class="font-mono text-gray-300">0.0 t/s</span></span>
+                </div>
+                <div id="metric-prefill-tokens" class="tile-sub font-mono truncate">0 tokens</div>
             </div>
-            <div class="flex justify-between items-baseline">
-                <div class="text-xs text-gray-500">Live Speed:</div>
-                <div id="metric-prefill" class="text-sm font-mono text-blue-300">0.0 t/s</div>
-            </div>
-            <div class="flex justify-between items-baseline border-t border-gray-700/30 pt-1">
-                <div class="text-xs text-gray-500">Avg Speed:</div>
-                <div id="metric-prefill-avg" class="text-sm font-mono text-blue-400/80">0.0 t/s</div>
-            </div>
-        </div>
-
-        <!-- Generation Speed Card -->
-        <div class="bg-gray-800/50 p-3 rounded-xl border border-gray-700/50 space-y-2">
-            <div class="flex justify-between items-center">
-                <span class="text-xs font-semibold text-green-400">Generation <span class="text-gray-500 cursor-help ml-1" title="Speed of generating new tokens (Tokens/s). Avg is token-weighted: total generated tokens / total generation time across requests since page load.">?</span></span>
-                <span id="metric-gen-tokens" class="text-[10px] text-gray-400">0 tokens</span>
-            </div>
-            <div class="flex justify-between items-baseline">
-                <div class="text-xs text-gray-500">Live Speed:</div>
-                <div id="metric-gen" class="text-sm font-mono text-green-300">0.0 t/s</div>
-            </div>
-            <div class="flex justify-between items-baseline border-t border-gray-700/30 pt-1">
-                <div class="text-xs text-gray-500">Avg Speed:</div>
-                <div id="metric-gen-avg" class="text-sm font-mono text-green-400/80">0.0 t/s</div>
+            <div class="tile !p-3 min-w-0">
+                <div class="flex justify-between items-center gap-1">
+                    <span class="tile-label"><span class="tile-dot bg-emerald-400"></span>Generation <span class="text-gray-500 cursor-help help-tip" title="Speed of generating new tokens (Tokens/s). Avg is token-weighted: total generated tokens / total generation time across requests since page load.">?</span></span>
+                </div>
+                <div id="metric-gen" class="tile-value mt-1.5 truncate">0.0 t/s</div>
+                <div id="metric-gen-lanes" class="hidden text-[10px] font-mono text-gray-500 leading-snug"></div>
+                <div class="flex justify-between gap-1 mt-1.5 pt-1.5 border-t border-gray-800 tile-sub">
+                    <span>avg <span id="metric-gen-avg" class="font-mono text-gray-300">0.0 t/s</span></span>
+                </div>
+                <div id="metric-gen-tokens" class="tile-sub font-mono truncate">0 tokens</div>
             </div>
         </div>
 
-        <!-- Context Window Monitor Card -->
-        <div class="bg-gray-800/50 p-3 rounded-xl border border-gray-700/50 space-y-2">
+        <!-- Context window -->
+        <div class="tile">
             <div class="flex justify-between items-center">
-                <span class="text-xs font-semibold text-indigo-400">Context Window <span class="text-gray-500 cursor-help ml-1" title="Tokens used out of total context size">?</span></span>
-                <span id="context-tokens-text" class="text-[10px] text-gray-400 font-mono">0 / 32,768</span>
+                <span class="tile-label">Context window <span class="text-gray-500 cursor-help help-tip" title="Tokens used out of total context size">?</span></span>
+                <span id="context-tokens-text" class="text-[11px] text-gray-300 font-mono">0 / 32,768</span>
             </div>
-            <div class="w-full bg-gray-900 rounded-full h-2 flex overflow-hidden">
-                <div id="context-bar" class="bg-indigo-500 h-2 transition-all duration-300" style="width: 0%"></div>
+            <div class="w-full bg-gray-800 rounded-full h-1.5 flex overflow-hidden mt-2.5">
+                <div id="context-bar" class="bg-indigo-500 h-1.5 rounded-full transition-all duration-300" style="width: 0%"></div>
             </div>
-            <div class="flex justify-between text-[9px] text-gray-500">
+            <div class="flex justify-between mt-1.5 tile-sub">
                 <span id="context-percent-text">0.0% used</span>
                 <span id="context-limit-text">Limit: 32,768</span>
             </div>
         </div>
 
-        <!-- VRAM & RAM Progress -->
-        <div class="bg-gray-800/50 p-3 rounded-xl border border-gray-700/50 space-y-3">
-            <div>
-                <div class="flex justify-between text-xs mb-1">
-                    <span class="text-gray-300"><span class="node-a-label">Master</span> VRAM <span class="text-gray-500 cursor-help ml-1" title="Weights vs Context Cache vs Background">?</span></span>
-                    <span id="master-vram-text" class="text-gray-400 font-mono">-- MB</span>
-                </div>
-                <div class="w-full bg-gray-900 rounded-full h-2 flex overflow-hidden">
-                    <div id="master-vram-weights" class="bg-gray-500 h-2 transition-all" title="Model Weights" style="width: 0%"></div>
-                    <div id="master-vram-ctx" class="bg-indigo-500 h-2 transition-all" title="Context Cache" style="width: 0%"></div>
-                    <div id="master-vram-bg" class="bg-gray-700 h-2 transition-all" title="Background VRAM" style="width: 0%"></div>
-                </div>
-            </div>
-            
-            <div id="worker-vram-container" class="hidden">
-                <div class="flex justify-between text-xs mb-1">
-                    <span class="text-gray-300"><span class="node-b-label">Worker</span> VRAM</span>
-                    <span id="worker-vram-text" class="text-gray-400 font-mono">-- MB</span>
-                </div>
-                <div class="w-full bg-gray-900 rounded-full h-2 flex overflow-hidden">
-                    <div id="worker-vram-weights" class="bg-gray-500 h-2 transition-all" title="Model Weights" style="width: 0%"></div>
-                    <div id="worker-vram-ctx" class="bg-indigo-500 h-2 transition-all" title="Context Cache" style="width: 0%"></div>
-                    <div id="worker-vram-bg" class="bg-gray-700 h-2 transition-all" title="Background VRAM" style="width: 0%"></div>
-                </div>
-            </div>
-
-            <div class="pt-2 border-t border-gray-700/30">
-                <div class="flex justify-between text-xs mb-1">
-                    <span class="text-gray-300">Master RAM <span class="text-gray-500 cursor-help ml-1" title="System RAM specifically consumed by llama-server">?</span></span>
-                    <span id="master-ram-text" class="text-gray-400 font-mono">-- MB</span>
-                </div>
-                <div class="w-full bg-gray-900 rounded-full h-1.5 flex overflow-hidden">
-                    <div id="master-ram-bar" class="bg-purple-500 h-1.5 transition-all" title="Process RAM" style="width: 0%"></div>
-                    <div id="master-ram-bg" class="bg-gray-600 h-1.5 transition-all" title="Background System RAM" style="width: 0%"></div>
-                </div>
-            </div>
-            
-            <div id="worker-ram-container" class="hidden pt-1">
-                <div class="flex justify-between text-[10px] mb-1">
-                    <span class="text-gray-400"><span class="node-b-label">Worker</span> RAM</span>
-                    <span id="worker-ram-text" class="text-gray-500 font-mono">-- MB</span>
-                </div>
-                <div class="w-full bg-gray-900 rounded-full h-1 flex overflow-hidden">
-                    <div id="worker-ram-bar" class="bg-purple-500/70 h-1 transition-all" title="Process RAM" style="width: 0%"></div>
-                    <div id="worker-ram-bg" class="bg-gray-600 h-1 transition-all" title="Background System RAM" style="width: 0%"></div>
-                </div>
-            </div>
+        <!-- VRAM & RAM: one bar per GPU (the launch's devices in order while a model is up, else
+             every GPU telemetry reports) and one RAM bar per host. Rendered by pollTelemetry
+             (renderVramRamCard). -->
+        <div class="tile space-y-3">
+            <div class="tile-label">Memory</div>
+            <div id="gpu-vram-list" class="space-y-3"><div class="text-[10px] text-gray-600">waiting for telemetry…</div></div>
+            <div id="host-ram-list" class="pt-3 border-t border-gray-800 space-y-2"></div>
         </div>
 
-        <div class="bg-gray-800/50 p-3 rounded-xl border border-gray-700/50">
-            <div class="flex justify-between items-end mb-1">
-                <span class="text-xs text-gray-300">Net Throughput <span class="text-gray-500 cursor-help ml-1" title="Network bandwidth primarily used by RPC sync">?</span></span>
-                <span id="current-net" class="text-sm font-bold text-blue-400 font-mono">0.0<span class="text-[10px] text-gray-500 ml-1">MB/s</span></span>
-            </div>
-            <div class="h-20 w-full cursor-pointer" onclick="expandChart('netChart', 'Net Throughput (MB/s)')"><canvas id="netChart"></canvas></div>
-        </div>
-
-        <div class="bg-gray-800/50 p-3 rounded-xl border border-gray-700/50">
-            <div class="flex justify-between items-end mb-1">
-                <span class="text-xs text-gray-300">Tokens / Sec</span>
-                <span id="current-tps" class="text-sm font-bold text-green-400 font-mono">0.0</span>
-            </div>
-            <div class="h-20 w-full cursor-pointer" onclick="expandChart('tpsChart', 'Tokens/sec')"><canvas id="tpsChart"></canvas></div>
-        </div>
-        <div class="bg-gray-800/50 p-3 rounded-xl border border-gray-700/50" id="card-gpu-temp">
-            <div class="flex justify-between items-start mb-1">
-                <div class="flex flex-col items-start gap-1">
-                    <span class="text-xs text-gray-300">GPU Temp <span class="text-gray-500 cursor-help ml-1" title="Temperature of the Master and Worker GPUs">?</span></span>
-                    <div class="flex flex-col gap-1 text-[9px] text-gray-400">
-                        <span class="flex items-center gap-1"><div class="w-2 h-2 border border-yellow-400 shrink-0"></div> <span class="node-a-label">Master</span> <span class="master-gpu-model text-gray-500 truncate min-w-0"></span></span>
-                        <span class="flex items-center gap-1"><div class="w-2 h-2 border border-red-400 shrink-0"></div> <span class="node-b-label">Worker</span> <span class="worker-gpu-model text-gray-500 truncate min-w-0"></span></span>
-                    </div>
-                    <div id="throttle-badges" class="flex flex-wrap gap-1 mt-1 min-h-[1.25rem]"></div>
+        <div class="grid grid-cols-2 gap-3">
+            <div class="tile !p-3 min-w-0">
+                <div class="flex justify-between items-baseline gap-1">
+                    <span class="tile-label">Network <span class="text-gray-500 cursor-help help-tip" title="Network bandwidth primarily used by RPC sync">?</span></span>
+                    <span id="current-net" class="text-[13px] font-semibold text-sky-300 font-mono">0.0<span class="text-[10px] text-gray-500 ml-1">MB/s</span></span>
                 </div>
-                <span id="current-temp" class="text-xs font-bold font-mono mt-1"><span class="text-yellow-400">--°C</span> <span class="text-gray-500">/</span> <span class="text-red-400">--°C</span></span>
+                <div class="h-14 w-full mt-2 cursor-zoom-in" onclick="expandChart('netChart', 'Net Throughput (MB/s)')"><canvas id="netChart"></canvas></div>
             </div>
-            <div class="h-24 w-full mt-2 cursor-pointer" onclick="expandChart('tempChart', 'GPU Temperature (°C)')"><canvas id="tempChart"></canvas></div>
-        </div>
-
-        <div class="bg-gray-800/50 p-3 rounded-xl border border-gray-700/50" id="card-gpu-pwr">
-            <div class="flex justify-between items-start mb-1">
-                <div class="flex flex-col items-start gap-1">
-                    <span class="text-xs text-gray-300">GPU Power <span class="text-gray-500 cursor-help ml-1" title="Power Draw of the Master and Worker GPUs in Watts">?</span></span>
-                    <div class="flex flex-col gap-1 text-[9px] text-gray-400">
-                        <span class="flex items-center gap-1"><div class="w-2 h-2 border border-yellow-400 shrink-0"></div> <span class="node-a-label">Master</span> <span class="master-gpu-model text-gray-500 truncate min-w-0"></span></span>
-                        <span class="flex items-center gap-1"><div class="w-2 h-2 border border-red-400 shrink-0"></div> <span class="node-b-label">Worker</span> <span class="worker-gpu-model text-gray-500 truncate min-w-0"></span></span>
-                    </div>
-                    <div id="throttle-badges-pwr" class="flex flex-wrap gap-1 mt-1 min-h-[1.25rem]"></div>
+            <div class="tile !p-3 min-w-0">
+                <div class="flex justify-between items-baseline gap-1">
+                    <span class="tile-label">Tokens/s</span>
+                    <span id="current-tps" class="text-[13px] font-semibold text-emerald-300 font-mono">0.0</span>
                 </div>
-                <span id="current-pwr" class="text-xs font-bold font-mono mt-1"><span class="text-yellow-400">--W</span> <span class="text-gray-500">/</span> <span class="text-red-400">--W</span></span>
+                <div class="h-14 w-full mt-2 cursor-zoom-in" onclick="expandChart('tpsChart', 'Tokens/sec')"><canvas id="tpsChart"></canvas></div>
             </div>
-            <div class="h-24 w-full mt-2 cursor-pointer" onclick="expandChart('pwrChart', 'GPU Power (W)')"><canvas id="pwrChart"></canvas></div>
         </div>
-        
-        <div class="bg-gray-800/50 p-3 rounded-xl border border-gray-700/50" id="card-gpu-util">
-            <div class="flex justify-between items-start mb-1">
-                <div class="flex flex-col items-start gap-1">
-                    <span class="text-xs text-gray-300">GPU Util <span class="text-gray-500 cursor-help ml-1" title="GPU Core Utilization">?</span></span>
-                    <div class="flex flex-col gap-1 text-[9px] text-gray-400">
-                        <span class="flex items-center gap-1"><div class="w-2 h-2 border border-yellow-400 shrink-0"></div> <span class="node-a-label">Master</span> <span class="master-gpu-model text-gray-500 truncate min-w-0"></span></span>
-                        <span class="flex items-center gap-1"><div class="w-2 h-2 border border-red-400 shrink-0"></div> <span class="node-b-label">Worker</span> <span class="worker-gpu-model text-gray-500 truncate min-w-0"></span></span>
-                    </div>
-                </div>
-                <span id="current-gpu-util" class="text-xs font-bold font-mono mt-1"><span class="text-yellow-400">--%</span> <span class="text-gray-500">/</span> <span class="text-red-400">--%</span></span>
+        <div class="tile" id="card-gpu-temp">
+            <div class="flex justify-between items-start gap-2">
+                <span class="tile-label">GPU temp <span class="text-gray-500 cursor-help help-tip" title="Temperature of the Master and Worker GPUs">?</span></span>
+                <span id="current-temp" class="text-xs font-semibold font-mono"><span class="text-yellow-400">--°C</span> <span class="text-gray-600">/</span> <span class="text-red-400">--°C</span></span>
             </div>
-            <div class="h-24 w-full mt-2 cursor-pointer" onclick="expandChart('gpuUtilChart', 'GPU Utilization (%)')"><canvas id="gpuUtilChart"></canvas></div>
+                <div class="tile-legend" data-legend="gpu"></div>
+                <div id="throttle-badges" class="flex flex-wrap gap-1 empty:hidden mt-1.5"></div>
+            <div class="h-20 w-full mt-2 cursor-zoom-in" onclick="expandChart('tempChart', 'GPU Temperature (°C)')"><canvas id="tempChart"></canvas></div>
         </div>
-
-        <div class="bg-gray-800/50 p-3 rounded-xl border border-gray-700/50" id="card-cpu-util">
-            <div class="flex justify-between items-start mb-1">
-                <div class="flex flex-col items-start gap-1">
-                    <span class="text-xs text-gray-300">CPU Util <span class="text-gray-500 cursor-help ml-1" title="CPU Utilization of Master and Worker">?</span></span>
-                    <div class="flex flex-col gap-1 text-[9px] text-gray-400">
-                        <span class="flex items-center gap-1"><div class="w-2 h-2 border border-yellow-400 shrink-0"></div> <span class="node-a-label">Master</span> <span class="master-cpu-model text-gray-500 truncate min-w-0"></span></span>
-                        <span class="node-b-cpu-row flex items-center gap-1"><div class="w-2 h-2 border border-red-400 shrink-0"></div> <span class="node-b-label">Worker</span> <span class="worker-cpu-model text-gray-500 truncate min-w-0"></span></span>
-                    </div>
-                </div>
-                <span id="current-cpu" class="text-xs font-bold font-mono mt-1"><span class="text-yellow-400">--%</span> <span class="text-gray-500">/</span> <span class="text-red-400">--%</span></span>
+        <div class="tile" id="card-gpu-pwr">
+            <div class="flex justify-between items-start gap-2">
+                <span class="tile-label">GPU power <span class="text-gray-500 cursor-help help-tip" title="Power Draw of the Master and Worker GPUs in Watts">?</span></span>
+                <span id="current-pwr" class="text-xs font-semibold font-mono"><span class="text-yellow-400">--W</span> <span class="text-gray-600">/</span> <span class="text-red-400">--W</span></span>
             </div>
-            <div class="h-24 w-full mt-2 cursor-pointer" onclick="expandChart('cpuChart', 'CPU Utilization (%)')"><canvas id="cpuChart"></canvas></div>
+                <div class="tile-legend" data-legend="gpu"></div>
+                <div id="throttle-badges-pwr" class="flex flex-wrap gap-1 empty:hidden mt-1.5"></div>
+            <div class="h-20 w-full mt-2 cursor-zoom-in" onclick="expandChart('pwrChart', 'GPU Power (W)')"><canvas id="pwrChart"></canvas></div>
         </div>
-        
-        <div class="bg-gray-800/50 p-3 rounded-xl border border-gray-700/50" id="card-cpu-temp">
-            <div class="flex justify-between items-start mb-1">
-                <div class="flex flex-col items-start gap-1">
-                    <span class="text-xs text-gray-300">CPU Temp <span class="text-gray-500 cursor-help ml-1" title="CPU Temperature">?</span></span>
-                    <div class="flex flex-col gap-1 text-[9px] text-gray-400">
-                        <span class="flex items-center gap-1"><div class="w-2 h-2 border border-yellow-400 shrink-0"></div> <span class="node-a-label">Master</span> <span class="master-cpu-model text-gray-500 truncate min-w-0"></span></span>
-                        <span class="node-b-cpu-row flex items-center gap-1"><div class="w-2 h-2 border border-red-400 shrink-0"></div> <span class="node-b-label">Worker</span> <span class="worker-cpu-model text-gray-500 truncate min-w-0"></span></span>
-                    </div>
-                </div>
-                <span id="current-cpu-temp" class="text-xs font-bold font-mono mt-1"><span class="text-yellow-400">--°C</span> <span class="text-gray-500">/</span> <span class="text-red-400">--°C</span></span>
+        <div class="tile" id="card-gpu-util">
+            <div class="flex justify-between items-start gap-2">
+                <span class="tile-label">GPU utilization <span class="text-gray-500 cursor-help help-tip" title="GPU Core Utilization">?</span></span>
+                <span id="current-gpu-util" class="text-xs font-semibold font-mono"><span class="text-yellow-400">--%</span> <span class="text-gray-600">/</span> <span class="text-red-400">--%</span></span>
             </div>
-            <div class="h-24 w-full mt-2 cursor-pointer" onclick="expandChart('cpuTempChart', 'CPU Temperature (°C)')"><canvas id="cpuTempChart"></canvas></div>
+                <div class="tile-legend" data-legend="gpu"></div>
+            <div class="h-20 w-full mt-2 cursor-zoom-in" onclick="expandChart('gpuUtilChart', 'GPU Utilization (%)')"><canvas id="gpuUtilChart"></canvas></div>
+        </div>
+        <div class="tile" id="card-cpu-util">
+            <div class="flex justify-between items-start gap-2">
+                <span class="tile-label">CPU utilization <span class="text-gray-500 cursor-help help-tip" title="CPU Utilization of Master and Worker">?</span></span>
+                <span id="current-cpu" class="text-xs font-semibold font-mono"><span class="text-yellow-400">--%</span> <span class="text-gray-600">/</span> <span class="text-red-400">--%</span></span>
+            </div>
+                <div class="tile-legend" data-legend="host"></div>
+            <div class="h-20 w-full mt-2 cursor-zoom-in" onclick="expandChart('cpuChart', 'CPU Utilization (%)')"><canvas id="cpuChart"></canvas></div>
+        </div>
+        <div class="tile" id="card-cpu-temp">
+            <div class="flex justify-between items-start gap-2">
+                <span class="tile-label">CPU temp <span class="text-gray-500 cursor-help help-tip" title="CPU Temperature">?</span></span>
+                <span id="current-cpu-temp" class="text-xs font-semibold font-mono"><span class="text-yellow-400">--°C</span> <span class="text-gray-600">/</span> <span class="text-red-400">--°C</span></span>
+            </div>
+                <div class="tile-legend" data-legend="host"></div>
+            <div class="h-20 w-full mt-2 cursor-zoom-in" onclick="expandChart('cpuTempChart', 'CPU Temperature (°C)')"><canvas id="cpuTempChart"></canvas></div>
         </div>
     </aside>
 
-    <div id="expand-modal" class="fixed inset-0 bg-black/95 hidden flex-col z-50 p-6">
-        <div class="flex justify-between items-center mb-4">
+    <div id="drawer-backdrop" class="drawer-backdrop"></div>
+
+    <div id="expand-modal" class="fixed inset-0 bg-gray-950/90 backdrop-blur-md hidden flex-col z-50 p-3 md:p-8">
+        <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
             <h2 id="expand-modal-title" class="text-lg font-bold text-white">Expanded Chart</h2>
             <label class="text-xs text-gray-400 cursor-pointer flex items-center gap-1"><input type="checkbox" class="omni-smooth-cb accent-indigo-500"> smooth (EMA)</label>
-            <button onclick="closeExpandModal()" class="text-gray-400 hover:text-white">✕ Close</button>
+            <button onclick="closeExpandModal()" class="btn btn-sm">✕ Close</button>
         </div>
         <!-- Height capped at a third of width (aspect-ratio 3/1) -- wide and
              shallow reads better for time series. max-height keeps it from
              overflowing on a narrow/tall window. -->
         <div class="flex-1 flex flex-col items-center overflow-y-auto">
-        <div class="bg-gray-900 border border-gray-700 rounded-xl relative w-full p-4" style="aspect-ratio: 3 / 1; max-height: 60vh;">
+        <div class="expand-chart-box bg-gray-900 border border-gray-800 rounded-2xl relative w-full p-2 md:p-4" style="aspect-ratio: 3 / 1; max-height: 60vh;">
             <canvas id="expandedChartCanvas"></canvas>
+        </div>
+        <!-- Sidebar telemetry charts, full screen (2026-10-01): a pannable/zoomable TIME WINDOW over everything the
+             server has recorded since it started (GET /api/telemetry/range, lib/telemetryhistory.js) -- the
+             History chart's model (ui/shared/histwindow.js). script.js openTelemetryExpand owns it. -->
+        <div id="telem-window-controls" class="hidden w-full mt-2 px-1 space-y-2">
+            <div id="telem-scroll" class="select-none" style="visibility:hidden">
+                <div id="telem-scroll-track" class="relative h-3 rounded-full" style="touch-action:none;cursor:pointer;background:rgba(37,40,50,0.9);border:1px solid rgba(54,58,71,0.7)">
+                    <div id="telem-scroll-thumb" class="absolute top-0 bottom-0 rounded-full" style="left:0;width:24px;touch-action:none;cursor:grab;background:rgba(140,145,253,0.6)"></div>
+                </div>
+            </div>
+            <div class="flex flex-wrap items-center gap-2 text-[11px] text-gray-500">
+                <span class="chip-group">
+                    <button type="button" class="chip" data-telem-span="600000">10 min</button>
+                    <button type="button" class="chip" data-telem-span="3600000">1 h</button>
+                    <button type="button" class="chip" data-telem-span="21600000">6 h</button>
+                    <button type="button" class="chip" data-telem-span="all">all</button>
+                </span>
+                <button type="button" id="telem-live" class="btn btn-sm" title="Follow the newest readings">● Live</button>
+                <span id="telem-status" class="font-mono text-gray-400"></span>
+                <span class="ml-auto hidden md:inline">wheel/pinch zoom · drag, sideways or shift+wheel pan · double-click: last 10 min, live</span>
+            </div>
         </div>
         <!-- Details panel: populated when a Monitor/History row is clicked,
              showing the full launch config + all row data for that request. -->
@@ -1183,7 +1268,7 @@
             <button id="expand-zoom-out" type="button" class="px-2 py-1 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded text-gray-300" title="Zoom out (show more time, less detail)">−</button>
             <button id="expand-zoom-in" type="button" class="px-2 py-1 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded text-gray-300" title="Zoom in (show less time, more detail)">+</button>
             <input id="expand-scroll-slider" type="range" min="0" max="0" value="0" class="flex-1 accent-indigo-500 cursor-pointer">
-            <span id="expand-time-status" class="font-mono text-[11px] text-gray-500 whitespace-nowrap w-40 text-right">Live · 90 samples</span>
+            <span id="expand-time-status" class="font-mono text-[11px] text-gray-500 whitespace-nowrap w-28 md:w-40 text-right">Live · 90 samples</span>
         </div>
     </div>
 
@@ -1191,10 +1276,10 @@
          `llama-server --help` (see server4.js GET /api/flags). Click a flag
          to insert it into the raw launch command box at the cursor -- the box
          stays the single source of truth, this is purely a discoverability aid. -->
-    <div id="flag-reference-modal" class="fixed inset-0 bg-black/80 hidden flex-col z-50 p-6">
+    <div id="flag-reference-modal" class="fixed inset-0 bg-gray-950/90 backdrop-blur-md hidden flex-col z-50 p-3 md:p-8">
         <div class="flex justify-between items-center mb-3">
             <h2 class="text-lg font-bold text-white">llama-server Flag Reference</h2>
-            <button id="btn-flag-reference-close" class="text-gray-400 hover:text-white">✕ Close</button>
+            <button id="btn-flag-reference-close" class="btn btn-sm">✕ Close</button>
         </div>
         <input type="text" id="flag-reference-search" placeholder="Search flags and descriptions..." autocomplete="off"
             class="w-full max-w-2xl bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-sm text-gray-200 mb-3">
@@ -1202,10 +1287,10 @@
         <div id="flag-reference-list" class="flex-1 overflow-y-auto max-w-3xl space-y-1 pr-2"></div>
     </div>
 
-    <div id="csv-modal" class="fixed inset-0 bg-black/90 hidden flex-col z-50 p-6">
+    <div id="csv-modal" class="fixed inset-0 bg-gray-950/90 backdrop-blur-md hidden flex-col z-50 p-3 md:p-8">
         <div class="flex justify-between items-center mb-4">
             <h2 class="text-lg font-bold text-white">Benchmarks CSV Logs</h2>
-            <button id="close-csv-btn" class="text-gray-400 hover:text-white">✕ Close</button>
+            <button id="close-csv-btn" class="btn btn-sm">✕ Close</button>
         </div>
         <div class="flex-1 bg-gray-900 border border-gray-700 rounded-xl overflow-hidden flex flex-col">
             <div class="overflow-auto flex-1 p-0">
@@ -1217,15 +1302,15 @@
         </div>
     </div>
 
-    <div id="hf-modal" class="fixed inset-0 bg-black/80 hidden items-center justify-center z-50 p-4">
-        <div class="bg-gray-900 border border-gray-700 rounded-xl w-full max-w-2xl max-h-[80vh] flex flex-col">
+    <div id="hf-modal" class="fixed inset-0 bg-gray-950/70 backdrop-blur-sm hidden items-center justify-center z-50 p-4">
+        <div class="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col">
             <div class="p-4 border-b border-gray-800 flex justify-between items-center">
                 <h2 class="font-bold text-white">Find GGUF Models</h2>
                 <button onclick="closeHFModal()" class="text-gray-500 hover:text-white">✕</button>
             </div>
             <div class="p-4 border-b border-gray-800 flex gap-2">
                 <input type="text" id="hf-search-input" placeholder="Search (e.g., Llama-3-8B-GGUF)" class="flex-1 bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-sm text-white">
-                <button onclick="searchHF()" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-md text-sm">Search</button>
+                <button onclick="searchHF()" class="btn btn-primary">Search</button>
             </div>
             <div id="hf-results" class="p-4 overflow-y-auto flex-1 space-y-3">
                 <div class="text-sm text-gray-500 text-center">Enter a search term above.</div>
@@ -1233,7 +1318,54 @@
         </div>
     </div>
 
+    <!-- Kill confirmation: "stop after the current turn" vs "kill now", plus
+         cancel. Same shell/classes as #hf-modal above -- no new dependency.
+         Wired in script.js (openKillDialog / requestStopAfterTurn /
+         killServerNow). -->
+    <div id="kill-modal" class="fixed inset-0 bg-gray-950/70 backdrop-blur-sm hidden items-center justify-center z-50 p-4">
+        <div class="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl w-full max-w-md flex flex-col">
+            <div class="p-4 border-b border-gray-800 flex justify-between items-center">
+                <h2 class="font-bold text-white">Stop llama-server?</h2>
+                <button type="button" onclick="closeKillDialog()" class="text-gray-500 hover:text-white">&#10005;</button>
+            </div>
+            <div class="p-4 space-y-2">
+                <div id="kill-modal-status" class="text-xs text-gray-400 mb-1"></div>
+                <button type="button" id="kill-after-turn" class="w-full text-left px-3 py-2 rounded-md bg-gray-800 hover:bg-gray-700 border border-gray-700 transition-colors">
+                    <div class="text-sm font-semibold text-white">Stop after the current turn</div>
+                    <div id="kill-after-turn-sub" class="text-[11px] text-gray-400">Let the in-flight request finish, then stop the server.</div>
+                </button>
+                <button type="button" id="kill-now" class="w-full text-left px-3 py-2 rounded-md bg-red-900/40 hover:bg-red-800 border border-red-800 transition-colors">
+                    <div class="text-sm font-semibold text-red-300">Kill now</div>
+                    <div class="text-[11px] text-red-400/80">Immediate. The in-flight request is lost.</div>
+                </button>
+                <button type="button" id="kill-cancel-pending" class="hidden w-full text-left px-3 py-2 rounded-md bg-gray-800 hover:bg-gray-700 border border-gray-700 transition-colors">
+                    <div class="text-sm font-semibold text-white">Cancel the pending stop</div>
+                    <div class="text-[11px] text-gray-400">Keep the server running and stop waiting.</div>
+                </button>
+            </div>
+            <div class="p-4 border-t border-gray-800 flex justify-end">
+                <button type="button" onclick="closeKillDialog()" class="btn btn-sm">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- model display names (window.ModelName: split suffix dropped, model/mmproj/draft kinds), shared with the server and dash-cli -->
+    <script src="./ui/shared/modelname.js"></script>
+    <script src="./ui/shared/ctxlabel.js"></script> <!-- a context size in words: the one rule (2026-10-25); before script.js and sidegroups.js, which read globalThis.CtxLabel -->
+    <script src="./ui/shared/relcolor.js"></script> <!-- request tables' relative colour ramp (2026-10-01, Kyle); read by script.js -->
+    <script src="./ui/shared/histwindow.js"></script> <!-- History chart window math (2026-10-01, Kyle); before script.js, which reads globalThis.HistWindow -->
+    <script src="./ui/shared/route.js"></script> <!-- routes + the page's one router (2026-10-06, Kyle); before script.js, which reads globalThis.Route / Nav -->
+    <script src="./ui/topology/view.js"></script> <!-- this machine's hardware in words: card labels, profile fit, split modes (2026-10-12); before script.js, which reads globalThis.TopoView -->
+    <script src="./ui/shared/poll.js"></script> <!-- every poll's rules: nothing while the page is hidden, never two at once (2026-10-22); before script.js, which reads globalThis.Poll -->
     <script src="./script.js"></script>
+    <script src="./ui/shared/sidegroups.js"></script> <!-- launch-sidebar group state + header summaries -->
+    <!-- the live chat's reducer (window.LiveChatModel), shared with lib/livechat.js; ui/benchmarks/live.js mounts the chat -->
+    <script src="./ui/livechat/model.js"></script>
+    <script type="module" src="./ui/benchmarks/index.js"></script>
+    <script type="module" src="./ui/models/index.js"></script>
+    <script type="module" src="./ui/leaderboards/index.js"></script>
+    <script type="module" src="./ui/modelpicker/index.js"></script>
+    <script type="module" src="./ui/profilepicker/index.js"></script>
 </body>
 </html>
 

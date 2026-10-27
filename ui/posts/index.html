@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>posts · ai lab editor</title>
+<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="stylesheet" href="/vendor/fonts.css">
+<link rel="stylesheet" href="/vendor/tailwind.css">
+<script src="/vendor/marked.min.js"></script>
+</head>
+<!-- The ai lab post editor (2026-10-02): part of the dashboard, behind its password gate. Saves commit to the private
+     posts repo through the GitHub API (lib/postsrepo.js); the public site shows only posts with draft: false.
+     "Home page" (2026-10-07) is the one entry that is not a post: the copy at the top of the public home page
+     (pages/home.md in the same repo), edited in the same form and saved the same way. -->
+<body class="bg-gray-950 text-gray-100 font-sans h-screen flex flex-col overflow-hidden">
+  <div class="app-topbar">
+    <a href="/" class="icon-btn" title="Back to the dashboard">←</a>
+    <span class="text-[14px] font-semibold text-white">Posts</span>
+    <span class="text-[12px] text-gray-500" id="pe-repo"></span>
+    <span class="ml-auto text-[12px] text-gray-500" id="pe-status"></span>
+  </div>
+  <div class="flex-1 flex min-h-0">
+    <aside class="w-72 shrink-0 border-r border-gray-800 bg-gray-900 flex flex-col min-h-0">
+      <div class="p-3 border-b border-gray-800"><button id="pe-new" class="btn btn-primary w-full">＋ New post</button></div>
+      <div id="pe-pages" class="p-2 border-b border-gray-800" hidden></div>
+      <div id="pe-list" class="flex-1 overflow-y-auto p-2 space-y-1"></div>
+    </aside>
+    <main class="flex-1 min-w-0 flex flex-col min-h-0">
+      <div class="p-4 border-b border-gray-800 grid grid-cols-1 md:grid-cols-6 gap-3 items-end">
+        <label class="md:col-span-3" id="pe-title-wrap"><span class="field-label" id="pe-title-label">Title</span><input id="pe-title" class="field" placeholder="Post title"></label>
+        <label class="md:col-span-2" id="pe-slug-wrap"><span class="field-label">Slug (URL)</span><input id="pe-slug" class="field font-mono" placeholder="from the title"></label>
+        <label id="pe-date-wrap"><span class="field-label">Date</span><input id="pe-date" type="date" class="field font-mono"></label>
+        <label class="md:col-span-4" id="pe-summary-wrap"><span class="field-label" id="pe-summary-label">Summary (list + link previews)</span><input id="pe-summary" class="field" placeholder="One line"></label>
+        <label class="md:col-span-2" id="pe-tags-wrap"><span class="field-label">Tags (comma separated)</span><input id="pe-tags" class="field" placeholder="speed, quantization"></label>
+      </div>
+      <div class="flex-1 grid grid-cols-1 lg:grid-cols-2 min-h-0">
+        <textarea id="pe-body" spellcheck="true" class="min-h-0 h-full resize-none bg-gray-950 border-0 border-r border-gray-800 p-4 font-mono text-[13px] leading-relaxed text-gray-200 focus:outline-none" placeholder="Markdown…"></textarea>
+        <iframe id="pe-preview" title="preview" class="min-h-0 h-full w-full bg-gray-950 hidden lg:block"></iframe>
+      </div>
+      <div class="p-3 border-t border-gray-800 flex flex-wrap items-center gap-2">
+        <span id="pe-state" class="tag tag-amber">draft</span>
+        <span class="text-[12px] text-gray-500" id="pe-note">Drafts never appear on the public site.</span>
+        <div class="ml-auto flex gap-2">
+          <button id="pe-save" class="btn">Save draft</button>
+          <button id="pe-publish" class="btn btn-go">Publish</button>
+        </div>
+      </div>
+    </main>
+  </div>
+  <script type="module" src="/ui/posts/editor.js"></script>
+</body>
+</html>

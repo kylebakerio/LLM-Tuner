@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fmt, toGB, pad, pctColor, throttleBadges, fmtUptime, portFromCommand } from '../src/format.js';
+import { fmt, toGB, pad, pctColor, throttleBadges, fmtUptime, portFromCommand, clipLabel, thermalParts, thermalLine, telemetryPanels } from '../src/format.js';
 
 test('fmt', () => {
   assert.equal(fmt(null), '--');
@@ -60,4 +60,62 @@ test('portFromCommand', () => {
   assert.equal(portFromCommand('/x/llama-server --port 9999'), 9999);
   assert.equal(portFromCommand('no port here'), 8080);
   assert.equal(portFromCommand(null, 1234), 1234);
+});
+
+test('clipLabel: a cut card label keeps the ordinal that tells identical cards apart', () => {
+  assert.equal(clipLabel('RX 7900 XTX #2', 14), 'RX 7900 XTX #2', 'fits: untouched');
+  // the plain cut both cards used to get: "RX 7900 XT…" twice
+  assert.equal(clipLabel('RX 7900 XTX #1', 11), 'RX 7900… #1');
+  assert.equal(clipLabel('RX 7900 XTX #2', 11), 'RX 7900… #2');
+  assert.notEqual(clipLabel('RX 7900 XTX #1', 8), clipLabel('RX 7900 XTX #2', 8), 'still two different cards at 8 columns');
+  assert.equal(clipLabel('RX 7900 XTX #12', 9), 'RX 7… #12', 'a two-digit ordinal is kept whole');
+  // what follows the ordinal gives way before the name does
+  assert.equal(clipLabel('RX 7900 XTX #2 · ROCm1 50%', 20), 'RX 7900 XTX #2 · RO…');
+  assert.equal(clipLabel('RX 7900 XTX #2 · ROCm1 50%', 15), 'RX 7900 XTX #2…');
+  assert.equal(clipLabel('RX 7900 XTX #2 alone', 12), 'RX 7900… #2');
+  // no ordinal (a single card, a reason, a model name): the usual cut
+  assert.equal(clipLabel('RTX 4090 Laptop', 10), 'RTX 4090 …');
+  assert.equal(clipLabel('Needs RTX 3060.', 9), 'Needs RT…');
+  // never longer than asked, down to nothing
+  for (const w of [0, 1, 2, 3, 4, 5, 6, 7, 30]) assert.ok(clipLabel('RX 7900 XTX #2 alone', w).length <= w, `width ${w}`);
+  assert.equal(clipLabel(null, 5), '');
+});
+
+test('thermalLine: temperature, then memory temperature and fan where the card has the sensor', () => {
+  // AMD (monitor.py reads the card's own hwmon dir): all three
+  const amd = { gpu_temp: 96.2, mem_temp: 102, fan_rpm: 2950, fan_pct: 86 };
+  assert.equal(thermalLine(amd), '96°C · mem 102°C · fan 2950 rpm (86%)');
+  // NVIDIA (nvidia-smi): fan percent only, no memory temperature -- nothing in their place
+  const nv = { gpu_temp: 82, mem_temp: null, fan_rpm: null, fan_pct: 45 };
+  assert.equal(thermalLine(nv), '82°C · fan 45%');
+  assert.deepEqual(thermalParts(nv).map((p) => p.key), ['temp', 'fan']);
+  // a card with neither, and telemetry from a server that sends neither field
+  assert.equal(thermalLine({ gpu_temp: 50, mem_temp: null, fan_rpm: null, fan_pct: null }), '50°C');
+  assert.equal(thermalLine({ gpu_temp: 50 }), '50°C');
+  assert.doesNotMatch(thermalLine({ gpu_temp: 50 }), /--|fan|mem/);
+  // a stopped fan is a reading, not a missing sensor
+  assert.equal(thermalLine({ gpu_temp: 40, fan_rpm: 0, fan_pct: 0 }), '40°C · fan 0 rpm (0%)');
+  // no reading at all
+  assert.equal(thermalLine(null), '');
+  assert.equal(thermalLine({}), '');
+  // narrow panels: whole parts go, last first (the duty, the fan, the memory temperature); never a cut-off number
+  assert.equal(thermalLine(amd, 31), '96°C · mem 102°C · fan 2950 rpm');
+  assert.equal(thermalLine(amd, 30), '96°C · mem 102°C');
+  assert.equal(thermalLine(amd, 15), '96°C');
+  for (const w of [4, 12, 16, 22, 31, 37, 60]) assert.ok(thermalLine(amd, w).length <= w, `width ${w}`);
+});
+
+test('telemetryPanels: fan and memory temperature reach the panel from either telemetry shape', () => {
+  const xtx = { host: 'local', index: 0, pci: '0b:00.0', vendor: 'amd', gpu_name: 'AMD Radeon RX 7900 XTX', gpu_util: 90, vram_used: 20000, vram_total: 24560,
+    process_vram: 0, gpu_pwr: 320, gpu_temp: 96, mem_temp: 102, fan_rpm: 2950, fan_pct: 86, throttle_reasons: [], error: false };
+  // no launch: the panel's gpu IS the stats.gpus entry
+  const idle = telemetryPanels({ hosts: { local: {} }, gpus: [xtx], devices: [] });
+  assert.equal(thermalLine(idle[0].gpu), '96°C · mem 102°C · fan 2950 rpm (86%)');
+  // a launch device whose reading has no matching gpus entry: built from the per-device record
+  const rec = { id: 'ROCm0', name: 'Some Other Name', host: 'local', util: 90, pwr: 320, temp: 96, mem_temp: 102, fan_rpm: 2950, fan_pct: 86, vram_used: 20000, vram_total: 24560 };
+  const launch = telemetryPanels({ hosts: { local: {} }, gpus: [], devices: [rec] });
+  assert.equal(thermalLine(launch[0].gpu), '96°C · mem 102°C · fan 2950 rpm (86%)');
+  // an older server's record carries neither: just the temperature
+  const old = telemetryPanels({ hosts: { local: {} }, gpus: [], devices: [{ id: 'CUDA0', name: 'X', host: 'local', util: 5, pwr: 30, temp: 44, vram_used: 1, vram_total: 2 }] });
+  assert.equal(thermalLine(old[0].gpu), '44°C');
 });

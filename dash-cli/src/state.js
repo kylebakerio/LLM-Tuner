@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from 'react';
-import { fmtTime, gpuOnline } from './format.js';
+import { fmtTime, gpuOnline, telemetryPanels, netBytesOf } from './format.js';
+import { normalizeTopology } from './topology.js';
 
 // Minimal external store (subscribe/getState/setState) so the TUI can render
 // from data pushed by the SSE stream + telemetry poller without prop-drilling.
@@ -20,6 +21,9 @@ export function createStore(initial) {
 }
 
 const BUFFER_SIZE = 240; // ~2 min at a 2s effective cadence
+// Per-GPU histories kept at once: a launch with a different device list
+// leaves the previous keys behind, pruned past this many.
+const GPU_BUFFER_KEYS_MAX = 16;
 const COMPLETION_CAP = 50;
 const LOG_CAP = 200;
 
@@ -49,13 +53,25 @@ export function createAppStore() {
       loadStartTime: 0,
       finalLoadTime: 0,
       error: '',
+      // Unmanaged llama-server on :8080 the dashboard is polling via /slots
+      // ({ port, model, busy, ... } -- see pollExternalSlots in server4.js),
+      // else null. The server's state stays 'stopped' while it is set.
+      external: null,
     },
     modelUpSince: null,
-    telemetry: null, // latest { master, worker } stats
+    telemetry: null, // latest stats: { hosts, gpus, devices } (+ legacy master/worker)
+    // The machine's cards and RPC workers (topology.js normalizeTopology of
+    // GET /api/topology); null until the server has said -- "unknown", which
+    // Monitor and Launch treat as "label nothing from it".
+    topology: null,
+    // Benchmark-queue lanes with an item running, from the telemetry answer
+    // ([{ lane, label, gpu, model, phase, gen, prefill, index, total }]).
+    lanes: [],
     netMbps: 0,
     buffers: {
-      mUtil: [], mVram: [], mPwr: [], mTemp: [],
-      wUtil: [], wVram: [], wPwr: [],
+      // GPU histories keyed by panel key (format.js telemetryPanels):
+      // { [key]: { util, vram, pwr, temp } }
+      gpus: {},
       net: [], promptTps: [], genTps: [],
     },
     live: { promptTps: null, genTps: null, genInst: null, ctxUsed: 0, ctxTotal: 0, active: false },
@@ -109,6 +125,7 @@ export function createAppStore() {
           loadStartTime: evt.loadStartTime || 0,
           finalLoadTime: evt.finalLoadTime || 0,
           error: evt.error || '',
+          external: evt.external ?? null,
         },
       };
       // 'ready' is the running state (see server4.js state machine).
@@ -120,6 +137,9 @@ export function createAppStore() {
         patch.modelUpSince = (prev === 'starting' || prev === 'loading') ? Date.now() : null;
       }
       if (evt.state && evt.state !== 'ready') patch.modelUpSince = null;
+      // A server that says when the running model came up (`startedAt`, ms
+      // epoch) settles it for a model that was already running, too.
+      if (evt.state === 'ready' && Number.isFinite(evt.startedAt) && evt.startedAt > 0) patch.modelUpSince = evt.startedAt;
       store.setState(patch);
 
       const log = typeof evt.log === 'string' ? evt.log : '';
@@ -168,7 +188,10 @@ export function createAppStore() {
             ...st.live,
             ctxUsed: Number.isFinite(used) ? used : st.live.ctxUsed,
             ctxTotal: Number.isFinite(total) ? total : st.live.ctxTotal,
-            active: busy || st.live.active,
+            // An external server never sends COMPLETION (its requests are
+            // logged by the benchmark's importer), so its busy flag is the
+            // only end-of-request signal; managed servers keep the sticky OR.
+            active: evt.external ? busy : (busy || st.live.active),
           },
         }));
       } else if (log.startsWith('COMPLETION:')) {
@@ -189,14 +212,21 @@ export function createAppStore() {
       }
     },
 
-    onTelemetry({ t, stats }) {
-      if (!stats || !stats.master) return;
-      const m = stats.master;
-      const w = stats.worker;
+    // A topology answer (/api/topology, or the copy sent with /api/profiles).
+    // Anything without a `cards` array leaves the last known one in place.
+    onTopology(raw) {
+      const topology = normalizeTopology(raw);
+      if (!topology) return;
+      if (JSON.stringify(topology) !== JSON.stringify(store.getState().topology)) store.setState({ topology });
+    },
+
+    onTelemetry({ t, stats, lanes }) {
+      if (Array.isArray(lanes)) store.setState({ lanes: lanes.filter((l) => l && typeof l === 'object') });
+      if (!stats || (!stats.master && !Array.isArray(stats.gpus))) return;
       const now = t || Date.now();
 
       let net = 0;
-      const totalBytes = (m.net_bytes || 0) + (w && w.net_bytes || 0);
+      const totalBytes = netBytesOf(stats);
       if (lastNet.bytes !== null) {
         const dt = (now - lastNet.ts) / 1000;
         if (dt > 0.2) net = Math.max(0, (totalBytes - lastNet.bytes) / dt / (1024 * 1024));
@@ -206,21 +236,28 @@ export function createAppStore() {
 
       // Build the next ring set OUTSIDE the setState callback (pushRing
       // returns new arrays), so the callback is a pure state transformation.
+      // One history per GPU panel; an offline reading (monitor.py's error
+      // fallback, or a launch device with no telemetry) records nothing.
       const s = store.getState();
       const b = s.buffers;
-      const wUp = gpuOnline(w);
-      const buffers = {
-        mUtil: pushRing(b.mUtil, m.gpu_util || 0),
-        mVram: pushRing(b.mVram, m.vram_used || 0),
-        mPwr: pushRing(b.mPwr, m.gpu_pwr || 0),
-        mTemp: pushRing(b.mTemp, m.gpu_temp || 0),
-        wUtil: wUp ? pushRing(b.wUtil, w.gpu_util || 0) : b.wUtil,
-        wVram: wUp ? pushRing(b.wVram, w.vram_used || 0) : b.wVram,
-        wPwr: wUp ? pushRing(b.wPwr, w.gpu_pwr || 0) : b.wPwr,
-        net: pushRing(b.net, net),
-        promptTps: b.promptTps,
-        genTps: b.genTps,
-      };
+      const gpus = { ...b.gpus };
+      const seen = new Set();
+      for (const p of telemetryPanels(stats, s.server.isRpc, s.topology)) {
+        seen.add(p.key);
+        if (!gpuOnline(p.gpu)) continue;
+        const cur = gpus[p.key] || { util: [], vram: [], pwr: [], temp: [] };
+        gpus[p.key] = {
+          util: pushRing(cur.util, p.gpu.gpu_util || 0),
+          vram: pushRing(cur.vram, p.gpu.vram_used || 0),
+          pwr: pushRing(cur.pwr, p.gpu.gpu_pwr || 0),
+          temp: pushRing(cur.temp, p.gpu.gpu_temp || 0),
+        };
+      }
+      for (const k of Object.keys(gpus)) {
+        if (Object.keys(gpus).length <= GPU_BUFFER_KEYS_MAX) break;
+        if (!seen.has(k)) delete gpus[k];
+      }
+      const buffers = { ...b, gpus, net: pushRing(b.net, net) };
       store.setState({ telemetry: stats, netMbps: net, buffers });
     },
 

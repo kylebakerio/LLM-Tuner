@@ -1,8 +1,17 @@
-# llama-cli v2 — plan: a btop-quality TUI for Mission Control
+# llama-cli v2 — plan: a btop-quality TUI for LL-Dash
 
 Status: proposal. Written 2026-08-22 after a full read of `llama-cli/`
 (~590 lines), `server4.js` (2265 lines), `monitor.py`, and the CSV/bench
 history system.
+
+> **Where this stands (2026-10-10).** The directory is `dash-cli/` now (the
+> command is still `llama-cli`). Phases 1–3 (Monitor, Launch, Chat) are
+> built; Phases 4–5 (Bench, History, §6.5–6.6, M5–M6) were never built —
+> benchmarks and history are done in the web dashboard — and their
+> placeholder tabs were removed from the TUI. Launch was redesigned
+> profile-first (status block below); §6.2–6.3 describe the config editor,
+> which is now its secondary screen. The rest of this file is the original
+> plan, kept as written.
 
 ## 1. Verdict
 
@@ -189,6 +198,62 @@ router, SSE client, and store are built to be mode-agnostic from day one.
   wrapped at 80 cols -- thrash by another route); `?` overlay documents
   all of it.
 
+### N-device layout (dashboard HETERO-DEVICES-PLAN.md phase 4, 2026-09-13)
+
+- **Launch:** the GPU A/B + RPC-toggle + single-split model is gone. The
+  hw group is an ordered device list: one row per physical card from
+  `/api/devices` `cards` (backend cycled with `v`) and one per configured
+  worker. Rows can be enabled (space), given a share (`+`/`-`/`e`),
+  reordered (`[`/`]`), and split by free VRAM (`S`). The config sends only
+  `devices` (+ `transport` with an enabled worker, + `specDraftDevice`
+  limited to enabled local devices). Old configs are converted through
+  `/api/preview-command` and its warnings are shown. Worker badges poll
+  `/api/worker/status {worker}` for enabled worker rows only; `w`/`L` act
+  on the focused or first enabled worker.
+- **Monitor:** one GpuBox per telemetry `devices` entry (launch order) or
+  `gpus` entry (idle), with the legacy master/worker pair for older servers.
+  The grid is 2 per row, 3 at ≥ 122 cols, wrapping. Buffers are keyed per
+  device. SYSTEM has one row per worker host; LOG matches its height.
+- **Profiles:** tagged RPC/Local by enabled worker devices, with a device
+  summary (picker and `profile list`).
+
+### Launch redesign + health pass (2026-10-10)
+
+- **Launch is profile-first.** It opens on the saved profiles (most recently
+  used first; one line each: name, model/quant, context, cards, build, last
+  used; `MISSING` when the model file is not in `/api/models`, `never used`
+  when `lastLoadedAt` is unset; `/` filters). `Enter` opens a review panel
+  with the command and device plan from `POST /api/preview-command`; `Enter`
+  there launches. The config editor (the old first screen) is behind `e` /
+  `n`, and its `b` goes through the same review. Launch still opens in the
+  editor when no profile exists.
+- **Busy-card guard** (server: `lib/launchguard.js`). The review shows the
+  preview's `busy` list (queue items on a needed card); launching over it
+  takes a second `[y/N]` and sends `force: true` on that request only. A
+  409 `CARD_BUSY` from `/api/start` opens the same question. A server
+  without the guard (no `busy` field) just launches.
+- **Stop / restart** from every Launch screen, both behind y/N (`x` used to
+  stop without asking). Restart is client-side: `/api/stop`, then
+  `/api/start` with the reported `launchConfig`, retrying while the old
+  process exits (`400 Running`). Launching while a server runs is the same
+  stop-then-start, announced in the second confirmation.
+- **Running line** on top of every Launch screen: model, context, cards,
+  uptime. Uptime is only known when the TUI saw the start; the store reads
+  `startedAt` from the status frame if the server ever sends it.
+- **Strata-engine profiles** (web: `engine: strata`) are launchable from the
+  list (`{ engine, strataBase, overrides }`, `temp` sent as `temperature`
+  like the web does); the editor has no fields for them. Rename / duplicate
+  copy a saved config verbatim (they used to drop `engine`/`strataBase`,
+  leaving an unlaunchable copy).
+- **Health:** Bench/History placeholder tabs and keys `4`/`5` removed; `?`
+  help replaces the mode view (it ran off the bottom) and shows the keys of
+  the Launch screen it was opened on; key hints are bold-key/dim-label;
+  README install path, `/temp`, `livechat` documented. Every route the CLI
+  calls was checked against `server4.js`: none is gone.
+- New: `src/launchplan.js` (pure helpers), `src/components/launchviews.js`
+  (running line, profile list, confirm panel), `test/launchplan.test.js`,
+  `test/launchflow.test.js`.
+
 ## 3. What exists today (baseline)
 
 | File | Lines | Role | Fate |
@@ -212,7 +277,7 @@ Feature gaps vs the dashboard that reqs 1–6 are really about:
 
 ```
 ┌─────────────────────────────┐         ┌──────────────────────────────────────────┐
-│  llama-cli v2 (new TUI)     │   HTTP  │  server4.js — Mission Control (:3000)    │
+│  llama-cli v2 (new TUI)     │   HTTP  │  server4.js — LL-Dash (:3000)    │
 │  ink/React on Node 20       │◄───────►│  • REST /api/*  models, builds, devices, │
 │                             │   SSE   │    flags, logs, bench, start/stop, worker│
 │  modes:                     │◄────────│  • GET /api/status — SSE state stream    │

@@ -9,6 +9,8 @@ import {
   thinkingKwargs,
   toApiContent,
   apiMessagesFrom,
+  parseSearchSetting,
+  searchSettingLabel,
   extractMedia,
   mdClassify,
   mdInline,
@@ -115,6 +117,51 @@ test('apiMessagesFrom: system prompt + tool replay when web search is on', () =>
   assert.equal(msgs[3].tool_call_id, 'call_1');
   assert.equal(msgs[3].content, '{"results":[]}');
   assert.equal(msgs[4].content, 'Node 22.');
+});
+
+test('apiMessagesFrom: several search rounds replay each round with only its own results', () => {
+  const call = (id, q) => ({ id, type: 'function', function: { name: 'web_search', arguments: JSON.stringify({ query: q }) } });
+  const msgs = apiMessagesFrom(
+    [
+      { kind: 'user', text: 'qwen next quant sizes?' },
+      {
+        kind: 'assistant',
+        text: 'About 45 GB at Q4.',
+        toolRounds: [
+          { toolCalls: [call('a', 'qwen next gguf')], toolResults: [{ id: 'a', content: '{"count":5}' }] },
+          { toolCalls: [call('b', 'qwen next q4 size'), call('c', 'unsloth qwen next')], toolResults: [{ id: 'b', content: '{"count":3}' }, { id: 'c', content: '{"count":0}' }] },
+        ],
+      },
+    ],
+    { webSearch: true },
+  );
+  assert.deepEqual(msgs.map((m) => m.role), ['system', 'user', 'assistant', 'tool', 'assistant', 'tool', 'tool', 'assistant']);
+  assert.deepEqual(msgs[2].tool_calls.map((c) => c.id), ['a']);
+  assert.equal(msgs[3].tool_call_id, 'a');
+  assert.deepEqual(msgs[4].tool_calls.map((c) => c.id), ['b', 'c']);
+  assert.deepEqual([msgs[5].tool_call_id, msgs[6].tool_call_id], ['b', 'c']);
+  assert.equal(msgs[7].content, 'About 45 GB at Q4.');
+});
+
+test('apiMessagesFrom: the system prompt mentions a search limit only when one is set', () => {
+  const user = [{ kind: 'user', text: 'hi' }];
+  assert.doesNotMatch(apiMessagesFrom(user, { webSearch: true })[0].content, /up to/);
+  assert.doesNotMatch(apiMessagesFrom(user, { webSearch: true, maxSearches: -1 })[0].content, /up to/);
+  assert.match(apiMessagesFrom(user, { webSearch: true, maxSearches: 3 })[0].content, /up to 3 web calls/);
+});
+
+test('parseSearchSetting: 0/off = off, n = up to n, -1/unlimited = unlimited, anything else rejected', () => {
+  assert.equal(parseSearchSetting('0'), 0);
+  assert.equal(parseSearchSetting('off'), 0);
+  assert.equal(parseSearchSetting('5'), 5);
+  assert.equal(parseSearchSetting('-1'), -1);
+  assert.equal(parseSearchSetting('unlimited'), -1);
+  assert.equal(parseSearchSetting('-2'), null);
+  assert.equal(parseSearchSetting('lots'), null);
+  assert.equal(parseSearchSetting(''), null);
+  assert.equal(searchSettingLabel(0), 'off');
+  assert.equal(searchSettingLabel(-1), 'unlimited');
+  assert.equal(searchSettingLabel(3), 'up to 3 per answer');
 });
 
 // 1x1 transparent PNG

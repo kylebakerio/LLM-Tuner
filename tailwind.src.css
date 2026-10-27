@@ -1,3 +1,574 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* =============================================================================================
+   LL-Dash design layer (2026-10-01 visual overhaul).
+   Two levers restyle the whole app without touching its ~2,000 utility uses:
+     1. tailwind.config.js remaps the gray/indigo palettes and the font stacks;
+     2. this file gives bare elements (inputs, selects, tables, details, scrollbars) and a few
+        recurring markup patterns (cards, section headings, "?" help markers) a consistent skin.
+   New shared pieces (.nav-tab, .seg-btn, .status-pill, .side-group ...) are plain classes so
+   script.js and ui/ can set them by name instead of carrying long utility strings.
+   Tokens are CSS variables so canvas code (Chart.js, ui/shared/theme.js) reads the same values.
+   ============================================================================================= */
+
+@layer base {
+    :root {
+        color-scheme: dark;
+        --bg: #0c0d11;
+        --surface-1: #14161c;
+        --surface-2: #1b1e26;
+        --surface-3: #252832;
+        --border: #252832;
+        --border-strong: #363a47;
+        --text-1: #eceef3;
+        --text-2: #b9bec9;
+        --text-3: #959cab;
+        --text-muted: #747b8c;
+        --accent: #7275f4;
+        --accent-strong: #5f5de6;
+        --accent-soft: rgba(114, 117, 244, 0.14);
+        --ring: rgba(114, 117, 244, 0.35);
+        --grid: rgba(255, 255, 255, 0.055);
+        --good: #34d399;
+        --warn: #fbbf24;
+        --bad: #f87171;
+        --radius: 10px;
+        --font-sans: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif;
+        --font-mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+    }
+
+    html {
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        text-rendering: optimizeLegibility;
+        /* Inter: open digits, single-storey a off, disambiguated l/I */
+        font-feature-settings: "cv11", "ss01", "ss03";
+    }
+    body {
+        background-color: var(--bg);
+        letter-spacing: -0.003em;
+    }
+
+    /* Numbers line up in every table and readout. */
+    .font-mono, code, kbd, samp, pre { font-feature-settings: "calt" 1, "zero" 0; letter-spacing: 0; }
+    td, th, .font-mono { font-variant-numeric: tabular-nums; }
+
+    ::selection { background: rgba(114, 117, 244, 0.35); color: #fff; }
+
+    /* Scrollbars: thin, recessive, visible on hover. */
+    * { scrollbar-width: thin; scrollbar-color: #363a47 transparent; }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #2c303b; border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
+    ::-webkit-scrollbar-thumb:hover { background: #3f4452; border: 3px solid transparent; background-clip: padding-box; }
+    ::-webkit-scrollbar-corner { background: transparent; }
+
+    /* Form controls. Utilities still own size/padding; this owns feel and focus. */
+    input, select, textarea, button { transition: border-color .15s ease, background-color .15s ease, color .15s ease, box-shadow .15s ease, opacity .15s ease; }
+    input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]),
+    select, textarea {
+        border-radius: 7px;
+    }
+    input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):hover,
+    select:hover, textarea:hover { border-color: #3f4452; }
+    input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):focus,
+    select:focus, textarea:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px rgba(114, 117, 244, 0.16);
+    }
+    /* Underline-style inputs (border-b only) keep their underline look on focus. */
+    input.border-b:focus, input.bg-transparent:focus { box-shadow: none; }
+    input::placeholder, textarea::placeholder { color: #525867; opacity: 1; }
+    input[readonly], textarea[readonly] { cursor: text; }
+    select:not([multiple]):not([size]) {
+        appearance: none;
+        -webkit-appearance: none;
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='%23959cab'%3E%3Cpath fill-rule='evenodd' d='M5.23 7.21a.75.75 0 011.06.02L10 11.17l3.71-3.94a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z' clip-rule='evenodd'/%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: right 0.4rem center;
+        background-size: 14px 14px;
+        padding-right: 1.6rem;
+        cursor: pointer;
+    }
+    select option { background: #14161c; color: #eceef3; }
+    input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); cursor: pointer; }
+    input[type="range"] { accent-color: var(--accent); -webkit-appearance: none; appearance: none; height: 18px; background: transparent; }
+    input[type="range"]::-webkit-slider-runnable-track { height: 4px; border-radius: 999px; background: var(--surface-3); }
+    input[type="range"]::-moz-range-track { height: 4px; border-radius: 999px; background: var(--surface-3); }
+    input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; margin-top: -5px; border-radius: 999px; background: #fff; border: 3px solid var(--accent); box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5); }
+    input[type="range"]::-moz-range-thumb { width: 10px; height: 10px; border-radius: 999px; background: #fff; border: 3px solid var(--accent); }
+    /* Spinners off: they crowded the narrow share/ctx fields; arrow keys and wheel still step. */
+    input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
+    input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+
+    button { cursor: pointer; }
+    button:disabled { cursor: not-allowed; }
+    button:focus-visible, a:focus-visible, summary:focus-visible, [tabindex]:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+    }
+
+    /* Tables: quiet headers, a whisper of row hover. */
+    th { font-weight: 500; color: var(--text-muted); letter-spacing: 0.01em; }
+    tbody tr { transition: background-color .12s ease; }
+    tbody tr:hover { background-color: rgba(140, 145, 253, 0.045); }
+
+    /* details/summary: custom disclosure chevron instead of the UA triangle. */
+    summary { cursor: pointer; list-style: none; }
+    summary::-webkit-details-marker { display: none; }
+
+    a { text-underline-offset: 2px; }
+    hr { border-color: var(--border); }
+
+    pre, code { font-family: var(--font-mono); }
+}
+
+@layer components {
+    /* ---- recurring markup patterns ------------------------------------------------------- */
+
+    /* Every panel in the app is `bg-gray-900 border border-gray-800 rounded-xl`; give them all
+       the same quiet elevation instead of editing each one. */
+    .rounded-xl.border.bg-gray-900 {
+        box-shadow: 0 1px 0 0 rgba(255, 255, 255, 0.025) inset, 0 1px 2px rgba(0, 0, 0, 0.35), 0 8px 24px -12px rgba(0, 0, 0, 0.45);
+    }
+
+    /* Panel headings were all-caps 12px tracking-wider; a modern, calmer title reads better and
+       stays scannable. Applies to every h3/h2 section title written that way. */
+    h3.uppercase.tracking-wider,
+    h2.uppercase.tracking-wider {
+        text-transform: none;
+        letter-spacing: -0.01em;
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text-1);
+    }
+    h3.uppercase.tracking-wider .normal-case,
+    h2.uppercase.tracking-wider .normal-case { font-weight: 400; color: var(--text-muted); }
+
+    /* "?" help markers: a small ring badge instead of a bare accent-coloured question mark. */
+    .help-tip {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 14px;
+        height: 14px;
+        margin-left: 3px;
+        border-radius: 999px;
+        border: 1px solid #3a3f4d;
+        color: #8a91a1 !important;
+        font-size: 9px !important;
+        font-weight: 600;
+        line-height: 1;
+        vertical-align: 1px;
+        text-transform: none;
+        letter-spacing: 0;
+        font-family: var(--font-sans);
+        transition: color .15s ease, border-color .15s ease, background-color .15s ease;
+        user-select: none;
+    }
+    .help-tip:hover { color: #fff !important; border-color: var(--accent); background: var(--accent-soft); }
+
+    /* ---- app shell ---------------------------------------------------------------------- */
+
+    .app-topbar {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        height: 52px;
+        padding: 0 0.75rem;
+        border-bottom: 1px solid var(--border);
+        background: rgba(12, 13, 17, 0.8);
+        backdrop-filter: blur(10px);
+        flex-shrink: 0;
+    }
+    .icon-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 30px;
+        height: 30px;
+        border-radius: 8px;
+        color: var(--text-muted);
+        flex-shrink: 0;
+    }
+    .icon-btn:hover { color: var(--text-1); background: var(--surface-2); }
+    .icon-btn svg { width: 16px; height: 16px; }
+
+    /* Top-level tabs: a segmented pill row. */
+    .nav-tabs {
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        padding: 3px;
+        border-radius: 10px;
+        background: var(--surface-1);
+        border: 1px solid var(--border);
+    }
+    .nav-tab {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        flex-shrink: 0;
+        white-space: nowrap;
+        padding: 0.32rem 0.8rem;
+        border-radius: 7px;
+        font-size: 12.5px;
+        font-weight: 500;
+        color: var(--text-3);
+    }
+    .nav-tab svg { width: 15px; height: 15px; opacity: .8; }
+    .nav-tab:hover { color: var(--text-1); background: rgba(255, 255, 255, 0.035); }
+    .nav-tab.is-active {
+        color: #fff;
+        background: var(--surface-3);
+        box-shadow: 0 1px 0 rgba(255, 255, 255, 0.05) inset, 0 1px 3px rgba(0, 0, 0, 0.4);
+    }
+    .nav-tab.is-active svg { opacity: 1; color: var(--indigo-glyph, #a6acff); }
+
+    /* Secondary segmented buttons (bench sub-tabs, codebench views, chart toggles). */
+    .seg-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        padding: 0.35rem 0.75rem;
+        border-radius: 7px;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--text-3);
+        background: transparent;
+        border: 1px solid transparent;
+        white-space: nowrap;
+    }
+    .seg-btn:hover { color: var(--text-1); background: var(--surface-2); }
+    .seg-btn.is-on {
+        color: #fff;
+        background: var(--accent-soft);
+        border-color: rgba(114, 117, 244, 0.45);
+    }
+    .seg-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px;
+    }
+
+    /* Engine status pill (sidebar header). */
+    .status-pill {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        min-width: 0;
+        padding: 0.45rem 0.7rem;
+        border-radius: 8px;
+        font-size: 11.5px;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+        border: 1px solid;
+        line-height: 1.3;
+    }
+    .status-pill > span:first-child { flex-shrink: 0; box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.06); }
+    .status-pill.is-stopped { color: #fca5a5; background: rgba(248, 113, 113, 0.08); border-color: rgba(248, 113, 113, 0.28); }
+    .status-pill.is-warn { color: #fcd34d; background: rgba(251, 191, 36, 0.08); border-color: rgba(251, 191, 36, 0.28); }
+    .status-pill.is-running { color: #6ee7b7; background: rgba(52, 211, 153, 0.08); border-color: rgba(52, 211, 153, 0.3); }
+
+    /* Launch sidebar groups: collapsible <details> sections. */
+    .side-group { border-top: 1px solid var(--border); }
+    .side-group > summary {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+        padding: 0.8rem 1.25rem;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--text-muted);
+        user-select: none;
+    }
+    .side-group > summary:hover { color: var(--text-2); }
+    .side-group > summary .side-hint { text-transform: none; letter-spacing: 0; font-weight: 500; color: #525867; font-size: 11px; margin-left: auto; margin-right: .25rem; }
+    .side-group > summary::after {
+        content: "";
+        width: 14px;
+        height: 14px;
+        flex-shrink: 0;
+        background-color: currentColor;
+        -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath fill-rule='evenodd' d='M7.21 14.77a.75.75 0 01.02-1.06L11.17 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z' clip-rule='evenodd'/%3E%3C/svg%3E") center / contain no-repeat;
+        mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath fill-rule='evenodd' d='M7.21 14.77a.75.75 0 01.02-1.06L11.17 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z' clip-rule='evenodd'/%3E%3C/svg%3E") center / contain no-repeat;
+        transition: transform .15s ease;
+    }
+    .side-group[open] > summary::after { transform: rotate(90deg); }
+    .side-group > .side-body { padding: 0 1.25rem 1.1rem; display: flex; flex-direction: column; gap: 0.85rem; }
+
+    .side-title { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); }
+    .brand-mark {
+        width: 30px;
+        height: 30px;
+        border-radius: 9px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: #fff;
+        background: linear-gradient(135deg, #8c91fd 0%, #5f5de6 55%, #3e3ba1 100%);
+        box-shadow: 0 1px 0 rgba(255, 255, 255, 0.25) inset, 0 6px 16px -6px rgba(114, 117, 244, 0.8);
+        flex-shrink: 0;
+    }
+    .brand-mark svg { width: 17px; height: 17px; }
+
+    /* Sidebar drag handles: a hairline that lights up on hover. */
+    .resizer {
+        width: 5px;
+        margin: 0 -2px;
+        position: relative;
+        z-index: 20;
+        flex-shrink: 0;
+        cursor: col-resize;
+        background: transparent;
+    }
+    .resizer::after { content: ""; position: absolute; top: 0; bottom: 0; left: 2px; width: 1px; background: transparent; transition: background-color .15s ease, box-shadow .15s ease; }
+    .resizer:hover::after { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+
+    /* Standard text input / select. */
+    .field {
+        width: 100%;
+        background-color: var(--bg);
+        border: 1px solid var(--border-strong);
+        padding: 0.38rem 0.6rem;
+        font-size: 12.5px;
+        line-height: 1.35;
+        color: var(--text-1);
+        border-radius: 7px;
+    }
+    select.field { padding-right: 1.6rem; }
+
+    /* Form field label used across the sidebar and bench forms. */
+    .field-label { display: block; font-size: 11px; font-weight: 500; color: var(--text-3); margin-bottom: 0.3rem; }
+    .check-row { display: flex; align-items: center; gap: 0.5rem; font-size: 12px; font-weight: 500; color: var(--text-2); }
+
+    /* Buttons */
+    .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.4rem;
+        padding: 0.4rem 0.8rem;
+        border-radius: 8px;
+        font-size: 12px;
+        font-weight: 500;
+        border: 1px solid var(--border-strong);
+        background: var(--surface-2);
+        color: var(--text-2);
+        white-space: nowrap;
+    }
+    .btn:hover { background: var(--surface-3); color: var(--text-1); border-color: #464b5a; }
+    .btn-primary {
+        background: linear-gradient(180deg, #7477f6, #5f5de6);
+        border-color: rgba(255, 255, 255, 0.08);
+        color: #fff;
+        box-shadow: 0 1px 0 rgba(255, 255, 255, 0.15) inset, 0 4px 14px -6px rgba(114, 117, 244, 0.7);
+    }
+    .btn-primary:hover { background: linear-gradient(180deg, #8285f8, #6a68ec); color: #fff; border-color: rgba(255, 255, 255, 0.12); }
+    .btn-go {
+        background: linear-gradient(180deg, #22c58b, #16a26f);
+        border-color: rgba(255, 255, 255, 0.08);
+        color: #fff;
+        font-weight: 600;
+        box-shadow: 0 1px 0 rgba(255, 255, 255, 0.18) inset, 0 6px 18px -8px rgba(34, 197, 139, 0.8);
+    }
+    .btn-go:hover { background: linear-gradient(180deg, #2ad497, #19b07a); color: #fff; }
+    .btn-danger { color: #fca5a5; background: rgba(248, 113, 113, 0.08); border-color: rgba(248, 113, 113, 0.3); }
+    .btn-danger:hover { color: #fff; background: rgba(248, 113, 113, 0.22); border-color: rgba(248, 113, 113, 0.5); }
+    .btn-ghost { background: transparent; border-color: transparent; color: var(--text-3); }
+    .btn-ghost:hover { background: var(--surface-2); border-color: transparent; color: var(--text-1); }
+    .btn-sm { padding: 0.25rem 0.55rem; font-size: 11px; border-radius: 7px; }
+    .btn:disabled, .btn[disabled] { opacity: .45; box-shadow: none; }
+
+    /* Content cards (Models, Bench): title row with tools on the right. */
+    .card {
+        background: var(--surface-1);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 1.1rem 1.25rem 1.2rem;
+        box-shadow: 0 1px 0 0 rgba(255, 255, 255, 0.025) inset, 0 1px 2px rgba(0, 0, 0, 0.35), 0 12px 32px -18px rgba(0, 0, 0, 0.6);
+        min-width: 0;
+    }
+    .card-plain { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; }
+    .card-head { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 0.75rem 1rem; margin-bottom: 0.9rem; }
+    .card-title { font-size: 15px; font-weight: 600; letter-spacing: -0.015em; color: #fff; line-height: 1.3; }
+    .card-sub { font-size: 12px; color: var(--text-muted); margin-top: 0.15rem; line-height: 1.45; }
+    .card-tools { margin-left: auto; display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 0.5rem 1rem; }
+
+    /* Segmented controls: a group of .chip buttons; the selected one gets .is-on. */
+    .ctl { display: inline-flex; align-items: center; gap: 0.5rem; }
+    .ctl-label { font-size: 11px; font-weight: 500; color: var(--text-muted); white-space: nowrap; }
+    .chip-group { display: inline-flex; align-items: center; gap: 2px; padding: 2px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border); }
+    .chip {
+        display: inline-flex; align-items: center; gap: 0.3rem;
+        padding: 0.2rem 0.6rem; border-radius: 6px;
+        font-size: 11.5px; font-weight: 500; color: var(--text-3); white-space: nowrap;
+    }
+    .chip:hover { color: var(--text-1); background: rgba(255, 255, 255, 0.04); }
+    .chip.is-on { color: #fff; background: var(--surface-3); box-shadow: 0 1px 0 rgba(255, 255, 255, 0.05) inset, 0 1px 2px rgba(0, 0, 0, 0.4); }
+
+    /* Legends written in HTML above a chart. */
+    .legend-item { display: inline-flex; align-items: center; gap: 0.4rem; white-space: nowrap; }
+    .legend-sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
+
+    /* "How to read this": methodology folded away under a quiet link-like summary. */
+    details.how > summary { display: inline-flex; align-items: center; gap: 0.3rem; font-size: 11.5px; font-weight: 500; color: #8c91fd; }
+    details.how > summary:hover { color: #a6acff; }
+    details.how > summary::before {
+        content: ""; width: 12px; height: 12px; background-color: currentColor;
+        -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath fill-rule='evenodd' d='M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a.75.75 0 000 1.5h.25v2.25a.75.75 0 001.5 0v-3A.75.75 0 0010 9H9z' clip-rule='evenodd'/%3E%3C/svg%3E") center / contain no-repeat;
+        mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath fill-rule='evenodd' d='M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a.75.75 0 000 1.5h.25v2.25a.75.75 0 001.5 0v-3A.75.75 0 0010 9H9z' clip-rule='evenodd'/%3E%3C/svg%3E") center / contain no-repeat;
+    }
+    details.how[open] { flex-basis: 100%; }
+    .how-body {
+        margin-top: 0.5rem; padding: 0.7rem 0.85rem; border-radius: 9px;
+        background: var(--bg); border: 1px solid var(--border);
+        font-size: 12px; line-height: 1.6; color: var(--text-3); max-width: 70rem;
+    }
+    .how-body b { color: var(--text-1); font-weight: 600; }
+
+    .stat-chip {
+        display: inline-flex; align-items: center; gap: 0.3rem;
+        padding: 0.15rem 0.55rem; border-radius: 999px;
+        font-size: 11.5px; color: var(--text-3);
+        background: var(--surface-1); border: 1px solid var(--border);
+    }
+    .stat-chip b { color: var(--text-1); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+    .model-tile {
+        text-align: left; padding: 0.6rem 0.75rem; border-radius: 10px;
+        background: var(--bg); border: 1px solid var(--border); min-width: 0;
+        transition: border-color .15s ease, background-color .15s ease, transform .15s ease;
+    }
+    .model-tile:hover { border-color: rgba(114, 117, 244, 0.6); background: rgba(114, 117, 244, 0.06); }
+
+    .tag { display: inline-flex; align-items: center; padding: 0 0.4rem; height: 17px; border-radius: 5px; font-size: 10px; font-weight: 600; letter-spacing: 0.01em; flex-shrink: 0; }
+    .tag-amber { background: rgba(251, 191, 36, 0.12); color: #fcd34d; }
+    .tag-red { background: rgba(248, 113, 113, 0.12); color: #fca5a5; }
+    .tag-sky { background: rgba(56, 189, 248, 0.12); color: #7dd3fc; }
+    .tag-gray { background: var(--surface-3); color: var(--text-2); }
+
+    /* Leaderboard tables (ui/shared/leaderboard.js) */
+    .lb-table { border-collapse: separate; border-spacing: 0; }
+    .lb-th {
+        padding: 0.5rem 0.6rem; font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+        color: var(--text-muted); border-bottom: 1px solid var(--border); white-space: nowrap;
+    }
+    .lb-td { padding: 0.55rem 0.6rem; border-bottom: 1px solid rgba(37, 40, 50, 0.7); vertical-align: top; }
+    .lb-table tbody tr:last-child .lb-td { border-bottom: 0; }
+    .lb-banner {
+        margin-bottom: 0.6rem; padding: 0.55rem 0.75rem; border-radius: 9px; font-size: 11.5px; line-height: 1.5;
+        color: #fde68a; background: rgba(251, 191, 36, 0.06); border: 1px solid rgba(251, 191, 36, 0.2);
+        display: flex; flex-direction: column; gap: 0.2rem;
+    }
+
+    /* Telemetry stat tiles */
+    .tile {
+        background: var(--surface-1);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 0.8rem 0.9rem;
+    }
+    .tile-label { font-size: 11.5px; font-weight: 500; color: var(--text-3); display: inline-flex; align-items: center; }
+    .tile-dot { width: 7px; height: 7px; border-radius: 999px; display: inline-block; margin-right: 0.45rem; flex-shrink: 0; }
+    .tile-value { font-family: var(--font-mono); font-size: 20px; font-weight: 600; letter-spacing: -0.02em; color: var(--text-1); line-height: 1.15; }
+    .tile-unit { font-size: 11px; font-weight: 500; color: var(--text-muted); margin-left: 0.2rem; letter-spacing: 0; }
+    .tile-sub { font-size: 11px; color: var(--text-muted); }
+
+    .tile-legend { display: flex; flex-wrap: wrap; gap: 0.15rem 0.75rem; margin-top: 0.35rem; font-size: 10.5px; color: var(--text-3); }
+    .kbd-hint { font-size: 11px; color: #525867; }
+
+    /* Chat transcript */
+    .chat-bubble-user {
+        background: linear-gradient(180deg, rgba(114, 117, 244, 0.12), rgba(114, 117, 244, 0.06));
+        border: 1px solid rgba(114, 117, 244, 0.22);
+    }
+    .chat-bubble-ast {
+        background: var(--surface-1);
+        border: 1px solid var(--border);
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+    }
+    .chat-role { display: inline-flex; align-items: center; gap: 0.5rem; font-size: 12.5px; font-weight: 600; color: var(--text-1); }
+    .chat-avatar {
+        width: 22px; height: 22px; border-radius: 7px; display: inline-flex; align-items: center; justify-content: center;
+        font-size: 10.5px; font-weight: 700; flex-shrink: 0;
+    }
+    .chat-avatar svg { width: 13px; height: 13px; }
+    .chat-avatar-user { background: var(--surface-3); color: var(--text-2); }
+    .chat-avatar-ast { background: linear-gradient(135deg, #8c91fd, #5f5de6); color: #fff; }
+
+    /* Composer */
+    .composer {
+        background: var(--surface-1);
+        border: 1px solid var(--border-strong);
+        border-radius: 16px;
+        box-shadow: 0 10px 30px -18px rgba(0, 0, 0, 0.9);
+        transition: border-color .15s ease, box-shadow .15s ease;
+    }
+    .composer:focus-within { border-color: rgba(114, 117, 244, 0.55); box-shadow: 0 0 0 3px rgba(114, 117, 244, 0.12), 0 10px 30px -18px rgba(0, 0, 0, 0.9); }
+    .composer textarea:focus, .composer textarea:hover { box-shadow: none !important; border-color: transparent !important; }
+    .composer-chip {
+        display: inline-flex; align-items: center; gap: 0.4rem;
+        height: 28px; padding: 0 0.6rem; border-radius: 999px;
+        background: var(--surface-2); border: 1px solid var(--border);
+        font-size: 11.5px; color: var(--text-3); white-space: nowrap;
+    }
+    .composer-chip:hover { border-color: var(--border-strong); }
+    .composer-chip input:focus { box-shadow: none !important; }
+    select.composer-select {
+        background-color: transparent; border: 0; padding: 0 1.1rem 0 0; font-size: 11.5px; color: var(--text-1);
+        background-position: right 0 center; background-size: 12px 12px; height: 26px;
+    }
+    select.composer-select:focus { box-shadow: none; }
+
+    /* Markdown answers. The typography plugin isn't in this build, so `prose` was a no-op and
+       answers rendered with preflight's bare resets (no bullets, flat headings). */
+    .prose { color: var(--text-1); line-height: 1.7; font-size: 14px; }
+    .prose > :first-child { margin-top: 0; }
+    .prose > :last-child { margin-bottom: 0; }
+    .prose p, .prose ul, .prose ol, .prose pre, .prose blockquote, .prose table { margin: 0.75em 0; }
+    .prose h1, .prose h2, .prose h3, .prose h4 { color: #fff; font-weight: 650; line-height: 1.3; margin: 1.3em 0 0.5em; letter-spacing: -0.015em; }
+    .prose h1 { font-size: 1.45em; }
+    .prose h2 { font-size: 1.25em; }
+    .prose h3 { font-size: 1.1em; }
+    .prose h4 { font-size: 1em; }
+    .prose ul { list-style: disc; padding-left: 1.4em; }
+    .prose ol { list-style: decimal; padding-left: 1.5em; }
+    .prose li { margin: 0.25em 0; }
+    .prose li::marker { color: var(--text-muted); }
+    .prose a { color: #a6acff; text-decoration: underline; text-decoration-color: rgba(166, 172, 255, 0.4); }
+    .prose a:hover { text-decoration-color: #a6acff; }
+    .prose strong { color: #fff; font-weight: 650; }
+    .prose blockquote { border-left: 3px solid var(--border-strong); padding-left: 1em; color: var(--text-2); }
+    .prose hr { margin: 1.5em 0; }
+    .prose :not(pre) > code {
+        font-size: 0.86em; padding: 0.15em 0.4em; border-radius: 5px;
+        background: var(--surface-3); color: #e0e3ff; border: 1px solid rgba(255, 255, 255, 0.04);
+    }
+    .prose pre { font-size: 12.5px; line-height: 1.6; overflow-x: auto; }
+    .prose pre code { background: none; padding: 0; border: 0; color: var(--text-1); }
+    .prose table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .prose th, .prose td { border-bottom: 1px solid var(--border); padding: 0.45em 0.7em; text-align: left; }
+    .prose th { color: var(--text-2); font-weight: 600; }
+    .prose img { border-radius: 8px; }
+}
+
+/* ---- legibility floor -----------------------------------------------------------------------
+   The viewport this runs on is ~2500px wide; 9px text was below comfortable reading size.
+   Lift the two smallest arbitrary sizes app-wide rather than editing hundreds of call sites. */
+.text-\[9px\] { font-size: 10px; }
+.text-\[10px\] { font-size: 11px; }
+
+/* Main views: same centred 1600px column as the Models tab, so forms and tables don't stretch
+   across an ultrawide. (Children of a flex column; margin auto centres them.) */
+#monitor-view > *, #history-view > *, #bench-view > * { width: 100%; max-width: 1600px; margin-left: auto; margin-right: auto; }
+
+/* Scrollbars that come and go must not move the layout (2026-10-01): the space is always reserved. */
+#telemetry-sidebar, #launch-sidebar, #monitor-view, #history-view, #bench-view, #models-view, #chat-container { scrollbar-gutter: stable; }

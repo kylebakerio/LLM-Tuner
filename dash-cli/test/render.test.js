@@ -51,8 +51,8 @@ test('Monitor mode renders the full btop screen', async (t) => {
   assert.match(out, /Llama CLI/);
   assert.match(out, /test-model\.gguf/);
   assert.match(out, /\[ready\]/);
-  assert.match(out, /Test GPU 4090/);
-  assert.match(out, /Worker GPU/);
+  assert.match(out, /GPU 0 · Test 4090/, 'legacy panels: the card name, vendor/"GPU" words dropped');
+  assert.match(out, /GPU 1 · Worker/);
   assert.match(out, /pwr-cap/, 'info-level throttle badge (permanent fw cap, not an alarm)');
   assert.match(out, /TOKENS \/ CONTEXT/);
   assert.match(out, /COMPLETED REQUESTS/);
@@ -68,7 +68,7 @@ test('Monitor mode shows the offline screen when disconnected', async (t) => {
   t.after(view.unmount);
   await sleep(50);
   const out = view.lastFrame() || '';
-  assert.match(out, /Mission Control offline/);
+  assert.match(out, /LL-Dash offline/);
   assert.match(out, /pm2 start ecosystem\.config\.js/);
 });
 
@@ -143,8 +143,8 @@ test('Monitor labels the GPU panels Local / Worker (rpc) and shows worker cpu/ra
   t.after(view.unmount);
   await sleep(50);
   const out = view.lastFrame() || '';
-  assert.match(out, /Local · Radeon RX 7900 XTX/);
-  assert.match(out, /Worker \(rpc\) · RTX 4090 Laptop GPU/);
+  assert.match(out, /Local · RX 7900 XTX/, 'vendor and product-line words dropped from the card name');
+  assert.match(out, /Worker \(rpc\) · RTX 4090 Laptop\b/);
   assert.doesNotMatch(out, /GPU 0|GPU 1/);
   assert.match(out, /wrk\s+33%\s+77°C · ram 12\.0\/32\.0G/);
 });
@@ -170,61 +170,139 @@ test('Monitor treats an nvidia_smi_error worker as offline (panel kept during RP
   assert.match(out, /worker telemetry offline/);
 });
 
-test('Launch prefilled from an RPC run: Local label, GPU B locked, transport shown, no rawCommand sent', async (t) => {
-  const appStore = createAppStore();
-  appStore.onConnState('live');
-  appStore.onSSEEvent({
-    state: 'stopped', model: '', log: '',
-    launchConfig: {
-      modelPath: '/models/alpha-7b.gguf', build: 'vulkan', ctx: 8192, ngl: 99,
-      deviceA: 'Vulkan0', deviceB: 'Vulkan1', tensorSplit: 70, rpcTarget: 'laptop', transport: 'TB4',
-      rawCommand: '/x/llama-server -m /models/other.gguf', verbosity: 1,
-    },
-  });
-  const posts = [];
-  const client = {
+// /api/devices on the desktop's CUDA+Vulkan build, with the laptop worker.
+const DEVICES_RESPONSE = {
+  devices: [
+    { id: 'CUDA0', description: 'NVIDIA GeForce RTX 3060', totalMib: 11906, freeMib: 10000 },
+    { id: 'Vulkan0', description: 'NVIDIA GeForce RTX 3060', totalMib: 12288, freeMib: 10000 },
+    { id: 'Vulkan1', description: 'AMD Radeon RX 7900 XTX (RADV NAVI31)', totalMib: 24560, freeMib: 20000 },
+  ],
+  cards: [
+    { name: 'NVIDIA GeForce RTX 3060', vendor: 'nvidia', preferredId: 'CUDA0', ambiguous: false,
+      backends: [{ id: 'CUDA0', totalMib: 11906, freeMib: 10000 }, { id: 'Vulkan0', totalMib: 12288, freeMib: 10000 }] },
+    { name: 'AMD Radeon RX 7900 XTX', vendor: 'amd', preferredId: 'Vulkan1', ambiguous: false,
+      backends: [{ id: 'Vulkan1', totalMib: 24560, freeMib: 20000 }] },
+  ],
+  workers: [{ name: 'laptop', ssh: 'laptop', port: 50052, devices: 'CUDA0', deviceCount: 1, cache: true, link: 'ssh' }],
+};
+
+function launchClient(posts, { status = 'running' } = {}) {
+  return {
     getJson: async (p) => {
       if (p === '/api/models') return [{ name: 'alpha-7b.gguf', path: '/models/alpha-7b.gguf', size: '4.2', source: 'local' }];
-      if (p === '/api/builds') return { builds: [{ id: 'vulkan', label: 'Vulkan Only', path: '/x/llama-server' }] };
-      if (p === '/api/worker/config') return { ssh: 'default-worker', port: 50052 };
-      if (p.startsWith('/api/devices')) return { devices: [] };
+      if (p === '/api/builds') return { builds: [{ id: 'vulkan-cuda', label: 'Vulkan + CUDA', path: '/x/llama-server' }] };
+      if (p === '/api/worker/config') return { ssh: 'laptop', workers: DEVICES_RESPONSE.workers };
+      if (p.startsWith('/api/devices')) return DEVICES_RESPONSE;
       return {};
     },
     postJson: async (p, body) => {
       posts.push([p, body]);
-      if (p === '/api/worker/status') return { status: 'running' };
-      if (p === '/api/preview-command') return { command: '/x/llama-server -dev Vulkan0,RPC0' };
+      if (p === '/api/worker/status') return { status };
+      if (p === '/api/preview-command') {
+        // A config without `devices` is a conversion request from the CLI.
+        if (!Array.isArray(body.devices)) {
+          return {
+            command: '', devices: [{ id: 'Vulkan1', share: 70 }, { worker: 'laptop', share: 30, id: 'RPC0' }],
+            warnings: ['Vulkan1 was saved without a card name'],
+          };
+        }
+        return { command: '/x/llama-server --rpc 127.0.0.1:50052 --split-mode layer -dev Vulkan1,RPC0 -ts 70,30', warnings: [] };
+      }
       return {};
     },
     connect() {},
     close() {},
   };
+}
+
+test('Launch prefilled from an old-style RPC run: converted by the server, device rows shown, only `devices` sent', async (t) => {
+  const appStore = createAppStore();
+  appStore.onConnState('live');
+  appStore.onSSEEvent({
+    state: 'stopped', model: '', log: '',
+    launchConfig: {
+      modelPath: '/models/alpha-7b.gguf', build: 'vulkan-cuda', ctx: 8192, ngl: 99,
+      deviceA: 'Vulkan1', tensorSplit: 70, rpcTarget: 'laptop', transport: 'TB4',
+      rawCommand: '/x/llama-server -m /models/other.gguf', verbosity: 1,
+    },
+  });
+  const posts = [];
   const { Launch } = await import('../src/modes/launch.js');
   const view = render(React.createElement(Launch, {
-    client, appStore, serverUrl: 'http://localhost:3000', modeGateRef: { current: false }, onLaunched: () => {},
+    client: launchClient(posts), appStore, serverUrl: 'http://localhost:3000', modeGateRef: { current: false }, onLaunched: () => {},
   }));
   t.after(view.unmount);
-  await sleep(100);
+  await sleep(150);
   view.stdin.write('\t'); // core -> hw group
-  await sleep(700);
+  await sleep(900);
   const out = view.lastFrame() || '';
-  assert.match(out, /Local\s+Vulkan0/);
-  assert.match(out, /GPU B\s+None\s+\(disabled/);
-  assert.match(out, /Local 70% \/ Worker 30%/);
-  assert.match(out, /RPC worker\s+on\s+\[RUNNING\]/);
-  assert.match(out, /Worker host\s+laptop/, 'prefilled host wins over the config default');
+  assert.match(out, /\[x\] RX 7900 XTX\s+Vulkan1\s+share 70 \(70%\)/);
+  assert.match(out, /\[x\] RPC laptop\s+share 30 \(30%\)\s+\[RUNNING\]/);
+  assert.match(out, /\[ \] RTX 3060\s+CUDA0 \(v: CUDA0\/Vulkan0\)/);
   assert.match(out, /Transport\s+TB4/);
+  assert.match(out, /saved without a card name/, 'conversion warning shown');
 
-  const preview = posts.filter(([p]) => p === '/api/preview-command').pop();
-  assert.ok(preview, 'preview requested');
-  assert.equal('rawCommand' in preview[1], false);
-  assert.equal(preview[1].rpcTarget, 'laptop');
+  const conversion = posts.find(([p, b]) => p === '/api/preview-command' && !Array.isArray(b.devices));
+  assert.ok(conversion, 'old config converted through the server preview');
+  assert.equal('rawCommand' in conversion[1], false);
+  const preview = posts.filter(([p, b]) => p === '/api/preview-command' && Array.isArray(b.devices)).pop();
+  assert.ok(preview, 'preview requested with devices');
+  assert.deepEqual(preview[1].devices, [
+    { id: 'Vulkan1', name: 'AMD Radeon RX 7900 XTX', vramMib: 24560, share: 70, enabled: true },
+    { worker: 'laptop', share: 30, enabled: true },
+    { id: 'CUDA0', name: 'NVIDIA GeForce RTX 3060', vramMib: 12288, enabled: false },
+  ]);
+  for (const k of ['deviceA', 'deviceB', 'rpcTarget', 'tensorSplit', 'rawCommand']) assert.equal(k in preview[1], false, `${k} not sent`);
   assert.equal(preview[1].transport, 'TB4');
-  assert.equal(preview[1].deviceB, null);
   assert.equal(preview[1].verbosity, 3);
-  assert.equal('rpcEnabled' in preview[1], false);
   const status = posts.find(([p]) => p === '/api/worker/status');
-  assert.deepEqual(status[1], { worker_ssh: 'laptop' });
+  assert.deepEqual(status[1], { worker: 'laptop' });
+});
+
+test('Launch polls a worker only while its row is enabled (space toggles the focused row)', async (t) => {
+  const appStore = createAppStore();
+  appStore.onConnState('live');
+  appStore.onSSEEvent({
+    state: 'stopped', model: '', log: '',
+    launchConfig: {
+      modelPath: '/models/alpha-7b.gguf', build: 'vulkan-cuda', ctx: 8192, ngl: 99,
+      devices: [{ id: 'Vulkan1', name: 'AMD Radeon RX 7900 XTX' }, { worker: 'laptop', enabled: false }],
+    },
+  });
+  const posts = [];
+  const { Launch } = await import('../src/modes/launch.js');
+  const view = render(React.createElement(Launch, {
+    client: launchClient(posts, { status: 'stopped' }), appStore, serverUrl: 'http://localhost:3000', modeGateRef: { current: false }, onLaunched: () => {},
+  }));
+  t.after(view.unmount);
+  await sleep(150);
+  view.stdin.write('\t'); // hw group, row 1 (XTX) focused
+  await sleep(700);
+  assert.equal(posts.filter(([p]) => p === '/api/worker/status').length, 0, 'disabled worker is not polled');
+  assert.match(view.lastFrame() || '', /\[ \] RPC laptop/);
+  view.stdin.write('[B'); // down -> worker row
+  await sleep(100);
+  view.stdin.write(' ');
+  await sleep(400);
+  assert.ok(posts.some(([p, b]) => p === '/api/worker/status' && b.worker === 'laptop'), 'enabling the row starts polling');
+  assert.match(view.lastFrame() || '', /\[x\] RPC laptop.*\[STOPPED\]/);
+});
+
+test('Monitor draws one GPU panel per launch device and a row per worker host', async (t) => {
+  const { THREE_DEVICE_STATS } = await import('./panels.test.js');
+  const appStore = createAppStore();
+  appStore.onConnState('live');
+  appStore.onSSEEvent({ state: 'ready', model: 'm.gguf', isRpc: true, log: '', launchCommand: '/x/llama-server --port 8080', launchConfig: null });
+  appStore.onTelemetry({ t: Date.now(), stats: THREE_DEVICE_STATS });
+  const view = render(React.createElement(App, { client: clientStub, appStore, serverUrl: 'http://localhost:3000' }));
+  t.after(view.unmount);
+  await sleep(50);
+  const out = view.lastFrame() || '';
+  assert.match(out, /Vulkan1 · RX 7900 XTX/);
+  assert.match(out, /RPC0 · RTX 4090 Laptop@laptop/);
+  assert.match(out, /CUDA0 · RTX 3060/);
+  assert.match(out, /laptop\s+33%\s+77°C · ram 12\.0\/32\.0G/);
+  assert.doesNotMatch(out, /\(no rpc worker\)/);
 });
 
 test('Help overlay renders on ? key (via direct Help render)', async (t) => {

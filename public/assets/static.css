@@ -1,0 +1,17 @@
+/* ai lab -- static mode only (public/build-static.js pages; see assets/static-mode.js). One quiet line under the
+   header: where the numbers on the page come from. Understated like the rest of the site. */
+
+.site-status { display: flex; align-items: center; gap: 0.5rem; min-height: 1.25rem; padding-top: 0.6rem; font-family: var(--font-mono); font-size: 11.5px; color: var(--text-muted); }
+.site-status i { width: 6px; height: 6px; border-radius: 999px; background: #525867; flex: none; }
+.site-status[data-state="checking"] i { opacity: 0.5; }
+.site-status[data-state="live"] { color: var(--text-3); }
+.site-status[data-state="live"] i { background: #34d399; box-shadow: 0 0 8px rgba(52, 211, 153, 0.6); }
+.site-status[data-state="offline"] { color: #d6b36a; }
+.site-status[data-state="offline"] i { background: #d6b36a; }
+.site-status + #site-main { padding-top: 1.6rem; }
+
+/* the live page while the lab is away */
+.lab-offline { padding: 2.5rem 0; color: var(--text-3); font-size: 14px; line-height: 1.7; max-width: 62ch; }
+.lab-offline b { color: var(--text-1); font-weight: 600; }
+.lab-offline ul { margin: 0.6rem 0 0; padding-left: 1.1rem; color: var(--text-muted); font-size: 13px; }
+.lab-offline code { font-family: var(--font-mono); font-size: 12px; color: var(--text-2); }

@@ -7,9 +7,11 @@ import { loadConfig } from './src/config.js';
 import { McClient } from './src/client.js';
 import { createAppStore } from './src/state.js';
 import App from './src/app.js';
-import { listProfileEntries, saveProfile, deleteProfile } from './src/profiles.js';
+import { listProfileState, saveProfile, deleteProfile } from './src/profiles.js';
 import { profileTag } from './src/launchconfig.js';
-import { portFromCommand } from './src/format.js';
+import { isStrataConfig, profileModelLabel, profileListRows } from './src/launchplan.js';
+import { normalizeTopology } from './src/topology.js';
+import { portFromCommand, modelName, isLaunchableModel } from './src/format.js';
 
 // The TUI runs in the terminal's alternate screen buffer (like vim/btop) --
 // the mouse-click feature (src/mouse.js) needs the app to own a fixed,
@@ -31,7 +33,7 @@ process.on('exit', exitAltScreen);
 const program = new Command();
 program
   .name('llama-cli')
-  .description('btop-style terminal UI for Mission Control (llama.cpp dashboard)')
+  .description('btop-style terminal UI for LL-Dash (llama.cpp dashboard)')
   .version('2.0.0');
 
 // Token (tunnel-gate password) resolution: --token > MC_TOKEN > config.
@@ -97,6 +99,7 @@ async function probeGate(client) {
 program
   .command('models')
   .description('List GGUF models (via the dashboard API)')
+  .option('--all', 'also list mmproj files, draft heads and other non-model .gguf files', false)
   .option('-s, --server <url>', 'Dashboard URL', null)
   .option('--token <pw>', 'Tunnel-gate password', null)
   .action(async (opts) => {
@@ -105,8 +108,10 @@ program
       token: opts.token || tokenFrom(process.argv) || cfg.token || null,
     });
     try {
-      const models = await client.getJson('/api/models');
-      console.table(models.map((m) => ({ name: m.name, size: m.size + ' GB', source: m.source, path: m.path })));
+      const all = await client.getJson('/api/models');
+      // models only unless --all (mmproj files, draft heads, template carriers are listed too)
+      const models = opts.all ? all : all.filter(isLaunchableModel);
+      console.table(models.map((m) => ({ name: modelName(m.name), size: m.size + ' GB', ...(opts.all ? { kind: m.kind || '-' } : {}), source: m.source, path: m.path })));
     } catch (err) {
       console.error(`Failed: ${err.message} (is the dashboard running?)`);
       process.exit(1);
@@ -128,26 +133,37 @@ profileCmd
   .option('-s, --server <url>', 'Dashboard URL', null)
   .option('--token <pw>', 'Tunnel-gate password', null)
   .action(async (opts) => {
-    let entries;
+    let state;
     try {
-      // most-recently-used first, same order as the web dropdown + TUI picker
-      entries = await listProfileEntries(await profileClient(opts));
+      state = await listProfileState(await profileClient(opts));
     } catch (err) {
       console.error(`Failed: ${err.message}`);
       process.exit(1);
     }
-    if (entries.length === 0) {
-      console.log('No profiles found. Save one from Launch mode (press p) or:');
+    if (state.entries.length === 0) {
+      console.log('No profiles found. Save one from Launch mode (p in the config editor) or:');
       console.log('  llama-cli profile save <name> -m <model.gguf> [-a "--ctx 8192 --ngl 99"]');
       return;
     }
-    console.table(entries.map(({ name, config: p }) => {
+    // Same order as the TUI's list: the profiles this machine can run first
+    // (most recently used first), then the ones it can't, with the server's
+    // reason. A server that sends no availability lists them all as before.
+    const topology = normalizeTopology(state.topology);
+    const rows = profileListRows(state.entries, { availability: state.availability, topology });
+    if (topology) console.log(`machine: ${topology.signature}`);
+    const HERE = { ready: 'yes', moved: 'yes (ids moved)', substitute: 'stand-in card', unavailable: 'no' };
+    console.table(rows.map(({ name, config: p, avail, cards }) => {
+      const type = profileTag(p);
       return {
         name,
-        type: profileTag(p),
-        worker: p.rpcTarget ? `${p.rpcTarget}${p.transport ? ` (${p.transport})` : ''}` : '-',
-        model: p.modelPath ? p.modelPath.split('/').pop() : '-',
-        build: p.build || '-',
+        type,
+        ...(state.availability ? { 'runs here': HERE[avail.status] } : {}),
+        // where the launch sits (the server's placement text), or why it can't run here
+        placement: cards,
+        transport: type === 'RPC' && p.transport ? p.transport : '-',
+        // a Strata-engine profile has a base config file instead of a model/build
+        model: isStrataConfig(p) ? profileModelLabel(p) : (p.modelPath ? modelName(p.modelPath) : '-'),
+        build: isStrataConfig(p) ? 'strata' : (p.build || '-'),
         ctx: p.ctx != null ? p.ctx : '-',
         ngl: p.ngl != null ? p.ngl : '-',
         args: p.argString || '-',
@@ -188,6 +204,23 @@ profileCmd
     try {
       await deleteProfile(await profileClient(opts), name);
       console.log(`Deleted profile "${name}"`);
+    } catch (err) {
+      console.error(`Failed: ${err.message}`);
+      process.exit(1);
+    }
+  });
+
+// livechat -- the running benchmark's conversation (codebench proxy tap), printed as it streams.
+program
+  .command('livechat')
+  .description("Stream the running benchmark's agent/model conversation (needs codebench's record-proxy --tap)")
+  .option('-s, --server <url>', 'Dashboard URL', null)
+  .option('--token <pw>', 'Tunnel-gate password', null)
+  .action(async (opts) => {
+    const cfg = await loadConfig();
+    const { runLivechat } = await import('./src/livechat.js');
+    try {
+      await runLivechat({ baseUrl: opts.server || process.env.MC_SERVER || cfg.server, token: opts.token || tokenFrom(process.argv) || cfg.token || null });
     } catch (err) {
       console.error(`Failed: ${err.message}`);
       process.exit(1);
@@ -242,7 +275,7 @@ tunnelCmd
 
 // Known subcommands; anything else is the TUI (so `llama-cli --server ...`
 // reaches the TUI instead of erroring as an unknown commander option).
-const KNOWN_SUBCOMMANDS = new Set(['models', 'profile', 'tunnel']);
+const KNOWN_SUBCOMMANDS = new Set(['models', 'profile', 'tunnel', 'livechat']);
 const sub = process.argv[2];
 
 function flagServer() {
@@ -256,7 +289,7 @@ function flagServer() {
 
 if (!KNOWN_SUBCOMMANDS.has(sub)) {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    console.error('llama-cli (TUI) requires a terminal. Use a subcommand (models, profile) for non-interactive use.');
+    console.error('llama-cli (TUI) requires a terminal. Use a subcommand (models, profile, tunnel, livechat) for non-interactive use.');
     process.exit(1);
   }
 
@@ -290,9 +323,18 @@ if (!KNOWN_SUBCOMMANDS.has(sub)) {
   client.connect();
 
   // Telemetry poller (the server caches monitor.py samples; this never
-  // shells out on the CLI side).
+  // shells out on the CLI side). The machine's topology (its cards and RPC
+  // workers -- what Monitor's panels and Launch's labels are named from) is
+  // asked for on the same timer, every 30s: it changes when a card or a build
+  // does, not per sample. A server without the route leaves it unknown.
   let backfilled = false;
+  let topologyAskedAt = 0;
+  const TOPOLOGY_REFRESH_MS = 30000;
   const poll = async () => {
+    if (Date.now() - topologyAskedAt >= TOPOLOGY_REFRESH_MS) {
+      topologyAskedAt = Date.now();
+      client.getJson('/api/topology').then((tp) => appStore.onTopology(tp)).catch(() => {});
+    }
     try {
       const d = await client.getJson('/api/telemetry/latest');
       appStore.onTelemetry(d);

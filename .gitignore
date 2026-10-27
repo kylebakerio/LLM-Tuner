@@ -1,3 +1,44 @@
 node_modules/
 dashboard.config.json
 __pycache__/
+
+# runtime state and editor backups
+sweep-state.json
+*.bak-*
+
+# static build of the public site (public/build-static.js) and its deploy state
+public/dist-static/
+public/dist-static.tmp-*/
+public/dist-static.old-*/
+public/.static-deployed.json
+public/.netlify/
+public/.wrangler/
+
+# kept local, never published (pre-push sweep 2026-10-27: benchmark lab notes, fixtures from real benchmark runs,
+# private notes, runtime data, backups, staging copies, local tool settings). A tracked file listed here stays tracked
+# in the local history; the public commit is built without it (reviews/push-sweep-20261027/build-squash.sh).
+RESULTS.md
+EXPERIMENTS.md
+OPENCODE-CODEBENCH-PLAN.md
+reddit-post-*.md
+BEST-CONFIGS.md
+TB4-EGPU-XTX-POST.md
+docs/archive/BENCH-FINDINGS-DESKTOP-*.md
+test/codebench.test.js
+test/fixtures/codebench/taskinfo-*
+test/fixtures/codebench/events*
+test/fixtures/codebench/results/
+test/fixtures/codebench/transcripts/agy.jsonl
+test/fixtures/codebench/transcripts/claude.jsonl
+test/fixtures/codebench/transcripts/opencode.jsonl
+session-*.md
+logs/
+weights-registry.json
+*.orig
+*.old-*
+public/staged-*/
+.claude/
+scratch/
+.pytest_cache/
+# machine-local site values kept out of the repo (the workers.dev subdomain is built from the account e-mail; 2026-10-27)
+public/site.config.local.json

@@ -1,7 +1,7 @@
 {
   "name": "llama-cli-tui",
   "version": "2.0.0",
-  "description": "btop-style terminal UI for Mission Control (llama.cpp dashboard)",
+  "description": "btop-style terminal UI for LL-Dash (llama.cpp dashboard)",
   "main": "cli.js",
   "type": "module",
   "bin": {

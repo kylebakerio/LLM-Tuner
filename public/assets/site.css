@@ -1,0 +1,119 @@
+/* ai lab -- the public site. Builds on vendor/tailwind.css (the dashboard's tokens and components: .card, .chip,
+   .prose, .tile ...); this file is only the site's own frame. Understated on purpose. */
+
+:root { --site-max: 1080px; --site-wide: 1600px; }
+
+body.site {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background:
+        radial-gradient(1200px 500px at 15% -10%, rgba(114, 117, 244, 0.07), transparent 60%),
+        var(--bg);
+    color: var(--text-1);
+    font-family: var(--font-sans);
+}
+.site-wrap { width: 100%; max-width: var(--site-max); margin: 0 auto; padding: 0 20px; box-sizing: border-box; }
+body.site[data-section="results"] .site-wrap { max-width: var(--site-wide); }
+
+.site-head { position: sticky; top: 0; z-index: 40; border-bottom: 1px solid var(--border); background: rgba(12, 13, 17, 0.82); backdrop-filter: blur(10px); }
+.site-head-row { display: flex; align-items: center; gap: 1.5rem; height: 56px; }
+.site-mark { display: inline-flex; align-items: center; gap: 0.55rem; font-family: var(--font-mono); font-size: 14px; font-weight: 600; color: #fff; text-decoration: none; letter-spacing: -0.01em; }
+.site-dot { width: 8px; height: 8px; border-radius: 999px; background: #34d399; box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.15), 0 0 12px rgba(52, 211, 153, 0.6); }
+.site-dot.is-idle { background: #525867; box-shadow: none; }
+.site-nav { display: flex; gap: 0.15rem; margin-left: auto; overflow-x: auto; scrollbar-width: none; }
+.site-nav::-webkit-scrollbar { display: none; }
+.site-nav a { padding: 0.35rem 0.7rem; border-radius: 7px; font-size: 13px; color: var(--text-3); text-decoration: none; white-space: nowrap; }
+.site-nav a:hover { color: var(--text-1); background: rgba(255, 255, 255, 0.04); }
+.site-nav a.is-on { color: #fff; background: var(--surface-2); }
+
+#site-main { flex: 1; padding-top: 2.5rem; padding-bottom: 4rem; }
+.site-foot { display: flex; flex-wrap: wrap; gap: 0.75rem 1.5rem; justify-content: space-between; padding-top: 1.5rem; padding-bottom: 2rem; border-top: 1px solid var(--border); font-size: 12px; color: var(--text-muted); }
+.site-foot-links { display: flex; gap: 1.1rem; }
+.site-foot a { color: var(--text-3); text-decoration: none; }
+.site-foot a:hover { color: #fff; }
+
+/* type */
+.site-kicker { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); letter-spacing: 0.02em; }
+.site-h1 { font-size: clamp(26px, 4vw, 38px); line-height: 1.15; font-weight: 600; letter-spacing: -0.025em; color: #fff; margin: 0.6rem 0 1rem; max-width: 22ch; }
+.site-lede { font-size: 16px; line-height: 1.7; color: var(--text-2); max-width: 62ch; }
+/* the home page's intro is a document (markdown, pages/home.md): a div of blocks -- paragraphs, maybe a list */
+div.site-lede > * + * { margin-top: 1rem; }
+div.site-lede ul, div.site-lede ol { padding-left: 1.25rem; list-style: disc; }
+div.site-lede ol { list-style: decimal; }
+div.site-lede strong { color: var(--text-1); font-weight: 600; }
+.site-lede a, .site-text a { color: #a6acff; text-decoration: underline; text-decoration-color: rgba(166, 172, 255, 0.35); text-underline-offset: 3px; }
+/* the home intro may hold one small table (pages/home.md): it may use the page width, the paragraphs keep their measure */
+div.site-lede { max-width: none; }
+div.site-lede > :not(table) { max-width: 62ch; }
+div.site-lede table { display: block; overflow-x: auto; border-collapse: collapse; font-size: 13.5px; line-height: 1.5; }
+div.site-lede th, div.site-lede td { padding: 0.4em 1em 0.4em 0; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+div.site-lede th { font-weight: 600; white-space: nowrap; }
+div.site-lede td:first-child { white-space: nowrap; }
+.site-h2 { font-size: 13px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); margin: 0 0 1rem; display: flex; align-items: center; gap: 0.6rem; }
+.site-h2 a { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 500; color: var(--text-3); text-decoration: none; font-size: 12.5px; }
+.site-h2 a:hover { color: #fff; }
+.site-section { margin-top: 3.25rem; }
+.site-text { font-size: 15px; line-height: 1.75; color: var(--text-2); max-width: 66ch; }
+.site-text p { margin: 0 0 1rem; }
+.site-empty { padding: 3rem 0; text-align: center; color: var(--text-muted); font-size: 14px; }
+.site-empty a { color: #a6acff; }
+
+/* headline numbers */
+.stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; margin-top: 2rem; }
+.stat { background: var(--surface-1); padding: 1rem 1.1rem; }
+.stat b { display: block; font-family: var(--font-mono); font-size: 24px; font-weight: 600; color: #fff; letter-spacing: -0.02em; }
+.stat span { font-size: 12px; color: var(--text-muted); }
+
+/* live lanes */
+.lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.lane { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 1rem 1.1rem; min-width: 0; }
+.lane-head { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.7rem; }
+.lane-card { font-family: var(--font-mono); font-size: 12px; font-weight: 600; color: var(--text-2); background: var(--surface-3); padding: 0.1rem 0.45rem; border-radius: 5px; }
+.lane-engine { font-size: 12px; color: var(--text-muted); }
+.lane-phase { margin-left: auto; display: inline-flex; align-items: center; gap: 0.35rem; font-family: var(--font-mono); font-size: 12px; color: var(--text-3); }
+.lane-phase i { width: 7px; height: 7px; border-radius: 999px; background: #525867; display: inline-block; }
+.lane-phase.is-gen { color: #6ee7b7; } .lane-phase.is-gen i { background: #34d399; box-shadow: 0 0 8px #34d399; }
+.lane-phase.is-prefill { color: #7dd3fc; } .lane-phase.is-prefill i { background: #38bdf8; box-shadow: 0 0 8px #38bdf8; }
+.lane-model { font-size: 15px; font-weight: 600; color: #fff; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lane-battery { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 0.15rem; }
+.lane-task { margin-top: 0.8rem; font-size: 12.5px; color: var(--text-3); }
+.lane-task code { font-family: var(--font-mono); font-size: 12px; color: var(--text-1); }
+.lane-bar { height: 4px; border-radius: 999px; background: var(--surface-3); overflow: hidden; margin-top: 0.55rem; }
+.lane-bar > span { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, #5f5de6, #8c91fd); }
+.lane-foot { display: flex; justify-content: space-between; margin-top: 0.45rem; font-size: 11.5px; color: var(--text-muted); font-family: var(--font-mono); }
+/* the running queue item's question and its passed / failed / left tally (only when /api/live carries them) */
+.lane-q { margin-top: 0.8rem; padding-left: 0.7rem; border-left: 2px solid rgba(140, 145, 253, 0.45); font-size: 13px; line-height: 1.5; color: var(--text-2); overflow-wrap: anywhere; }
+.lane-q > span { display: block; font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); }
+.lane-foot.has-tally { flex-wrap: wrap; gap: 0.15rem 0.9rem; }
+.lane-tally b { font-weight: 600; }
+.lane-tally .is-pass { color: #6ee7b7; }
+.lane-tally .is-fail { color: #fca5a5; }
+.lab-offline-q { color: var(--text-3); margin: 0.1rem 0 0.5rem; }
+
+/* writing */
+.posts { display: flex; flex-direction: column; }
+.post-row { display: grid; grid-template-columns: 7.5rem 1fr; gap: 1rem; padding: 1rem 0; border-top: 1px solid var(--border); text-decoration: none; }
+.post-row:first-child { border-top: 0; }
+.post-row time { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); padding-top: 0.15rem; }
+.post-row h3 { margin: 0; font-size: 16px; font-weight: 600; color: #fff; letter-spacing: -0.01em; }
+.post-row p { margin: 0.3rem 0 0; font-size: 14px; color: var(--text-3); line-height: 1.55; }
+.post-row:hover h3 { color: #c7cbff; }
+@media (max-width: 640px) { .post-row { grid-template-columns: 1fr; gap: 0.25rem; } }
+
+.post { max-width: 720px; margin: 0 auto; }
+.post-back { font-size: 13px; color: var(--text-muted); text-decoration: none; }
+.post-back:hover { color: #fff; }
+.post-title { font-size: clamp(26px, 4vw, 36px); line-height: 1.2; font-weight: 650; letter-spacing: -0.025em; color: #fff; margin: 1rem 0 0.6rem; }
+.post-meta { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); margin-bottom: 2rem; }
+.post-tag { color: var(--text-3); }
+.post-body { font-size: 15.5px; }
+.post-body ul { margin: 0.5rem 0 1.25rem; }
+.post-body li { margin: 0.45rem 0; }
+.post-body table { font-size: 13.5px; }
+
+/* results: the dashboard's Models module, without its app chrome */
+#models-view { min-width: 0; }
+
+.about-links { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 1.25rem; }

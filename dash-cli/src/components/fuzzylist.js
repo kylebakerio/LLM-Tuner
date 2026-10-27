@@ -1,24 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
 import { h } from '../h.js';
-
-// Subsequence fuzzy match: returns a sort score (lower is better) or null.
-// Case-insensitive.
-function fuzzyScore(query, text) {
-  const q = query.toLowerCase();
-  const t = text.toLowerCase();
-  if (!q) return 0;
-  let qi = 0;
-  let end = -1;
-  for (let ti = 0; ti < t.length; ti++) {
-    if (t[ti] === q[qi]) {
-      qi++;
-      end = ti;
-      if (qi === q.length) break;
-    }
-  }
-  return qi === q.length ? end : null;
-}
+import { fuzzyScore } from '../format.js';
 
 // Selectable, type-to-filter list. `items` is [{ label, hint?, value }].
 // Keys: up/down (or j/k) move, Enter selects, Esc/q cancels, printable keys

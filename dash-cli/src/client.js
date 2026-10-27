@@ -1,6 +1,6 @@
 import { Readable } from 'node:stream';
 
-// Client for the Mission Control backend (server4.js).
+// Client for the LL-Dash backend (server4.js).
 //
 // Two legs:
 //   1. plain JSON REST (getJson/postJson) -- one-shot requests

@@ -1,283 +1,388 @@
-# Mission Control
+# LL-Dash
 
-A single-host dashboard for running and measuring llama.cpp models on local
-GPU(s), with an optional remote RPC worker. It launches `llama-server`
-natively, watches it over an SSE stream, captures per-request performance for
-*any* client that hits the model's OpenAI endpoint (this dashboard's own
-chat, opencode, curl — anything), benchmarks hardware with `llama-bench`, and
-logs every request to CSV for later comparison.
+LL-Dash is a self-hosted control room for running llama.cpp models on your own
+GPUs. It launches `llama-server` (or the optional Strata engine) on any mix of
+local cards and remote RPC workers. It records the speed of every request,
+whichever client sent it, and shows live hardware telemetry. It also runs speed
+benchmarks and keeps a catalog of models and launch configs with their measured
+results.
 
-It serves the UI and all `/api/*` endpoints on **port 3000**. Run it under
-pm2 (see below) or `node server4.js` in the foreground.
+It has four parts:
 
-## Files
+- a Node.js server (`server4.js`, port 3000);
+- a browser UI that needs no build step;
+- a small Python telemetry helper (`monitor.py`);
+- a terminal client (`dash-cli/`).
 
-| File | What it is |
+It is designed for one Linux machine with one operator. **Read
+[Security and remote access](#security-and-remote-access) before you expose it
+to a network.**
+
+> **Status:** personal lab software, developed and used on a small number of
+> machines. Expect rough edges on hardware it has not run on.
+
+## Features
+
+- **Launch `llama-server`** from any of several configured llama.cpp builds,
+  on an ordered list of local GPUs and RPC workers. Each device can have its
+  own share, and the split mode is layer or tensor. The raw command box is
+  exactly what runs.
+- **Saved launch profiles**, shared by the web UI and the CLI. Devices are
+  saved by card as well as id, so a profile follows its card when device ids
+  shift, or when it moves to another machine.
+- **RPC workers.** LL-Dash starts and stops `ggml-rpc-server` on other machines
+  over SSH, and by default carries RPC through an SSH forward.
+- **Strata engine (optional).** Launches configs from one or more Strata
+  installs, with per-launch overrides.
+- **Request capture from any client.** Every request to the model gets a row:
+  token counts, t/s, wall time, draft acceptance, and a hardware time series for
+  that request.
+- **Live telemetry** for NVIDIA and AMD GPUs, the host's CPU, RAM and network,
+  and the GPUs of RPC workers.
+- **History**, kept in a CSV file and in a SQLite database.
+- **Speed benchmarking:** `llama-bench` runs, launch sweeps of the real server
+  (including speculative decoding), and public coding suites.
+- **Results catalog:** one record per model, with speed by launch config and
+  context depth, history and side-by-side comparisons. GGUF files are
+  identified by their content.
+- **Built-in chat** with attachments, thinking control, and server-side web
+  search and fetch tools.
+- **A terminal client** (`dash-cli/`) with Monitor, Launch and Chat modes.
+- **Remote access** through a Cloudflare tunnel, behind a password gate.
+- **Optional extras:**
+  - views and a run queue for an external coding-benchmark harness;
+  - a separate, read-only public results site.
+
+## Requirements
+
+**Required**
+
+- **Linux.** The code reads `/proc`, `/sys/class/hwmon` and `/sys/bus/pci`, and
+  uses `ss` (iproute2) and `flock`.
+- **Node.js 20.** This is the version it is developed on; there is no `engines`
+  field. `better-sqlite3` is a native module, so `npm install` either downloads
+  a prebuilt binary or builds one (that needs a C++ toolchain and Python).
+- **Python 3** for `monitor.py`, standard library only.
+- **One or more llama.cpp builds** that provide `llama-server`.
+  - `llama-bench` is needed for the Bench tab.
+  - Each RPC worker needs `ggml-rpc-server`, built from the same llama.cpp
+    commit as the master.
+
+**For GPU telemetry**
+
+- `nvidia-smi` for NVIDIA cards, and `amdgpu_top` for AMD cards. Other GPUs can
+  be launched on but show no readings.
+
+**Optional**
+
+| Tool | Needed for |
 |---|---|
-| `server4.js` | The backend: HTTP server + SSE state stream. Spawns/stops `llama-server`, parses its log lines (model status, per-request timing, fatal errors), writes the benchmark CSV, spawns `monitor.py`. |
-| `monitor.py` | Telemetry child process on **port 8081**: GPU/CPU/VRAM/power/temp via `nvidia-smi`/`amdgpu_top` — for this machine, a second local GPU, or a remote worker over SSH. |
-| `index.html` / `script.js` | The frontend. Single page, no build step, fully offline (see below). |
-| `dashboard.config.json` | User-editable and gitignored: the `llamaServerBuilds` list (id/label/path) behind the "Build" selector. See `dashboard.config.example.json`. Missing/invalid file falls back to the built-in default build. |
-| `ecosystem.config.js` | pm2 config (see below). |
-| `vendor/` | Vendored Chart.js / marked / prebuilt Tailwind CSS (offline support). |
-| `logs/` | Created at runtime: `benchmarks.csv` (one row per completed request) + `bench-history.log` (bench/sweep transcript, tail reloaded on boot). |
+| [pm2](https://pm2.keymetrics.io/) | keeping the server running |
+| `ssh` with non-interactive (key-based) login | RPC workers and worker telemetry |
+| `cloudflared` | remote access |
+| `gh`, logged in | the posts editor |
+| a Strata install | the Strata engine |
+| `evalplus`, or the Aider benchmark checkout plus Docker | the public coding suites |
+| Node.js 22+ (for `wrangler`) | deploying the static public site |
 
-## Ports
+## Quick start
 
-| Port | What |
+LL-Dash keeps its runtime data **next to** the checkout, not inside it, so give
+it a parent directory of its own:
+
+```bash
+mkdir -p ~/llm-lab && cd ~/llm-lab
+git clone <repository-url> dashboard
+cd dashboard
+npm install
+cp dashboard.config.example.json dashboard.config.json   # then edit it (see Configuration)
+node server4.js                                          # open http://localhost:3000
+```
+
+After the first run, the layout is:
+
+```
+~/llm-lab/
+  dashboard/        this repository
+    logs/           device-list cache and a code stamp (small, per machine)
+  logs/             created at runtime: request CSV, SQLite database, launch
+                    profiles, bench transcript, derived Strata configs
+  models/           optional: GGUF files or symlinks to them (scanned first)
+```
+
+To keep it running in the background, see [Under pm2](#under-pm2). For a tour
+of the interface, see [docs/web-ui.md](docs/web-ui.md).
+
+## Configuration
+
+`dashboard.config.json` holds every per-machine setting.
+
+- It is gitignored, and every key is optional.
+- `dashboard.config.example.json` is a neutral starting point. It works
+  unchanged with llama.cpp built in `~/llama.cpp/build` and models in
+  `~/models`.
+- If the file is missing or invalid, LL-Dash falls back to one build at
+  `~/llama.cpp/build/bin/llama-server`.
+- [TOPOLOGY.md](TOPOLOGY.md) ("Configuration") is the full reference.
+
+| Key | What it sets |
 |---|---|
-| 3000 | Dashboard UI + API |
-| 8080 | `llama-server` (default; a `--port` in the raw command box overrides it, and the telemetry follows) |
-| 8081 | `monitor.py` telemetry |
-| 50052 | Remote RPC worker (llama.cpp RPC) |
+| `pathRoots` | `{ "NAME": "path" }`: roots usable as `${NAME}` in any path here and in saved profiles. |
+| `modelsRoot` | Where this machine keeps its models. It is scanned, available as `${MODELS}`, and is the base for relative model paths. |
+| `llamaServerBuilds` | `[{ id, label, path }]`: the `llama-server` binaries in the Build selector. |
+| `modelDirs` | More directories to scan for GGUF files. |
+| `rpcWorkers` | Other machines' GPUs, by name. See [RPC workers](docs/launching-models.md#rpc-workers). |
+| `strataInstalls` | Strata install directories, with the current one first. Empty means no Strata. |
+| `llamaHost` | The address `llama-server` listens on. The default is `127.0.0.1`. |
+| `remoteAccess` | The tunnel and password gate. See [below](#tunnel-and-password-gate). |
+| `deviceNames`, `machineNames`, `modelDisplayNames`, `reliabilityNotes` | Display names and hardware notes for recorded runs. |
 
-Models are picked from top-level `.gguf` files in `../models` (next to this
-directory) or from the local Hugging Face cache
-(`~/.cache/huggingface/hub`, or `$HF_HOME`/`$HUGGINGFACE_HUB_CACHE`).
+The example file also lists keys used only by the optional benchmark
+integration. Leave those empty if you don't use it.
 
-## UI tabs
+**Paths.**
 
-- **Interactive** — the dashboard's own chat client against the launched
-  model: image attach (paths or file picker), a per-request thinking level
-  (`template default` / `on` xhigh/medium/low / `off`, via
-  `chat_template_kwargs`), a show/hide-thinking display toggle, and an
-  "allow web search" tool (keyless DuckDuckGo, run server-side).
-- **Monitor** — per-request telemetry, session-only. Capture is
-  *client-agnostic*: the server parses `llama-server`'s own `print_timing`
-  lines, so a request from any client gets a row (prompt/gen tokens + tps,
-  wall time, load time, draft-acceptance stats) plus an "omni" graph of GPU
-  power/temp/utilization/VRAM sampled over the request's life.
-- **History** — the persisted view: recent rows and aggregate stats
-  (best/avg prefill, gen, wall time; the last run's full config) from
-  `logs/benchmarks.csv`, filterable by model + transport, with a CSV download.
-- **Bench** — `llama-bench` hardware runs (single or matrix; the matrix queue
-  lives *server-side*, so it keeps running if you close the tab) and sweeps
-  that bench the real `llama-server`, including the speculative-decoding
-  stack that `llama-bench` can't exercise.
+- A leading `~` and `${NAME}` (from `pathRoots`, otherwise the environment) are
+  expanded. Nothing else in a path is changed.
+- An absolute path is used exactly as written.
+- `tools/migrate-profile-paths.js` shows the portable spelling of an existing
+  profile store.
 
-Launch settings live in the left sidebar: model, build, ctx/ngl, device A/B
-(auto-detected on load, manual override available), tensor split, KV cache
-types, speculative decoding, sampling params, and a Flag Reference popover
-(parsed from the selected build's `--help`) that click-inserts flags. Saved
-setups persist as launch profiles in the browser.
+Example (every value is a placeholder):
 
-## Launching: local GPU(s) + optional RPC worker
-
-The master (`llama-server`) always launches natively now -- there's no more
-Docker-vs-local mode choice. `dashboard.config.json`'s `llamaServerBuilds`
-picks which compiled binary to run (e.g. Vulkan-only vs. a combined
-CUDA+Vulkan build), and up to two local devices (GPU A / GPU B) can be
-selected for a split, both detected automatically on page load.
-
-**The raw command box is the source of truth.** The structured fields seed
-the box (via the preview endpoint) on every change, but whatever text is in
-the box at Boot time is what gets tokenized and run. `-m`, `--port`, and
-`--rpc` in the box are synced back into the server-side launch config, so
-the CSV row, the `/slots` poll, and worker telemetry all use the values that
-actually ran. Launches are validated server-side (model path present, finite
-ctx/ngl, port 1–65535, a valid build) — a bad launch returns a clean error
-in the UI instead of leaving the dashboard stuck in "starting".
-
-RPC Worker is a separate, optional toggle (off by default) that adds a remote
-`llama.cpp` RPC worker as a second compute target alongside your local GPU(s).
-Enabling it forces GPU B back to "None" -- the split is always exactly 2-way
-(this machine vs. the worker), not a 3-way local+local+remote split.
-
-**RPC needs a local build compiled with `-DGGML_RPC=ON`** (the Vulkan
-`build/` has it as of 2026-09-13; `build-cuda-vulkan` does not):
-
-```bash
-cmake -B build -DGGML_RPC=ON
-cmake --build build --config Release -j$(nproc) --target llama-server ggml-rpc-server llama-bench
+```json
+{
+  "pathRoots": { "LLAMA": "~/llama.cpp" },
+  "modelsRoot": "~/models",
+  "llamaServerBuilds": [
+    { "id": "all",    "label": "CUDA + ROCm + Vulkan", "path": "${LLAMA}/build-all/bin/llama-server" },
+    { "id": "vulkan", "label": "Vulkan only",          "path": "${LLAMA}/build-vulkan/bin/llama-server" }
+  ],
+  "rpcWorkers": {
+    "worker1": { "ssh": "user@worker-host", "localPort": 50052, "devices": "Vulkan0" }
+  },
+  "remoteAccess": {
+    "tunnelConfig": "~/.cloudflared/<tunnel>.yml",
+    "url": "https://dash.example.com",
+    "autoStart": true,
+    "passwordFile": "~/.config/ai-dashboard/tunnel-password"
+  }
+}
 ```
 
-**The worker runs a bare `ggml-rpc-server` binary -- no Docker.** It's
-configured by the `rpcWorker` block in `dashboard.config.json` (`ssh`,
-`port`, `binary`, `devices`, `logFile`; see the example file). The RPC Worker
-box's Start/Stop/Status/Logs buttons (and dash-cli's `w`) SSH to the worker
-and run `setsid nohup <binary> -H 0.0.0.0 -p <port> -d <devices>`,
-`pkill -x`, `pgrep -x`, and `tail` on the log file. SSH must work
-non-interactively (`BatchMode=yes`) for the `user@host` in the worker field.
+**Where models are found.** These locations are scanned recursively, in this
+order. A file reachable by more than one path is listed once.
 
-The worker binary must speak the same RPC protocol major version (and a
-minor version no newer) as the master -- build it from the **same llama.cpp
-commit**. The worker laptop has no build toolchain, so it's built here as a
-portable binary (ggml linked statically; still needs the system libstdc++,
-libgomp and libvulkan) and copied over:
+1. `../models`
+2. `/data/models` (fixed in the code; skipped if it doesn't exist)
+3. the Hugging Face cache (`$HF_HOME`, else `$HUGGINGFACE_HUB_CACHE`, else
+   `~/.cache/huggingface/hub`)
+4. `modelsRoot`
+5. each entry of `modelDirs`
 
-```bash
-cmake -B build-rpc-worker -DGGML_VULKAN=ON -DGGML_RPC=ON -DBUILD_SHARED_LIBS=OFF \
-  -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release \
-  -DVulkan_GLSLC_EXECUTABLE=/home/kyle/Downloads/1.4.357.0/x86_64/bin/glslc
-cmake --build build-rpc-worker -j$(nproc) --target ggml-rpc-server
-scp build-rpc-worker/bin/ggml-rpc-server laptop:llama-rpc/
-```
+Split GGUFs appear as one entry, and mmproj files are paired with their models.
 
-(`GGML_NATIVE=OFF` because the worker's CPU differs from this one; the
-explicit `glslc` because miniconda's older `glslc` on PATH can't compile the
-coopmat2 shaders.) The worker needs only the Vulkan loader and the GPU
-driver's ICD. Keep `rpcWorker.devices` pinned to one device: by default
-`rpc-server` serves *every* non-CPU device, which would add extra RPC
-devices and break the 2-way `-ts`.
+**Environment variables**
 
-**Device list is pinned when RPC is on.** With GPU A set, `resolveLaunchCommand`
-emits `--rpc host:port ... -dev <GPU A>,RPC0` (RPC devices are named `RPC<n>`
-by ggml-rpc, numbered across all `--rpc` servers; `--rpc` must come before
-`-dev`), so `-ts N,M` always maps N to the local GPU and M to the worker.
-`llama-server --rpc host:port --list-devices` shows the names. RPC together with a local GPU B (3-way split) is still
-unsupported -- the GUI forces GPU B to "None" when RPC is on.
-
-`ggml-rpc-server` has no authentication; it listens on the LAN while running.
-Stop it when you're done.
-
-## What stops a running model server
-
-Only genuinely fatal log lines stop the server: `failed to fit params to free
-device memory`, `llama_server: fatal error`, `segfault`, `out of memory`
-(case-insensitive). Non-fatal lines that merely *contain* `error:` or
-`abort` — client disconnects, per-request HTTP errors — are echoed to the
-log but ignored; an earlier substring check would have killed a healthy model
-over a single bad client request. A process that exits on its own is handled
-by the normal close/shutdown path either way. The Stop button sends SIGTERM
-and escalates to SIGKILL after 3 seconds for a process that ignores it.
-
-## Orphan cleanup on startup
-
-At boot the dashboard `fuser -k`s whatever is holding **8080** and **8081**
-before it starts its own processes. This recovers from a previous dashboard
-crash that left an orphaned `llama-server`/`monitor.py` behind — which would
-otherwise block the next launch with EADDRINUSE. The flip side: restarting
-the dashboard while a model is *deliberately* running kills it too, so
-expect to hit "Boot Cluster" again after any restart (pm2 or manual).
-
-## Remote access (Cloudflare tunnel + password gate)
-
-The sidebar's **Remote access (Cloudflare tunnel)** toggle (or
-`POST /api/tunnel`) publishes the dashboard to a random
-`https://xxx.trycloudflare.com` via a Cloudflare quick tunnel
-(`cloudflared tunnel`, no account) and arms a **hard password gate on all
-traffic** at the same time. While it's up:
-
-- a **browser** can open the live web dash at the tunnel URL — it lands on a
-  login page, and the password sets an `mc_session` cookie;
-- a **remote CLI** can reach the local backend:
-  `llama-cli -s https://xxx.trycloudflare.com --token <password>`
-  (the CLI probes the gate and prompts for the password, or takes
-  `--token`/`MC_TOKEN`).
-
-The gate is **global**, not just for tunnel traffic: cloudflared forwards
-from localhost, so tunnel and local requests are indistinguishable — while
-the tunnel is up, *every* request (including your own local browser after a
-refresh) must carry `Authorization: Bearer <password>` or the session
-cookie. The only unauthenticated response is the gate page itself. Stopping
-the tunnel (sidebar, `llama-cli tunnel stop`, or restarting the dashboard)
-drops the gate and local access returns to normal.
-
-Security notes: the password is held in server memory only (PBKDF2 + a
-random per-boot salt) — **a dashboard restart revokes the tunnel, the gate,
-and every session**, and the URL changes on every start. A failed tunnel
-start clears all gate state, so it can never leave you locked out.
-`cloudflared` must be on the host's `PATH`; the dashboard's shutdown handler
-kills the cloudflared child on SIGINT/SIGTERM. See `API.md`
-("Remote access (tunnel gate)") for the exact endpoints.
-
-## Offline / no external dependencies
-
-The frontend used to load Tailwind, Chart.js, and marked from public CDNs, so
-the dashboard wouldn't render without internet access. Those are now vendored
-locally under `vendor/` (`vendor/chart.js`, `vendor/marked.min.js`,
-`vendor/tailwind.css`) and referenced from `index.html` via relative paths, so
-the site works fully offline once served by `server4.js`. (The one
-internet-reachable feature is the tunnel's keyless DuckDuckGo web search,
-used only when a chat enables the web-search tool.)
-
-`vendor/tailwind.css` is a pre-built, purged stylesheet (via the Tailwind CLI,
-config in `tailwind.config.js`) rather than the Tailwind CDN's in-browser JIT
-compiler. If you add new Tailwind classes to `index.html` or `script.js`,
-rebuild it:
-
-```bash
-npm install        # one-time, pulls in the tailwindcss dev dependency
-npm run build:css  # regenerates vendor/tailwind.css
-```
-
-This build step needs internet/npm; the resulting `vendor/tailwind.css` is
-committed so end users never need to run it themselves.
-
-## Running the dashboard under pm2
-
-`server4.js` is the dashboard backend. It's the process that spawns the
-master `llama-server` directly (no Docker — the master has been a native
-launch since the refactor), reaches the remote worker over SSH (Docker
-compose on the *worker* machine), spawns `monitor.py` as a child, and serves
-the SSE state stream + HTTP API the UI depends on. Because a crash in this
-process used to take the whole dashboard down until someone manually
-restarted it (see `dashboard-bugs1-analysis.md` item 13), it now runs under
-[pm2](https://pm2.keymetrics.io/), a Node process manager that auto-restarts
-it if it ever dies.
-
-`monitor.py` is not managed separately — `server4.js` spawns it on startup
-and kills it on shutdown (along with any running `llama-server` and bench
-process), so a single pm2 entry for `server4.js` covers everything.
-
-### Config
-
-Process settings live in `ecosystem.config.js`:
-
-```js
-module.exports = {
-  apps: [{
-    name: 'dashboard',
-    script: 'server4.js',
-    cwd: __dirname,
-    restart_delay: 2000,   // wait 2s between restart attempts
-    max_restarts: 20,      // give up after 20 restarts within min_uptime windows (crash-loop guard)
-    min_uptime: 5000,      // must stay up 5s to count as a stable start
-    autorestart: true
-  }]
-};
-```
-
-`max_restarts`/`min_uptime` together are a crash-loop guard: if something is
-broken badly enough that the process dies within 5s of every restart, pm2
-gives up after 20 attempts instead of restart-looping forever.
-
-### Common commands
-
-Run these from this directory (`/home/kyle/AI/experiment-1/dashboard`).
-
-| Command | What it does |
+| Variable | Effect |
 |---|---|
-| `pm2 start ecosystem.config.js` | Start the dashboard (first time, or after a full stop) |
-| `pm2 status` | Show whether it's online, its PID, uptime, and restart count (`↺`) |
-| `pm2 logs dashboard` | Tail stdout/stderr live (this is where `handleLogs()`'s echoed llama-server output shows up) |
-| `pm2 restart dashboard` | Manually restart it (e.g. after editing `server4.js`) |
-| `pm2 stop dashboard` | Stop it — pm2 will **not** auto-restart after an explicit stop |
-| `pm2 delete dashboard` | Remove it from pm2's process list entirely |
-| `pm2 save` | Snapshot the current process list to `~/.pm2/dump.pm2`, so `pm2 resurrect` (or `pm2 startup` + a reboot) can bring it back |
+| `HF_HOME`, `HUGGINGFACE_HUB_CACHE` | The Hugging Face cache to scan. |
+| `STRATA_DIR` | One more Strata install, listed first. |
+| `POSTS_REPO`, `POSTS_CLONE` | The posts repository (`owner/name`) and its local clone, for the posts editor. |
+| `MONITOR_BIND` | `monitor.py`'s listen address. The default is `127.0.0.1`. |
+| `MONITOR_PORT` | `monitor.py`'s port. The dashboard always dials 8081, so this is only for trying a second copy. |
+| `SWEEP_STATE_FILE` | Where the headless sweep keeps its state. The default is `sweep-state.json` in the checkout. |
 
-A restart via pm2 (or a crash it recovers from) does **not** preserve
-in-flight model state — if a model was loaded, you'll need to hit "Boot
-Cluster" again in the UI afterward, and the orphan cleanup on startup (above)
-will have already reaped whatever was holding 8080. pm2 only guarantees the
-dashboard backend itself comes back up; it doesn't remember or reissue your
-last `/api/start` config.
+## Running it
 
-### Checking restart history
+### Ports
 
-The `↺` column in `pm2 status` is a cumulative restart counter for the
-process's whole lifetime (not just since the last boot) — a non-zero count
-after leaving it running unattended (e.g. overnight) tells you it crashed
-and recovered at least that many times, worth cross-referencing against
-`pm2 logs dashboard --lines 500` (or the raw log files under `~/.pm2/logs/`)
-to see what actually happened.
+| Port | What | Bound to |
+|---|---|---|
+| 3000 | Dashboard UI and API (`server4.js`). Fixed. | all interfaces |
+| 8080 | `llama-server` (default). A `--port` in the command overrides it. | `127.0.0.1`, unless `llamaHost` is set |
+| 8081 | `monitor.py` telemetry | `127.0.0.1` (`MONITOR_BIND` overrides) |
+| 50052 | RPC worker (`ggml-rpc-server`) on the worker; also each worker's local forward port | the worker's loopback (`link: "ssh"`) or all interfaces (`link: "direct"`) |
+| 3100 | Public site (`public/server.js`, optional) | all interfaces (`PUBLIC_HOST`) |
+| 3101 | Public live API (`public/live_server.py`, optional) | `127.0.0.1` |
 
-### Removing pm2 management
+Strata servers default to port 8095. Whenever the model server runs on a port
+other than 8080, the dashboard forwards `127.0.0.1:8080` to it, for clients
+that are hard-wired to 8080.
 
-If you want to go back to running it directly:
+### Under pm2
+
+`ecosystem.config.js` defines three apps:
+
+| App | Script | What |
+|---|---|---|
+| `dashboard` | `server4.js` | The dashboard. Start this one. |
+| `public` | `public/server.js` | The optional public results site (port 3100) |
+| `live` | `public/live_server.py` | The optional live API for the static public site (port 3101) |
 
 ```bash
-pm2 stop dashboard
-pm2 delete dashboard
-node server4.js   # now runs in the foreground, no auto-restart
+pm2 start ecosystem.config.js --only dashboard   # a plain `pm2 start ecosystem.config.js` starts all three
+pm2 status                                       # state, PID, uptime, restart count (↺, cumulative)
+pm2 logs dashboard                               # server output, including the echoed llama-server log
+pm2 restart dashboard                            # e.g. after editing server4.js or lib/
+pm2 stop dashboard                               # pm2 won't auto-restart an app you stopped
+pm2 save                                         # so `pm2 resurrect` / `pm2 startup` brings it back
 ```
+
+Each app has a crash-loop guard: `restart_delay: 2000`, `min_uptime: 5000`,
+`max_restarts: 20`. If an app keeps dying within 5 s, pm2 gives up after 20
+restarts.
+
+`monitor.py` is not a pm2 app; `server4.js` starts and stops it. To run in the
+foreground instead, use `node server4.js`.
+
+### Startup and shutdown
+
+At startup the server does the following, in order:
+
+1. Loads the configuration.
+2. Loads each build's last known device list from `logs/device-cache.json`.
+   Builds with no cached list are probed later, when the GPUs are free.
+3. Stops orphans left on ports 8080 and 8081 by a previous dashboard. It only
+   stops a model server or `monitor.py`; nothing else is touched.
+4. Starts `monitor.py`.
+5. Starts the tunnel, if `remoteAccess.autoStart` is set.
+
+On SIGINT or SIGTERM, it stops what it started: `llama-server`, `llama-bench`,
+`monitor.py` and `cloudflared`.
+
+**A restart therefore unloads a model the dashboard launched.** That covers a
+pm2 restart, a crash and a manual restart. Load the model again afterwards.
+
+The Stop button sends SIGTERM, then SIGKILL after 3 s. A server that exits
+before it is ready shows its last error lines as "Launch failed".
+
+## Security and remote access
+
+### Default exposure
+
+**With no tunnel running, LL-Dash has no authentication.** It assumes a trusted
+machine and network.
+
+| Component | Exposure |
+|---|---|
+| Dashboard (port 3000) | All interfaces, CORS `*`. The launch command is run as given, so anyone who can reach the port can **run any program as the user the dashboard runs as**. They can also start and stop processes on configured workers over SSH, and read the request history. |
+| `monitor.py` (port 8081) | Loopback only (`MONITOR_BIND` overrides). It answers only the dashboard's telemetry POST, and GET returns 404. |
+| `llama-server` | `127.0.0.1` by default. Setting `llamaHost` (for example `"0.0.0.0"`) exposes it, also without authentication. |
+| `ggml-rpc-server` | No authentication. With `link: "ssh"` (the default), it listens on the worker's loopback only, behind the SSH forward. With `link: "direct"`, it listens on all of the worker's interfaces. |
+
+Because the dashboard sends CORS `*`, a firewall alone is not enough. Any web
+page open in a browser that can reach the dashboard, including a browser on
+the same machine, can send it requests.
+
+**Recommendations**
+
+- Firewall port 3000 from any network you don't trust. If you set
+  `MONITOR_BIND` or `llamaHost` to a non-loopback address, firewall those ports
+  too.
+- Don't browse untrusted sites in a browser that can reach an ungated
+  dashboard. Alternatively, keep the password gate armed (see below).
+- From another machine, prefer an SSH port forward
+  (`ssh -L 3000:localhost:3000 <host>`) or the tunnel.
+
+### Tunnel and password gate
+
+`POST /api/tunnel` publishes the dashboard through Cloudflare, in one of two
+ways:
+
+- **Quick tunnel** (no account needed): runs `cloudflared tunnel --url
+  http://127.0.0.1:3000` and gets a random `https://<random>.trycloudflare.com`
+  URL. You supply the password in the start request; it must be at least 4
+  characters.
+- **Named tunnel**: set `remoteAccess.tunnelConfig` to a `cloudflared` config
+  file, and `remoteAccess.url` to its public URL.
+  - With `autoStart: true` and a `passwordFile` (keep that file mode 600), the
+    tunnel starts with the dashboard and is retried every 60 s if it fails or
+    exits.
+  - Stopping it through the CLI or the API leaves it stopped until the next
+    dashboard start.
+
+**Starting a tunnel arms a password gate in front of every request.** That
+includes static files, REST and SSE, and local requests as well as remote
+ones, because `cloudflared` forwards from localhost and the two look the same.
+
+- **Credentials:** send `Authorization: Bearer <password>` (CLI, scripts), or an
+  `mc_session` cookie set by the gate's login page (`POST /api/tunnel/login`).
+- **Unauthenticated requests** get the login page (browsers) or a `401` JSON
+  response.
+- **The password** is checked with PBKDF2-HMAC-SHA256 (200,000 iterations)
+  against a salt generated when the tunnel starts. The dashboard never writes
+  the password to disk.
+- **Browser sessions** are signed tokens valid for 30 days. They survive a
+  dashboard restart; the signing key lives in
+  `~/.config/ai-dashboard/session-secret.json` (mode 600). Stopping the tunnel,
+  or changing the password, logs every session out.
+- **The login has no rate limit or lockout.** Use a long password.
+- **`remoteAccess.allowIps`** lists peers that may skip the password. It
+  matches the socket's remote address, never a forwarded header. Loopback
+  entries are ignored, because tunnel traffic arrives from `127.0.0.1`.
+- **`remoteAccess.failRedirect`** (optional) sends a browser to another URL
+  after a wrong password.
+- **Stopping the tunnel** drops the gate. Use `llama-cli tunnel stop`, or
+  `POST /api/tunnel {"action":"stop"}`.
+
+`cloudflared` must be on the PATH, or you can set `remoteAccess.cloudflared`.
+The dashboard's shutdown handler stops it.
+
+### The web-fetch tool
+
+The model chooses the URLs that the chat's `web_fetch` tool reads, so the tool
+is restricted:
+
+- Only plain `http`/`https` URLs without credentials are allowed.
+- Every hop, redirects included, must resolve to a public address. Loopback,
+  private, link-local, CGNAT and multicast ranges are refused, and the
+  connection is pinned to the address that was checked.
+- At most 5 redirects, 5 MB and 15 s.
+- Only HTML, XML, text and JSON are read.
+
+## Project layout
+
+```
+server4.js               backend: HTTP + SSE on :3000; launches and supervises model servers
+monitor.py               telemetry helper on 127.0.0.1:8081
+index.html, script.js    the main page (no build step)
+ui/                      page modules (Results, Bench views, pickers, posts editor, shared helpers)
+lib/                     server modules, most pure and unit-tested
+db/schema.sql            SQLite schema
+dash-cli/                terminal client
+public/                  public results site and its static build
+bench-tools/, tools/     sweep client, depth sweep, profile and weights utilities
+test/                    node:test unit tests
+vendor/                  Chart.js, marked, prebuilt Tailwind CSS, inlined fonts
+```
+
+[docs/development.md](docs/development.md) has the full module list.
+
+## Documentation
+
+| Page | Covers |
+|---|---|
+| [docs/web-ui.md](docs/web-ui.md) | Each tab, both sidebars, the chat and the posts editor |
+| [docs/launching-models.md](docs/launching-models.md) | Device lists, the raw command box, launch guards, profiles, device probes, builds, RPC workers, Strata |
+| [docs/benchmarking.md](docs/benchmarking.md) | `llama-bench`, launch sweeps, public suites, and the optional benchmark integration |
+| [docs/building-benchmark-tasks.md](docs/building-benchmark-tasks.md) | Building and maintaining tasks for a private coding benchmark: prompts, hidden tests, validation, reading early passes and fails, keeping it private |
+| [docs/terminal-client.md](docs/terminal-client.md) | `dash-cli` overview ([dash-cli/README.md](dash-cli/README.md) is the full manual) |
+| [docs/public-site.md](docs/public-site.md) | The public results site, its static build and posts |
+| [docs/development.md](docs/development.md) | Tests, CSS and fonts, offline use, tools, HTTP API overview, project layout |
+| [API.md](API.md) | The HTTP and SSE contract |
+| [TOPOLOGY.md](TOPOLOGY.md) | Hardware model, profile portability, run labels, full configuration reference |
+
+## Limitations
+
+- **Linux only.**
+- **GPU telemetry covers AMD and NVIDIA only.**
+  - Fan RPM and memory temperature are AMD-only.
+  - Worker telemetry over SSH is NVIDIA-only.
+- **Identical cards are paired by listing order,** both across backends and in
+  telemetry.
+- **Ports 3000, 8080 and 8081 are fixed defaults.**
+- **Some defaults still reflect the machines this was written on.** Examples:
+  the fixed `/data/models` scan, and the hard-coded paths in
+  `bench-tools/depth_sweep.py`. [TOPOLOGY.md](TOPOLOGY.md) ("Still
+  machine-specific") has the full list.

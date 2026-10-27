@@ -9,7 +9,40 @@ import sys
 import time
 import traceback
 
-PORT = 8081
+PORT = int(os.environ.get("MONITOR_PORT", "8081"))   # the dashboard dials 8081; the override is for trying a copy beside it
+# Loopback only (2026-10-27): the one client is the dashboard (server4.js POSTs localhost:8081/stats). It used to listen on
+# every interface, where the LAN, the tailnet and the laptop link could reach it. MONITOR_BIND overrides.
+BIND = os.environ.get("MONITOR_BIND", "127.0.0.1")
+
+# Is an NVIDIA GPU installed at all? Asked of sysfs, never of nvidia-smi: with no card present every nvidia-smi
+# call makes nvidia-modprobe load the kernel module, which fails and logs "NVRM: No NVIDIA GPU found" -- at this
+# poll rate ~3 lines/s on the console (Kyle 2026-10-06, the 3060 out of the machine). Re-checked every 30 s.
+_NV = {"at": 0.0, "has": False}
+def has_nvidia_gpu():
+    now = time.time()
+    if now - _NV["at"] > 30:
+        has = False
+        for d in glob.glob("/sys/bus/pci/devices/*"):
+            try:
+                if open(d + "/vendor").read().strip() == "0x10de" and open(d + "/class").read().strip().startswith("0x03"):
+                    has = True; break
+            except OSError: pass
+        _NV.update(at=now, has=has)
+    return _NV["has"]
+
+# One nvidia-smi line per NVIDIA GPU. index + PCI bus id identify a card across
+# tools (nvidia-smi, sysfs hwmon, amdgpu_top) and across the compute-apps list.
+# New fields go at the END: the parser below reads the first twelve by position.
+NVIDIA_GPU_QUERY = ("index,pci.bus_id,name,memory.used,memory.total,power.draw,temperature.gpu,utilization.gpu,"
+                    "clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown,"
+                    "clocks_throttle_reasons.sw_power_cap,clocks_throttle_reasons.hw_power_brake_slowdown,"
+                    "fan.speed")
+NVIDIA_APPS_QUERY = "gpu_bus_id,used_memory,name"
+
+def _norm_pci(bus_id):
+    """'00000000:09:00.0' (nvidia-smi) or '0000:0c:00.0' (sysfs, amdgpu_top) -> '09:00.0'."""
+    s = str(bus_id or '').strip().lower()
+    return s[-7:] if len(s) >= 7 else s
 
 # get_amd_stats() below has to force-kill amdgpu_top every call (it doesn't respect
 # its own "-n 1" sample-count flag -- see that function's docstring). If the device
@@ -28,8 +61,26 @@ def _reap_children(signum, frame):
 
 signal.signal(signal.SIGCHLD, _reap_children)
 
-def read_amdgpu_hwmon():
-    """Find the sysfs hwmon dir for the AMD GPU (name == 'amdgpu') and read power
+def read_cpu_hwmon_temp():
+    """The CPU temperature in millidegrees as a string ('79250'), from the CPU's hwmon driver; '' when there is none."""
+    for want, label in (('k10temp', 'Tctl'), ('zenpower', 'Tdie'), ('coretemp', 'Package id 0')):
+        for d in glob.glob('/sys/class/hwmon/hwmon*'):
+            try:
+                if open(os.path.join(d, 'name')).read().strip() != want: continue
+                inputs = sorted(glob.glob(os.path.join(d, 'temp*_input')))
+                pick = None
+                for f in inputs:
+                    try: lab = open(f.replace('_input', '_label')).read().strip()
+                    except OSError: lab = ''
+                    if lab == label: pick = f; break
+                pick = pick or (inputs[0] if inputs else None)
+                if pick: return open(pick).read().strip()
+            except OSError: continue
+    return ''
+
+def read_amdgpu_hwmon(pci=None):
+    """Find the sysfs hwmon dir for an AMD GPU (name == 'amdgpu' -- with `pci`,
+    the one whose device is at that PCI address) and read power
     (power1_average, PPT/board power) and temperature (prefer 'junction' label,
     fall back to 'edge') straight from the kernel driver -- cheap synchronous file
     reads, no subprocess needed. amdgpu_top's own JSON 'Sensors' fields came back
@@ -44,6 +95,8 @@ def read_amdgpu_hwmon():
                 with open(os.path.join(hwmon_dir, 'name')) as f:
                     if f.read().strip() != 'amdgpu':
                         continue
+                if pci and _norm_pci(os.path.basename(os.path.realpath(os.path.join(hwmon_dir, 'device')))) != pci:
+                    continue
             except Exception:
                 continue
 
@@ -64,10 +117,45 @@ def read_amdgpu_hwmon():
                 except Exception:
                     continue
             temp = temp_by_label.get('junction', temp_by_label.get('edge'))
-            break  # first amdgpu hwmon device only -- matches the single-GPU assumption elsewhere in get_amd_stats()
+            break  # the card at `pci` (or, without one, the first amdgpu hwmon device)
     except Exception:
         pass
     return power, temp
+
+def read_amdgpu_fan_mem(pci=None):
+    """Fan and memory temperature of the AMD GPU at `pci`, from its amdgpu hwmon dir:
+    (fan_rpm, fan_pct, mem_temp_c), each None where the card has no such sensor. fan_pct is the PWM duty
+    (pwm1 of pwm1_max). A zero-RPM fan (stopped at idle) reads 0, which is a reading, not a missing one.
+    Every card has its own hwmon dir, matched by PCI address like read_amdgpu_hwmon() -- with two identical
+    cards, name matching would read the same fan twice."""
+    rpm, pct, mem = None, None, None
+    def num(path):
+        try:
+            with open(path) as f: return int(f.read().strip())
+        except Exception: return None
+    try:
+        for hwmon_dir in glob.glob('/sys/class/hwmon/hwmon*'):
+            try:
+                with open(os.path.join(hwmon_dir, 'name')) as f:
+                    if f.read().strip() != 'amdgpu': continue
+                if pci and _norm_pci(os.path.basename(os.path.realpath(os.path.join(hwmon_dir, 'device')))) != pci: continue
+            except Exception:
+                continue
+            rpm = num(os.path.join(hwmon_dir, 'fan1_input'))
+            pwm, pwm_max = num(os.path.join(hwmon_dir, 'pwm1')), num(os.path.join(hwmon_dir, 'pwm1_max'))
+            if pwm is not None: pct = round(pwm * 100.0 / (pwm_max or 255))
+            for temp_input in glob.glob(os.path.join(hwmon_dir, 'temp*_input')):
+                try:
+                    with open(temp_input.replace('_input', '_label')) as f:
+                        if f.read().strip() != 'mem': continue
+                    v = num(temp_input)
+                    if v is not None: mem = int(v / 1000)
+                except Exception:
+                    continue
+            break
+    except Exception:
+        pass
+    return rpm, pct, mem
 
 def get_meminfo_usage():
     """Read /proc/meminfo and return (total_kb, used_kb) where used = Total - Available.
@@ -199,6 +287,17 @@ class HardwareMonitorHandler(http.server.SimpleHTTPRequestHandler):
         sys.stderr.write(f"[monitor] ERROR {format % args}\n")
         sys.stderr.flush()
 
+    # GET/HEAD: nothing to serve (2026-10-27). The base class, SimpleHTTPRequestHandler, answers GET with the files of
+    # its working directory -- this dashboard dir, dashboard.config.json and session notes included -- with no auth.
+    # Nothing here was meant to be served that way: the telemetry is POST /stats.
+    def do_GET(self):
+        try:
+            self.send_error(404)
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            pass
+
+    do_HEAD = do_GET
+
     def do_OPTIONS(self):
         try:
             self.send_response(200, "ok")
@@ -216,28 +315,28 @@ class HardwareMonitorHandler(http.server.SimpleHTTPRequestHandler):
             post_data = self.rfile.read(content_length) if content_length > 0 else b'{}'
             req = json.loads(post_data.decode('utf-8'))
 
-            stats = {"master": self.get_stats()}
-            # A master host with no NVIDIA GPU (the desktop with only the 7900
-            # XTX) gets its GPU fields from amdgpu_top instead; CPU/RAM/net stay
-            # from get_stats(). That AMD card is then the master, so it must not
-            # also be reported as a local second GPU below.
-            master_is_amd = False
-            if stats["master"].get("nvidia_smi_error"):
-                amd = self.get_amd_stats()
-                if not amd.get("amdgpu_top_error"):
-                    for key in ("gpu_name", "gpu_throttle", "throttle_reasons", "vram_used",
-                                "vram_total", "process_vram", "gpu_pwr", "gpu_temp", "gpu_util"):
-                        stats["master"][key] = amd[key]
-                    stats["master"]["nvidia_smi_error"] = False
-                    master_is_amd = True
-            worker_ssh = req.get('worker_ssh', '').strip()
-            local_second_gpu = req.get('local_second_gpu', '').strip()
-            if local_second_gpu == 'amd' and not master_is_amd:
-                # Local-multi-gpu launch mode: "worker" slot is the second GPU on
-                # THIS machine (the AMD eGPU), not a remote SSH host.
-                stats['worker'] = self.get_amd_stats()
-            elif worker_ssh:
-                stats['worker'] = self.get_stats(worker_ssh)
+            # Every GPU this machine has (all NVIDIA cards via nvidia-smi, all
+            # AMD cards via amdgpu_top), plus each requested RPC worker host's
+            # GPUs and CPU/RAM over ssh: {"workers": [{"name", "ssh"}]}. The
+            # server maps these onto the launch's devices (lib/telemetry.js).
+            workers = []
+            for w in (req.get('workers') or []):
+                if not isinstance(w, dict):
+                    continue
+                name = str(w.get('name', '')).strip()
+                ssh = str(w.get('ssh', '')).strip()
+                # No leading '-': the target is an ssh argv entry, never an option.
+                if name and name != 'local' and ssh and not ssh.startswith('-'):
+                    workers.append((name, ssh))
+
+            local_host, gpus = self.get_host_stats()
+            gpus = gpus + self.get_amd_gpus()
+            hosts = {"local": local_host}
+            for name, ssh in workers:
+                host, remote_gpus = self.get_host_stats(ssh)
+                hosts[name] = host
+                gpus += [dict(g, host=name) for g in remote_gpus]
+            stats = {"hosts": hosts, "gpus": gpus}
 
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
@@ -273,11 +372,11 @@ class HardwareMonitorHandler(http.server.SimpleHTTPRequestHandler):
             except (ConnectionResetError, BrokenPipeError, OSError):
                 pass
 
-    def get_amd_stats(self):
-        """Local AMD GPU telemetry via `amdgpu_top -J` (local-multi-gpu launch mode's
-        second GPU, e.g. a 7900 XTX eGPU). Returns the same dict shape as get_stats()
-        so pollTelemetry's existing worker-card rendering on the frontend needs no
-        changes to consume it. Verified live end-to-end (local-multi-gpu launch,
+    def get_amd_gpus(self):
+        """Local AMD GPU telemetry via `amdgpu_top -J`: one GPU entry per card (every
+        AMD card, each with its own PCI address -- two identical cards are two
+        entries), in the same per-GPU shape get_host_stats() returns for
+        NVIDIA cards, plus fan speed and memory temperature from the card's hwmon dir. An amdgpu_top failure yields no AMD entries. Verified live end-to-end (local-multi-gpu launch,
         real generation load split across a 4090 + this 7900 XTX): util/VRAM/power
         all populate correctly and track actual load (e.g. gpu_util 0->52%, gpu_pwr
         0->92W once generation started). amdgpu_top's own JSON 'Sensors' fields
@@ -305,7 +404,7 @@ class HardwareMonitorHandler(http.server.SimpleHTTPRequestHandler):
         state brings back the old non-exiting behavior -- worst case is exactly
         today's behavior, just with a tighter timeout.
         """
-        device = None
+        devices = []
         proc = None
         try:
             proc = subprocess.Popen(
@@ -324,12 +423,9 @@ class HardwareMonitorHandler(http.server.SimpleHTTPRequestHandler):
                 raw_out = e.stdout or b''
             text = raw_out.decode('utf-8', errors='ignore')
             obj, _ = json.JSONDecoder().raw_decode(text)
-            devices = obj.get('devices', [])
-            if not devices:
-                raise ValueError("amdgpu_top returned no devices")
-            device = devices[0]
+            devices = obj.get('devices', []) or []
         except Exception:
-            pass
+            devices = []
         finally:
             # amdgpu_top never exits on its own (see above) -- always reap it.
             # A device in a bad TB4/power state can leave the kernel driver call
@@ -342,16 +438,6 @@ class HardwareMonitorHandler(http.server.SimpleHTTPRequestHandler):
                 except Exception:
                     pass
 
-        if device is None:
-            return {
-                "gpu_name": "Offline", "gpu_throttle": False, "throttle_reasons": [],
-                "vram_used": 0, "vram_total": 1, "process_vram": 0,
-                "gpu_pwr": 0, "gpu_temp": 0, "gpu_util": 0,
-                "ram_used": 0, "ram_total": 1, "process_ram": 0,
-                "cpu_name": "Offline", "cpu_util": 0.0, "cpu_temp": 0,
-                "net_bytes": 0, "amdgpu_top_error": True
-            }
-
         def _val(d, *path, default=0):
             cur = d
             for key in path:
@@ -362,74 +448,58 @@ class HardwareMonitorHandler(http.server.SimpleHTTPRequestHandler):
                 return cur.get('value', default)
             return cur if cur is not None else default
 
-        gpu_name = _val(device, 'Info', 'DeviceName', default='Unknown AMD GPU')
-        vram_used = int(_val(device, 'VRAM', 'Total VRAM Usage', default=0))
-        vram_total = int(_val(device, 'VRAM', 'Total VRAM', default=1)) or 1
-        gpu_util = int(_val(device, 'gpu_activity', 'GFX', default=0))
+        gpus = []
+        for index, device in enumerate(devices):
+            pci = _norm_pci(_val(device, 'Info', 'PCI', default=''))
+            gpu_name = _val(device, 'Info', 'DeviceName', default='Unknown AMD GPU')
+            vram_used = int(_val(device, 'VRAM', 'Total VRAM Usage', default=0))
+            vram_total = int(_val(device, 'VRAM', 'Total VRAM', default=1)) or 1
+            gpu_util = int(_val(device, 'gpu_activity', 'GFX', default=0))
 
-        # Prefer sysfs hwmon (verified reliable on this card/driver combo, see
-        # read_amdgpu_hwmon() docstring); fall back to amdgpu_top's own JSON
-        # sensor fields for portability to setups where that isn't the case.
-        hwmon_power, hwmon_temp = read_amdgpu_hwmon()
+            # Prefer sysfs hwmon (verified reliable on this card/driver combo, see
+            # read_amdgpu_hwmon() docstring); fall back to amdgpu_top's own JSON
+            # sensor fields for portability to setups where that isn't the case.
+            hwmon_power, hwmon_temp = read_amdgpu_hwmon(pci or None)
 
-        gpu_pwr = hwmon_power
-        if gpu_pwr is None:
-            gpu_pwr = _val(device, 'Sensors', 'Average Power', default=None)
+            gpu_pwr = hwmon_power
             if gpu_pwr is None:
-                gpu_pwr = _val(device, 'Sensors', 'GFX Power', default=0)
-        gpu_pwr = float(gpu_pwr or 0)
+                gpu_pwr = _val(device, 'Sensors', 'Average Power', default=None)
+                if gpu_pwr is None:
+                    gpu_pwr = _val(device, 'Sensors', 'GFX Power', default=0)
+            gpu_pwr = float(gpu_pwr or 0)
 
-        gpu_temp = hwmon_temp
-        if gpu_temp is None:
-            gpu_temp = _val(device, 'Sensors', 'Junction Temperature', default=None)
+            gpu_temp = hwmon_temp
             if gpu_temp is None:
-                gpu_temp = _val(device, 'Sensors', 'Edge Temperature', default=0)
-        gpu_temp = int(gpu_temp or 0)
+                gpu_temp = _val(device, 'Sensors', 'Junction Temperature', default=None)
+                if gpu_temp is None:
+                    gpu_temp = _val(device, 'Sensors', 'Edge Temperature', default=0)
+            gpu_temp = int(gpu_temp or 0)
+            fan_rpm, fan_pct, mem_temp = read_amdgpu_fan_mem(pci or None)
 
-        # fdinfo is keyed by pid, doubly-nested per amdgpu_top's JSON shape:
-        # {pid: {name, usage: {name, usage: {VRAM: {unit, value}, GFX: {...}, ...}}}}
-        process_vram = 0
-        try:
-            for pid, entry in device.get('fdinfo', {}).items():
-                name = entry.get('name', '')
-                if 'llama-server' in name or 'llama' in name or 'ggml-rpc' in name:
-                    inner = entry.get('usage', {}).get('usage', {})
-                    process_vram += int(_val(inner, 'VRAM', default=0))
-        except Exception:
+            # fdinfo is keyed by pid, doubly-nested per amdgpu_top's JSON shape:
+            # {pid: {name, usage: {name, usage: {VRAM: {unit, value}, GFX: {...}, ...}}}}
             process_vram = 0
+            try:
+                for pid, entry in device.get('fdinfo', {}).items():
+                    name = entry.get('name', '')
+                    if 'llama-server' in name or 'llama' in name or 'ggml-rpc' in name:
+                        inner = entry.get('usage', {}).get('usage', {})
+                        process_vram += int(_val(inner, 'VRAM', default=0))
+            except Exception:
+                process_vram = 0
 
-        # CPU/RAM/net are this same local host's -- both GPUs share one pool, so
-        # these mirror what get_stats() computes for master. The frontend hides the
-        # worker RAM/CPU sub-panels in local-multi-gpu mode since a duplicate
-        # reading there would be redundant, but the fields stay populated here so
-        # the dict shape is always valid regardless of how the frontend renders it.
-        mem_total_kb, mem_used_kb = get_meminfo_usage()
-        ram_total = max(mem_total_kb // 1024, 1)
-        ram_used = max(mem_used_kb // 1024, 0)
+            gpus.append({
+                "host": "local", "index": index, "pci": pci, "vendor": "amd", "gpu_name": gpu_name,
+                "gpu_throttle": False, "throttle_reasons": [],
+                "vram_used": vram_used, "vram_total": vram_total, "process_vram": process_vram,
+                "gpu_pwr": gpu_pwr, "gpu_temp": gpu_temp, "gpu_util": gpu_util, "error": False,
+                "mem_temp": mem_temp, "fan_rpm": fan_rpm, "fan_pct": fan_pct,
+            })
+        return gpus
 
-        cpu_util = 0.0
-        try:
-            cpu_util = _parse_cpu_util_from_stat(open('/proc/stat').read())
-        except Exception:
-            cpu_util = 0.0
-
-        cpu_name = "Unknown CPU"
-        try:
-            cpu_info = open('/proc/cpuinfo').read()
-            cpu_name = [l for l in cpu_info.split('\n') if "model name" in l][0].split(':')[1].strip()
-        except Exception:
-            pass
-
-        return {
-            "gpu_name": gpu_name, "gpu_throttle": False, "throttle_reasons": [],
-            "vram_used": vram_used, "vram_total": vram_total, "process_vram": process_vram,
-            "gpu_pwr": gpu_pwr, "gpu_temp": gpu_temp, "gpu_util": gpu_util,
-            "ram_used": ram_used, "ram_total": ram_total, "process_ram": 0,
-            "cpu_name": cpu_name, "cpu_util": cpu_util, "cpu_temp": 0,
-            "net_bytes": get_net_bytes(), "amdgpu_top_error": False
-        }
-
-    def get_stats(self, ssh_prefix=""):
+    def get_host_stats(self, ssh_prefix=""):
+        """One host's CPU/RAM/net plus its NVIDIA GPUs (every nvidia-smi line):
+        local with no ssh_prefix, else that ssh target. Returns (host, gpus)."""
         meminfo_out = ""  # For SSH remote meminfo data; empty for local (uses /proc/meminfo directly)
         nvidia_smi_error = False  # Tracks whether the primary nvidia-smi query failed
 
@@ -439,9 +509,9 @@ class HardwareMonitorHandler(http.server.SimpleHTTPRequestHandler):
             # Use /sys/class/thermal/thermal_zone*/temp for CPU temp (multiple zones)
             # Use /proc/net/dev for per-interface network byte counters
             shell_cmd = (
-                "nvidia-smi '--query-gpu=name,memory.used,memory.total,power.draw,temperature.gpu,utilization.gpu,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown,clocks_throttle_reasons.sw_power_cap,clocks_throttle_reasons.hw_power_brake_slowdown' '--format=csv,noheader,nounits' 2>/dev/null || true; "
+                "nvidia-smi '--query-gpu=" + NVIDIA_GPU_QUERY + "' '--format=csv,noheader,nounits' 2>/dev/null || true; "
                 "echo '===APPS==='; "
-                "nvidia-smi '--query-compute-apps=used_memory,name' '--format=csv,noheader,nounits' 2>/dev/null || true; "
+                "nvidia-smi '--query-compute-apps=" + NVIDIA_APPS_QUERY + "' '--format=csv,noheader,nounits' 2>/dev/null || true; "
                 "echo '===MEMINFO==='; "
                 "cat /proc/meminfo 2>/dev/null || true; "
                 "echo '===PS==='; "
@@ -489,16 +559,12 @@ class HardwareMonitorHandler(http.server.SimpleHTTPRequestHandler):
                 temp_out = '\n'.join(section_lines.get('TEMP', [])).strip()
                 netdev_out = '\n'.join(section_lines.get('NETDEV', [])).strip()
             except Exception:
-                # Fail fast and return empty / offline indicators, with error flag
-                return {
-                    "gpu_name": "Offline", "gpu_throttle": False, "throttle_reasons": [],
-                    "vram_used": 0, "vram_total": 1, "process_vram": 0,
-                    "gpu_pwr": 0, "gpu_temp": 0, "gpu_util": 0,
+                # Fail fast: an offline host with no GPUs, with the error flag
+                return ({
                     "ram_used": 0, "ram_total": 1, "process_ram": 0,
-                    "cpu_name": "Offline", "cpu_util": 0.0, "cpu_temp": 0, 
-                    "net_bytes": 0,
-                    "nvidia_smi_error": True
-                }
+                    "cpu_name": "Offline", "cpu_util": 0.0, "cpu_temp": 0,
+                    "net_bytes": 0, "net_by_interface": {}, "error": True
+                }, [])
         else:
             # Local stats (run natively, fast, no network latency)
             gpu_out = ""
@@ -507,13 +573,14 @@ class HardwareMonitorHandler(http.server.SimpleHTTPRequestHandler):
             cpu_info = ""
             temp_out = ""
             
+            nv = has_nvidia_gpu()   # no card -> no nvidia-smi (see has_nvidia_gpu)
             try:
-                gpu_out = subprocess.check_output(["nvidia-smi", "--query-gpu=name,memory.used,memory.total,power.draw,temperature.gpu,utilization.gpu,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown,clocks_throttle_reasons.sw_power_cap,clocks_throttle_reasons.hw_power_brake_slowdown", "--format=csv,noheader,nounits"], stderr=subprocess.DEVNULL, timeout=2).decode('utf-8').strip()
+                if nv: gpu_out = subprocess.check_output(["nvidia-smi", "--query-gpu=" + NVIDIA_GPU_QUERY, "--format=csv,noheader,nounits"], stderr=subprocess.DEVNULL, timeout=2).decode('utf-8').strip()
             except Exception as e:
                 nvidia_smi_error = True
-            
+
             try:
-                apps_out = subprocess.check_output(["nvidia-smi", "--query-compute-apps=used_memory,name", "--format=csv,noheader,nounits"], stderr=subprocess.DEVNULL, timeout=2).decode('utf-8')
+                if nv: apps_out = subprocess.check_output(["nvidia-smi", "--query-compute-apps=" + NVIDIA_APPS_QUERY, "--format=csv,noheader,nounits"], stderr=subprocess.DEVNULL, timeout=2).decode('utf-8')
             except Exception: pass
             
             try:
@@ -539,8 +606,11 @@ class HardwareMonitorHandler(http.server.SimpleHTTPRequestHandler):
                 cpu_info = open('/proc/cpuinfo').read()
             except Exception: pass
 
+            # The CPU's own sensor first (hwmon: AMD k10temp Tctl, Intel coretemp package). thermal_zone0 on this board is
+            # an ACPI zone stuck at 16.8 C -- the chart read a flat 16 C under 50% load (Kyle, 2026-10-06) -- so it is only
+            # the fallback when no CPU hwmon exists.
             try:
-                temp_out = open('/sys/class/thermal/thermal_zone0/temp').read().strip()
+                temp_out = read_cpu_hwmon_temp() or open('/sys/class/thermal/thermal_zone0/temp').read().strip()
             except Exception: pass
 
         # Helper to parse /proc/meminfo output (works for both local and SSH-remote data)
@@ -563,45 +633,51 @@ class HardwareMonitorHandler(http.server.SimpleHTTPRequestHandler):
             mem_total_kb, mem_used_kb = get_meminfo_usage()
 
         # PARSING DATA (Same for both local and remote)
-        # GPU Metrics
-        try:
-            if nvidia_smi_error or not gpu_out or gpu_out.strip() == '':
-                raise ValueError("nvidia-smi query failed or returned empty")
-            parts = gpu_out.split('\n')[0].split(',')
-            if len(parts) < 6:
-                raise ValueError(f"nvidia-smi returned insufficient columns: {gpu_out!r}")
-            gpu_name = parts[0].strip()
-            vram_used, vram_total = int(float(parts[1])), int(float(parts[2]))
-            gpu_pwr = float(parts[3].strip() if parts[3].strip() != '[Not Supported]' else 0)
-            gpu_temp = int(parts[4].strip())
-            gpu_util = int(parts[5].strip())
-            # Granular throttle reasons: positions 6-9 in the query
-            throttle_fields = [
-                'hw_thermal_slowdown',
-                'sw_thermal_slowdown',
-                'sw_power_cap',
-                'hw_power_brake_slowdown'
-            ]
-            throttle_reasons = []
-            for i, field in enumerate(throttle_fields):
-                if i + 6 < len(parts) and parts[i + 6].strip() == 'Active':
-                    throttle_reasons.append(field)
-            gpu_throttle = len(throttle_reasons) > 0
-        except Exception as e:
-            gpu_name, vram_used, vram_total, gpu_pwr, gpu_temp, gpu_util, gpu_throttle = "Unknown", 0, 1, 0, 0, 0, False
-            throttle_reasons = []
+        # GPU Metrics -- one GPU per nvidia-smi line (none when it failed or the
+        # host has no NVIDIA card).
+        gpus = []
+        throttle_fields = [
+            'hw_thermal_slowdown',
+            'sw_thermal_slowdown',
+            'sw_power_cap',
+            'hw_power_brake_slowdown'
+        ]
+        if not nvidia_smi_error and gpu_out and gpu_out.strip():
+            for line in gpu_out.strip().split('\n'):
+                parts = [p.strip() for p in line.split(',')]
+                if len(parts) < 8:
+                    continue
+                try:
+                    # Granular throttle reasons: positions 8-11 in the query
+                    throttle_reasons = [field for i, field in enumerate(throttle_fields)
+                                        if i + 8 < len(parts) and parts[i + 8] == 'Active']
+                    # fan.speed (percent) is the 13th field; "[N/A]" on a laptop, absent from an older nvidia-smi
+                    try: fan_pct = int(float(parts[12])) if len(parts) > 12 else None
+                    except ValueError: fan_pct = None
+                    gpus.append({
+                        "host": "local", "index": int(parts[0]), "pci": _norm_pci(parts[1]), "vendor": "nvidia",
+                        "gpu_name": parts[2],
+                        "vram_used": int(float(parts[3])), "vram_total": int(float(parts[4])),
+                        "gpu_pwr": 0.0 if parts[5].startswith('[') else float(parts[5]),
+                        "gpu_temp": int(float(parts[6])), "gpu_util": int(float(parts[7])),
+                        "gpu_throttle": len(throttle_reasons) > 0, "throttle_reasons": throttle_reasons,
+                        "process_vram": 0, "error": False,
+                        "mem_temp": None, "fan_rpm": None, "fan_pct": fan_pct,
+                    })
+                except ValueError:
+                    continue
 
-        # Process VRAM Metrics
+        # Process VRAM per GPU, matched by PCI bus id.
         # Match: llama-server (master), ggml-rpc-server (worker), or any line containing 'llama'/'ggml-rpc'
-        process_vram = 0
         try:
+            by_pci = {g["pci"]: g for g in gpus}
             for line in apps_out.split('\n'):
                 if ('llama-server' in line or 'ggml-rpc-server' in line or 'llama' in line or 'ggml-rpc' in line):
-                    parts = line.strip().split(',')
-                    if len(parts) >= 2:
-                        process_vram += int(float(parts[0]))
+                    parts = [p.strip() for p in line.split(',')]
+                    if len(parts) >= 3 and _norm_pci(parts[0]) in by_pci:
+                        by_pci[_norm_pci(parts[0])]["process_vram"] += int(float(parts[1]))
         except Exception:
-            process_vram = 0
+            pass
 
         # RAM Metrics — already computed above from /proc/meminfo (Total - Available)
         # so the figure always >= any single process's RSS, avoiding the inverted /
@@ -675,16 +751,14 @@ class HardwareMonitorHandler(http.server.SimpleHTTPRequestHandler):
         elif not ssh_prefix:
             net_bytes = get_net_bytes()
 
-        return {
-            "gpu_name": gpu_name, "gpu_throttle": gpu_throttle, "throttle_reasons": throttle_reasons,
-            "vram_used": vram_used, "vram_total": vram_total, "process_vram": process_vram,
-            "gpu_pwr": gpu_pwr, "gpu_temp": gpu_temp, "gpu_util": gpu_util,
+        host = {
             "ram_used": ram_used, "ram_total": ram_total, "process_ram": process_ram,
-            "cpu_name": cpu_name, "cpu_util": cpu_util, "cpu_temp": cpu_temp, 
+            "cpu_name": cpu_name, "cpu_util": cpu_util, "cpu_temp": cpu_temp,
             "net_bytes": net_bytes,
             "net_by_interface": net_by_interface,
-            "nvidia_smi_error": nvidia_smi_error
+            "error": False
         }
+        return host, gpus
 
 # TCPServer is single-threaded by default -- it can only ever process one
 # request at a time, so a single slow amdgpu_top/nvidia-smi call (or an
@@ -700,5 +774,6 @@ class HardwareMonitorHandler(http.server.SimpleHTTPRequestHandler):
 # globals written in do_POST), so there's no new race condition introduced.
 socketserver.ThreadingTCPServer.allow_reuse_address = True
 socketserver.ThreadingTCPServer.daemon_threads = True
-with socketserver.ThreadingTCPServer(("", PORT), HardwareMonitorHandler) as httpd:
-    httpd.serve_forever()
+if __name__ == '__main__':
+    with socketserver.ThreadingTCPServer((BIND, PORT), HardwareMonitorHandler) as httpd:
+        httpd.serve_forever()

@@ -1,13 +1,25 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  DEFAULT_DRAFT, DRAFT_KEYS, sanitizeConfig, configToDraft, draftToConfig, clampVerbosity,
-  nodeLabels, splitText, profileTag, sortProfileEntries,
+  DEFAULT_DRAFT, DRAFT_KEYS, LEGACY_DEVICE_KEYS, sanitizeConfig, sanitizeDevices, legacyToDevices,
+  needsDeviceConversion, convertLegacyConfig, configToDraft, draftToConfig, clampVerbosity,
+  sharePercents, suggestShares, mergeCatalog, pollableWorkers, hasEnabledWorker, splitProblem,
+  toggleDeviceAt, adjustShareAt, setShareAt, moveDeviceAt, cycleBackendAt,
+  profileTag, deviceSummary, sortProfileEntries, unnamedDeviceNotes, uniqueWarnings,
 } from '../src/launchconfig.js';
-import { gpuOnline, gpuTitles } from '../src/format.js';
 
-// A profile as the web dashboard saves it: structured fields PLUS the raw
-// command box and legacy keys the CLI has no field for.
+test('unnamedDeviceNotes flags enabled local devices restored without a card name; uniqueWarnings dedupes', () => {
+  const notes = unnamedDeviceNotes([
+    { id: 'Vulkan0' }, { id: 'Vulkan1', name: 'AMD Radeon RX 7900 XTX' }, { worker: 'laptop' }, { id: 'CUDA0', enabled: false },
+  ]);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /Vulkan0 was saved without a card name/);
+  assert.deepEqual(uniqueWarnings(['a', 'b'], ['b', '', 'c'], []), ['a', 'b', 'c']);
+});
+import { gpuOnline, gpuTitles, gpuKey, shortGpuName } from '../src/format.js';
+
+// A profile as the older web UI saved it: two-device fields PLUS the raw
+// command box and keys the CLI has no field for.
 const WEB_RPC_PROFILE = {
   modelPath: '/m/qwen-27b.gguf', build: 'cuda-vulkan', ctx: 65536, ngl: 99,
   deviceA: 'CUDA0', deviceB: 'Vulkan1', tensorSplit: 60,
@@ -17,41 +29,89 @@ const WEB_RPC_PROFILE = {
   launchMode: 'local-multi-gpu', model: 'qwen-27b.gguf',
 };
 
-test('sanitizeConfig keeps only DRAFT_KEYS (rawCommand and unknown keys dropped)', () => {
+// /api/devices on the desktop's CUDA+Vulkan build (2026-09-13).
+const CARDS = [
+  { name: 'NVIDIA GeForce RTX 3060', vendor: 'nvidia', preferredId: 'CUDA0', ambiguous: false,
+    backends: [{ id: 'CUDA0', totalMib: 11906, freeMib: 10000 }, { id: 'Vulkan0', totalMib: 12288, freeMib: 10000 }] },
+  { name: 'AMD Radeon RX 7900 XTX', vendor: 'amd', preferredId: 'Vulkan1', ambiguous: false,
+    backends: [{ id: 'Vulkan1', totalMib: 24560, freeMib: 20000 }] },
+];
+const WORKERS = [{ name: 'laptop', ssh: 'laptop', devices: 'CUDA0', deviceCount: 1, cache: true, link: 'ssh' }];
+
+test('sanitizeConfig drops rawCommand and unknown keys, keeps legacy device keys for copying', () => {
   const out = sanitizeConfig({ ...WEB_RPC_PROFILE, preserveThinking: true, bogus: 1 });
-  assert.equal('rawCommand' in out, false);
-  assert.equal('launchMode' in out, false);
-  assert.equal('model' in out, false);
-  assert.equal('bogus' in out, false);
+  for (const k of ['rawCommand', 'launchMode', 'model', 'bogus']) assert.equal(k in out, false, `${k} dropped`);
   assert.equal(out.preserveThinking, true, 'legacy key buildLlamaArgs still honors');
-  assert.equal(out.modelPath, '/m/qwen-27b.gguf');
-  for (const k of Object.keys(out)) assert.ok(DRAFT_KEYS.includes(k), `${k} is a draft key`);
-  assert.equal('rpcEnabled' in out || 'workerHost' in out, false, 'UI-only keys are not launch keys');
+  assert.equal(out.rpcTarget, 'laptop', 'a copied web profile keeps its device fields');
+  for (const k of Object.keys(out)) assert.ok(DRAFT_KEYS.includes(k) || LEGACY_DEVICE_KEYS.includes(k), `${k} is known`);
   assert.deepEqual(sanitizeConfig(null), {});
 });
 
-test('configToDraft: web RPC profile -> RPC on, host from rpcTarget, GPU B cleared', () => {
-  const d = configToDraft(WEB_RPC_PROFILE);
-  assert.equal(d.rpcEnabled, true);
-  assert.equal(d.workerHost, 'laptop');
-  assert.equal(d.transport, 'TB4');
-  assert.equal(d.deviceA, 'CUDA0');
-  assert.equal(d.deviceB, null, 'split is local-vs-worker only');
-  assert.equal(d.tensorSplit, 60);
-  assert.equal(d.verbosity, 3, 'verbosity clamped up to the floor');
-  assert.equal('rawCommand' in d, false);
-  assert.equal('launchMode' in d, false);
+test('sanitizeDevices normalizes entries and never keeps a bare RPC id', () => {
+  assert.deepEqual(sanitizeDevices([
+    { id: 'RPC0' }, { id: 'CUDA0,Vulkan1' }, null, { id: ' CUDA0 ', share: -1, extra: 1 },
+    { worker: 'laptop', share: '30', id: 'RPC0' }, { id: 'Vulkan1', name: 'AMD Radeon RX 7900 XTX', share: 50, enabled: false },
+  ]), [
+    { id: 'CUDA0', share: null, enabled: true },
+    { worker: 'laptop', share: 30, enabled: true },
+    { id: 'Vulkan1', name: 'AMD Radeon RX 7900 XTX', share: 50, enabled: false },
+  ]);
 });
 
-test('configToDraft: local profile -> RPC off, keeps base host/transport, REPLACE semantics', () => {
-  const base = { ...DEFAULT_DRAFT, workerHost: 'laptop', transport: 'WAN', deviceB: 'Vulkan9', argString: '--old' };
-  const d = configToDraft({ modelPath: '/m/a.gguf', deviceA: 'Vulkan0', deviceB: 'Vulkan1', rpcTarget: null, transport: null, verbosity: 4 }, base);
-  assert.equal(d.rpcEnabled, false);
-  assert.equal(d.rpcTarget, '');
-  assert.equal(d.workerHost, 'laptop', 'host survives a local load for the next RPC toggle');
-  assert.equal(d.transport, 'WAN', 'null transport falls back to the base pick');
-  assert.equal(d.deviceB, 'Vulkan1');
-  assert.equal(d.verbosity, 4);
+test('legacyToDevices mirrors the server conversion', () => {
+  assert.deepEqual(legacyToDevices({ deviceA: 'CUDA0', deviceB: 'Vulkan1', tensorSplit: 40 }),
+    [{ id: 'CUDA0', share: 40, enabled: true }, { id: 'Vulkan1', share: 60, enabled: true }]);
+  assert.deepEqual(legacyToDevices({ deviceA: 'Vulkan1', rpcTarget: 'laptop', tensorSplit: 60 }),
+    [{ id: 'Vulkan1', share: 60, enabled: true }, { worker: 'laptop', share: 40, enabled: true }]);
+  assert.deepEqual(legacyToDevices({ deviceA: 'Vulkan0', deviceB: 'Vulkan0', tensorSplit: 60 }),
+    [{ id: 'Vulkan0', share: null, enabled: true }]);
+  assert.deepEqual(legacyToDevices({}), []);
+  assert.equal(needsDeviceConversion(WEB_RPC_PROFILE), true);
+  assert.equal(needsDeviceConversion({ devices: [], deviceA: 'CUDA0' }), false);
+  assert.equal(needsDeviceConversion({ modelPath: '/m' }), false);
+});
+
+test('convertLegacyConfig uses the server preview (worker ids mapped back, warnings kept), else converts locally', async () => {
+  const bodies = [];
+  const client = {
+    postJson: async (p, body) => {
+      bodies.push([p, body]);
+      return {
+        command: '/x/llama-server ...',
+        devices: [{ id: 'Vulkan1', name: 'AMD Radeon RX 7900 XTX', share: 60 }, { worker: 'laptop', share: 40, id: 'RPC0' }],
+        warnings: ['AMD Radeon RX 7900 XTX moved from Vulkan0 to Vulkan1; using Vulkan1'],
+      };
+    },
+  };
+  const res = await convertLegacyConfig(client, { ...WEB_RPC_PROFILE, deviceA: 'Vulkan0', deviceB: null });
+  assert.equal(bodies[0][0], '/api/preview-command');
+  assert.equal('rawCommand' in bodies[0][1], false, 'the raw command is never sent for conversion');
+  assert.deepEqual(res.devices, [
+    { id: 'Vulkan1', name: 'AMD Radeon RX 7900 XTX', share: 60, enabled: true },
+    { worker: 'laptop', share: 40, enabled: true },
+  ]);
+  assert.match(res.warnings[0], /moved from Vulkan0 to Vulkan1/);
+
+  const down = await convertLegacyConfig({ postJson: async () => { throw new Error('fetch failed'); } }, WEB_RPC_PROFILE);
+  assert.deepEqual(down.devices.map((d) => d.id || d.worker), ['CUDA0', 'Vulkan1'], 'local fallback');
+  assert.deepEqual(down.warnings, []);
+  const unresolved = await convertLegacyConfig({ postJson: async () => ({ command: '', error: 'modelPath is required' }) }, { rpcTarget: 'laptop' });
+  assert.deepEqual(unresolved.devices, [{ worker: 'laptop', share: null, enabled: true }]);
+});
+
+test('configToDraft: explicit devices win, then the config list, then the legacy conversion; no legacy keys in the draft', () => {
+  const given = configToDraft(WEB_RPC_PROFILE, DEFAULT_DRAFT, { devices: [{ id: 'Vulkan1', share: 70 }] });
+  assert.deepEqual(given.devices, [{ id: 'Vulkan1', share: 70, enabled: true }]);
+  for (const k of [...LEGACY_DEVICE_KEYS, 'rawCommand', 'launchMode']) assert.equal(k in given, false, `${k} not in draft`);
+  assert.equal(given.transport, 'TB4');
+  assert.equal(given.verbosity, 3, 'verbosity clamped up to the floor');
+
+  const own = configToDraft({ modelPath: '/m/a.gguf', devices: [{ worker: 'laptop', enabled: false }], transport: null }, { ...DEFAULT_DRAFT, transport: 'WAN' });
+  assert.deepEqual(own.devices, [{ worker: 'laptop', share: null, enabled: false }]);
+  assert.equal(own.transport, 'WAN', 'null transport falls back to the base pick');
+
+  const legacy = configToDraft(WEB_RPC_PROFILE);
+  assert.deepEqual(legacy.devices.map((d) => d.id), ['CUDA0', 'Vulkan1'], 'GPU B wins over the worker, like the server');
 });
 
 test('configToDraft skipEmpty (prefill merge) does not blank base values', () => {
@@ -63,37 +123,38 @@ test('configToDraft skipEmpty (prefill merge) does not blank base values', () =>
   assert.equal('rawCommand' in d, false);
 });
 
-test('draftToConfig: RPC on maps host -> rpcTarget, sends transport, nulls GPU B', () => {
-  const draft = { ...DEFAULT_DRAFT, modelPath: '/m/a.gguf', rpcEnabled: true, workerHost: ' kyle@10.0.0.5 ', transport: 'WAN', deviceA: 'Vulkan0', deviceB: 'Vulkan1', rawCommand: 'nope' };
+test('draftToConfig sends devices (disabled rows kept), transport only with an enabled worker, never legacy keys', () => {
+  const draft = {
+    ...DEFAULT_DRAFT, modelPath: '/m/a.gguf', transport: 'WAN', rawCommand: 'nope', deviceA: 'X', rpcTarget: 'laptop',
+    devices: [
+      { id: 'Vulkan1', name: 'AMD Radeon RX 7900 XTX', share: 50, enabled: true },
+      { worker: 'laptop', share: 30, enabled: true },
+      { id: 'CUDA0', name: 'NVIDIA GeForce RTX 3060', share: null, enabled: false },
+    ],
+    specDraftDevice: 'Vulkan1',
+  };
   const cfg = draftToConfig(draft);
-  assert.equal(cfg.rpcTarget, 'kyle@10.0.0.5');
+  assert.deepEqual(cfg.devices, [
+    { id: 'Vulkan1', name: 'AMD Radeon RX 7900 XTX', share: 50, enabled: true },
+    { worker: 'laptop', share: 30, enabled: true },
+    { id: 'CUDA0', name: 'NVIDIA GeForce RTX 3060', enabled: false },
+  ]);
   assert.equal(cfg.transport, 'WAN');
-  assert.equal(cfg.deviceB, null);
-  assert.equal(cfg.deviceA, 'Vulkan0');
-  assert.equal('rawCommand' in cfg, false, 'never sent to /api/start or saved');
-  assert.equal('rpcEnabled' in cfg, false);
-  assert.equal('workerHost' in cfg, false);
+  assert.equal(cfg.specDraftDevice, 'Vulkan1');
+  for (const k of [...LEGACY_DEVICE_KEYS, 'rawCommand']) assert.equal(k in cfg, false, `${k} never sent`);
+
+  const noWorker = draftToConfig({ ...draft, devices: [{ id: 'Vulkan1' }, { worker: 'laptop', enabled: false }], specDraftDevice: 'CUDA0', verbosity: null });
+  assert.equal(noWorker.transport, null, 'a disabled worker does not send transport');
+  assert.equal(noWorker.specDraftDevice, null, 'draft device must be an enabled local device');
+  assert.equal(noWorker.verbosity, 3, 'a blanked verbosity still leaves as the floor');
+  assert.equal(draftToConfig({ ...draft, specDraftDevice: 'RPC0' }).specDraftDevice, null, 'never a worker');
 });
 
-test('draftToConfig: RPC off sends empty rpcTarget and null transport even with a host set', () => {
-  const cfg = draftToConfig({ ...DEFAULT_DRAFT, rpcEnabled: false, workerHost: 'laptop', transport: 'TB4', deviceB: 'Vulkan1', verbosity: null });
-  assert.equal(cfg.rpcTarget, '');
-  assert.equal(cfg.transport, null);
-  assert.equal(cfg.deviceB, 'Vulkan1');
-  assert.equal(cfg.verbosity, 3, 'a blanked verbosity still leaves as the floor');
-});
-
-test('profile round-trip: web profile -> draft -> config keeps rpcTarget + transport', () => {
-  const cfg = draftToConfig(configToDraft(WEB_RPC_PROFILE));
-  assert.equal(cfg.rpcTarget, 'laptop');
+test('profile round-trip: old web profile -> draft -> config -> draft keeps the device list', () => {
+  const cfg = draftToConfig(configToDraft({ modelPath: '/m/a.gguf', deviceA: 'Vulkan1', rpcTarget: 'laptop', tensorSplit: 60, transport: 'TB4' }));
+  assert.deepEqual(cfg.devices, [{ id: 'Vulkan1', share: 60, enabled: true }, { worker: 'laptop', share: 40, enabled: true }]);
   assert.equal(cfg.transport, 'TB4');
-  assert.equal(cfg.deviceB, null);
-  assert.equal(cfg.modelPath, WEB_RPC_PROFILE.modelPath);
-  assert.equal('rawCommand' in cfg, false);
-  // and a local one stays local
-  const local = draftToConfig(configToDraft({ modelPath: '/m/a.gguf', rpcTarget: '' }));
-  assert.equal(local.rpcTarget, '');
-  assert.equal(local.transport, null);
+  assert.deepEqual(configToDraft(cfg).devices, [{ id: 'Vulkan1', share: 60, enabled: true }, { worker: 'laptop', share: 40, enabled: true }]);
 });
 
 test('clampVerbosity floors at 3 (unset too, like the web restore)', () => {
@@ -107,19 +168,102 @@ test('clampVerbosity floors at 3 (unset too, like the web restore)', () => {
   assert.equal(DEFAULT_DRAFT.verbosity, 3);
 });
 
-test('node + split labels follow the RPC switch', () => {
-  assert.deepEqual(nodeLabels(true), { a: 'Local', b: 'Worker' });
-  assert.deepEqual(nodeLabels(false), { a: 'GPU A', b: 'GPU B' });
-  assert.equal(splitText({ tensorSplit: 60, rpcEnabled: true }), 'Local 60% / Worker 40%');
-  assert.equal(splitText({ tensorSplit: 25, rpcEnabled: false }), 'GPU A 25% / GPU B 75%');
-  assert.equal(splitText({ tensorSplit: null }), null);
+test('sharePercents: 100 for one device, normalized when every share is set, auto otherwise', () => {
+  assert.deepEqual(sharePercents([{ id: 'Vulkan1', share: 7 }]), [100]);
+  assert.deepEqual(sharePercents([{ id: 'Vulkan1', share: 50 }, { worker: 'laptop', share: 30 }, { id: 'CUDA0', share: 20, enabled: false }]), [63, 38, null]);
+  assert.deepEqual(sharePercents([{ id: 'Vulkan1', share: 50 }, { id: 'CUDA0' }]), ['auto', 'auto']);
+  assert.deepEqual(sharePercents([{ id: 'Vulkan1', share: 0 }, { id: 'CUDA0', share: 0 }]), ['auto', 'auto']);
 });
 
-test('profileTag + sortProfileEntries (most recently used first)', () => {
+test('splitProblem: all blank (auto) or all set totaling 100; one device never needs a share', () => {
+  assert.equal(splitProblem([{ id: 'Vulkan1', share: 7 }]), null);
+  assert.equal(splitProblem([{ id: 'Vulkan1' }, { id: 'CUDA0' }]), null);
+  assert.equal(splitProblem([{ id: 'CUDA0', share: 31 }, { id: 'Vulkan1', share: 69 }]), null);
+  assert.equal(splitProblem([{ id: 'CUDA0', share: 50 }, { id: 'Vulkan1', share: 60 }, { worker: 'laptop', share: 30, enabled: false }]),
+    'Shares total 110% -- they must add up to 100%.');
+  assert.match(splitProblem([{ id: 'CUDA0', share: 50 }, { id: 'Vulkan1' }]), /every enabled device/);
+});
+
+test('suggestShares: free VRAM from cards and worker telemetry; a missing reading is estimated', () => {
+  const devices = [{ id: 'Vulkan1' }, { worker: 'laptop' }, { id: 'CUDA0' }, { id: 'Vulkan0', enabled: false }];
+  const gpus = [{ host: 'laptop', gpu_name: 'RTX 4090 Laptop', vram_total: 16000, vram_used: 6000, error: false }];
+  const res = suggestShares(devices, { cards: CARDS, gpus });
+  assert.deepEqual(res.devices.map((d) => d.share), [50, 25, 25, null], '20000 : 10000 : 10000');
+  assert.equal(res.devices.filter((d) => d.enabled).reduce((a, d) => a + d.share, 0), 100);
+  assert.deepEqual(res.notes, []);
+
+  const est = suggestShares([{ id: 'Vulkan1' }, { worker: 'laptop' }], { cards: CARDS, gpus: [] });
+  assert.deepEqual(est.devices.map((d) => d.share), [50, 50]);
+  assert.match(est.notes[0], /laptop: no VRAM reading yet, estimated/);
+
+  const single = suggestShares([{ id: 'Vulkan1' }], { cards: CARDS });
+  assert.equal(single.devices[0].share, null, 'fewer than two enabled rows: unchanged');
+});
+
+test('mergeCatalog: one row per card and worker; name match re-points ids; missing flagged; idempotent', () => {
+  // Saved when the XTX was Vulkan0 (with its name) plus a bare 3060 id.
+  const rows = mergeCatalog([
+    { id: 'Vulkan0', name: 'AMD Radeon RX 7900 XTX', share: 60 },
+    { worker: 'laptop', share: 40 },
+    { id: 'ROCm3' },
+  ], CARDS, WORKERS);
+  assert.deepEqual(rows.map((r) => r.entry), [
+    { id: 'Vulkan1', name: 'AMD Radeon RX 7900 XTX', vramMib: 24560, share: 60, enabled: true },
+    { worker: 'laptop', share: 40, enabled: true },
+    { id: 'ROCm3', share: null, enabled: true },
+    { id: 'CUDA0', name: 'NVIDIA GeForce RTX 3060', vramMib: 12288, share: null, enabled: false },
+  ]);
+  assert.equal(rows[2].missing, true);
+  assert.equal(rows[3].card, CARDS[0]);
+  const again = mergeCatalog(rows.map((r) => r.entry), CARDS, WORKERS).map((r) => r.entry);
+  assert.deepEqual(again, rows.map((r) => r.entry), 'merging a merged list is a no-op');
+
+  // bare id matches a card by backend and gains the card name; worker by ssh
+  const bare = mergeCatalog([{ id: 'Vulkan0' }, { worker: 'laptop' }], CARDS, [{ ...WORKERS[0], name: 'lap' }]);
+  assert.deepEqual(bare[0].entry, { id: 'Vulkan0', name: 'NVIDIA GeForce RTX 3060', vramMib: 12288, share: null, enabled: true });
+  assert.equal(bare[1].entry.worker, 'lap', 'ssh target resolves to the worker name');
+});
+
+test('mergeCatalog: a fresh draft enables discrete cards (not an iGPU), workers off', () => {
+  const cards = [...CARDS, { name: 'Intel(R) Iris(R) Xe Graphics', preferredId: 'Vulkan2', backends: [{ id: 'Vulkan2' }] }];
+  const rows = mergeCatalog([], cards, WORKERS);
+  assert.deepEqual(rows.map((r) => [r.entry.id || r.entry.worker, r.entry.enabled]),
+    [['CUDA0', true], ['Vulkan1', true], ['Vulkan2', false], ['laptop', false]]);
+});
+
+test('row edits: toggle, share, move, backend cycle', () => {
+  const list = [{ id: 'CUDA0', name: 'NVIDIA GeForce RTX 3060' }, { worker: 'laptop', share: 10 }];
+  assert.equal(toggleDeviceAt(list, 1)[1].enabled, false);
+  assert.equal(adjustShareAt(list, 0, 5)[0].share, 5, 'unset share starts from 0');
+  assert.equal(adjustShareAt(list, 1, -20)[1].share, 0, 'never below 0');
+  assert.equal(setShareAt(list, 1, null)[1].share, null);
+  assert.deepEqual(moveDeviceAt(list, 1, -1).map((d) => d.id || d.worker), ['laptop', 'CUDA0']);
+  assert.deepEqual(moveDeviceAt(list, 0, -1).map((d) => d.id || d.worker), ['CUDA0', 'laptop'], 'edge: unchanged');
+  assert.equal(cycleBackendAt(list, 0, CARDS[0])[0].id, 'Vulkan0');
+  assert.equal(cycleBackendAt(cycleBackendAt(list, 0, CARDS[0]), 0, CARDS[0])[0].id, 'CUDA0', 'wraps');
+  assert.equal(cycleBackendAt(list, 1, CARDS[0])[1].worker, 'laptop', 'workers have no backend');
+});
+
+test('pollableWorkers / hasEnabledWorker gate worker polling to enabled worker rows', () => {
+  assert.deepEqual(pollableWorkers([{ id: 'CUDA0' }, { worker: 'laptop', enabled: false }]), []);
+  assert.equal(hasEnabledWorker([{ worker: 'laptop', enabled: false }]), false);
+  assert.deepEqual(pollableWorkers([{ worker: 'laptop' }, { worker: 'laptop' }, { worker: 'desk' }]), ['laptop', 'desk']);
+});
+
+test('profileTag + deviceSummary for both config shapes; sortProfileEntries', () => {
   assert.equal(profileTag({ rpcTarget: 'laptop' }), 'RPC');
   assert.equal(profileTag({ rpcTarget: '' }), 'Local');
-  assert.equal(profileTag({ rpcTarget: null }), 'Local');
   assert.equal(profileTag({}), 'Local');
+  assert.equal(profileTag({ devices: [{ id: 'Vulkan1' }, { worker: 'laptop', enabled: false }] }), 'Local', 'a disabled worker is not RPC');
+  assert.equal(profileTag({ devices: [{ worker: 'laptop' }] }), 'RPC');
+  assert.equal(deviceSummary({ devices: [
+    { id: 'Vulkan1', name: 'AMD Radeon RX 7900 XTX', share: 50 },
+    { worker: 'laptop', share: 30 },
+    { id: 'CUDA0', name: 'NVIDIA GeForce RTX 3060', share: 20 },
+    { id: 'Vulkan0', enabled: false },
+  ] }), 'RX 7900 XTX 50 · laptop 30 · RTX 3060 20');
+  assert.equal(deviceSummary({ deviceA: 'CUDA0', rpcTarget: 'laptop', tensorSplit: 60 }), 'CUDA0 60 · laptop 40');
+  assert.equal(deviceSummary({ modelPath: '/m' }), '');
 
   const sorted = sortProfileEntries({
     old: { config: { modelPath: '/a' }, savedAt: 100, lastLoadedAt: null },
@@ -127,18 +271,19 @@ test('profileTag + sortProfileEntries (most recently used first)', () => {
     newSave: { config: { modelPath: '/c' }, savedAt: 500, lastLoadedAt: null },
   });
   assert.deepEqual(sorted.map((e) => e.name), ['usedRecently', 'newSave', 'old']);
-  assert.equal(sorted[0].config.rpcTarget, 'laptop');
   assert.deepEqual(sortProfileEntries(null), []);
 });
 
-test('gpuOnline treats Offline name OR either vendor error flag as offline', () => {
+test('gpuOnline, gpuTitles, gpuKey, shortGpuName', () => {
   assert.equal(gpuOnline({ gpu_name: 'AMD Radeon RX 7900 XTX', amdgpu_top_error: false }), true);
-  assert.equal(gpuOnline({ gpu_name: 'NVIDIA GeForce RTX 4090 Laptop GPU', nvidia_smi_error: false }), true);
+  assert.equal(gpuOnline({ gpu_name: 'NVIDIA GeForce RTX 4090 Laptop GPU', error: false }), true);
   assert.equal(gpuOnline({ gpu_name: 'Offline' }), false);
   assert.equal(gpuOnline({ gpu_name: 'Unknown', nvidia_smi_error: true }), false);
   assert.equal(gpuOnline({ gpu_name: 'AMD Radeon', amdgpu_top_error: true }), false);
   assert.equal(gpuOnline(null), false);
-  assert.equal(gpuOnline({}), false);
   assert.deepEqual(gpuTitles(true), ['Local', 'Worker (rpc)']);
   assert.deepEqual(gpuTitles(false), ['GPU 0', 'GPU 1']);
+  assert.equal(gpuKey('AMD Radeon RX 7900 XTX (RADV NAVI31)'), gpuKey('AMD Radeon RX 7900 XTX'));
+  assert.equal(shortGpuName('NVIDIA GeForce RTX 4090 Laptop GPU'), 'RTX 4090 Laptop');
+  assert.equal(shortGpuName('AMD Radeon RX 7900 XTX (RADV NAVI31)'), 'RX 7900 XTX');
 });

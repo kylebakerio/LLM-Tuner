@@ -1,0 +1,14 @@
+{
+  "name": "ai-lab-public-site",
+  "private": true,
+  "description": "Tooling for the static build of lab.kylebaker.io (a Cloudflare Worker with static assets, wrangler.jsonc). Only wrangler lives here: the local asset server (`wrangler dev`) and the deploy (`wrangler deploy`, run by publish-static.js). Wrangler needs Node >= 22; the site code itself has no dependencies.",
+  "scripts": {
+    "build": "node build-static.js",
+    "preview": "node preview-static.js",
+    "dev": "wrangler dev --port 4174",
+    "publish:dry": "node publish-static.js --dry-run"
+  },
+  "devDependencies": {
+    "wrangler": "4.147.0"
+  }
+}

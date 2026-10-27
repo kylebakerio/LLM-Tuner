@@ -44,7 +44,10 @@ export function loadProfiles(client) {
   });
 }
 
-export async function saveProfile(client, name, cfg) {
+// `lastLoadedAt` (optional) carries a profile's "last used" stamp along when
+// it is saved under another name (rename); without it the server keeps the
+// stamp an existing profile of that name already has.
+export async function saveProfile(client, name, cfg, { lastLoadedAt } = {}) {
   if (!name || !String(name).trim()) throw new Error('Profile name is required');
   if (!cfg || typeof cfg !== 'object') throw new Error('Nothing to save');
   // Never persist the web's rawCommand from the CLI: /api/start runs a
@@ -52,7 +55,11 @@ export async function saveProfile(client, name, cfg) {
   // every structured field the user edited here.
   const { rawCommand, ...config } = cfg;
   return call(client, async () => {
-    await client.postJson('/api/profiles', { name: String(name).trim(), config });
+    await client.postJson('/api/profiles', {
+      name: String(name).trim(),
+      config,
+      ...(lastLoadedAt ? { lastLoadedAt } : {}),
+    });
     return config;
   });
 }
@@ -77,6 +84,20 @@ export function listProfiles(client) {
 // Launch picker and `profile list` order, same as the web dropdown).
 export function listProfileEntries(client) {
   return call(client, async () => sortProfileEntries((await loadProfiles(client)).profiles));
+}
+
+// The profile list with what the server says about this machine:
+//   { entries, availability, topology }
+// `entries` as listProfileEntries(); `availability` is { name: { status,
+// reason, placement } } -- can each profile run here -- and `topology` the
+// machine's cards and workers. Both are null from a server that sends
+// neither, and every profile is then treated as ready.
+export function listProfileState(client) {
+  return call(client, async () => {
+    const doc = await loadProfiles(client);
+    const obj = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : null);
+    return { entries: sortProfileEntries(doc.profiles), availability: obj(doc.availability), topology: obj(doc.topology) };
+  });
 }
 
 // Record "used now" so the shared profile list (web + CLI) can sort by

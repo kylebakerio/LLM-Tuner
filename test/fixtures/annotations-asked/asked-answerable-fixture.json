@@ -1,0 +1,17 @@
+{
+  "v": 1, "kind": "asked-answerable", "created": "2026-10-19",
+  "method": "test fixture (test/askedanswerable.test.js): not a real review",
+  "runs": {
+    "bat-a/task-one": { "battery": "bat-a", "task": "task-one", "runner": "opencode", "status": "fail", "answerable": "yes",
+      "asked": "Should I use the existing Stripe customer?", "where": "prompt para 2: \"reuse the customer on file\"",
+      "note": "ended asking \"Should I use the existing Stripe customer?\"; the prompt answers this: reuse the customer on file", "compactions": 0 },
+    "bat-a/task-two": { "battery": "bat-a", "task": "task-two", "runner": "opencode", "status": "fail", "answerable": "partly",
+      "asked": "Which timezone?", "where": "prompt says venue-local time, not which venue", "compactions": 1 },
+    "bat-a/task-three": { "battery": "bat-a", "task": "task-three", "runner": "opencode", "status": "fail", "answerable": "no",
+      "asked": "What is the API key?", "where": "nowhere", "note": "not answerable", "compactions": 0 },
+    "bat-a/task-four-L3": { "battery": "bat-a", "task": "task-four", "runner": "opencode", "status": "fail", "answerable": "yes",
+      "asked": "Keep the old column?", "where": "prompt: drop it", "note": "ended asking \"Keep the old column?\"; the prompt answers this: drop it", "compactions": 0 },
+    "bat-a/task-bonus": { "battery": "bat-a", "task": "task-bonus", "runner": "opencode", "status": "pass", "answerable": "yes",
+      "asked": "Done; want tests?", "where": "prompt: add tests", "note": "ended asking \"Done; want tests?\"; the prompt answers this: add tests", "compactions": 0 }
+  }
+}
